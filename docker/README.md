@@ -126,7 +126,7 @@ The container runs services as the `node` user for security. If you encounter pe
 
 ```bash
 # Fix log directory permissions
-sudo chown -R 1000:1000 ../logs ../events
+chown -R 1000:1000 ../logs ../events
 
 # Or run with current user
 docker-compose run --user $(id -u):$(id -g) telegramcoder

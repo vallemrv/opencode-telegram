@@ -15,24 +15,16 @@ export default async function messagePartUpdatedHandler(
     try {
         const { part } = event.properties;
         
-        // Handle reasoning parts separately
         if (part.type === "reasoning") {
-            await handleReasoningPart(ctx);
+            await handleReasoningPart(ctx, userSession);
             return null;
         }
         
-        // Handle tool calls separately
-        if (part.type === "tool") {
-            await handleToolPart(ctx, part);
-            return null;
-        }
-        
-        // Only process text parts
         if (part.type !== "text") {
             return null;
         }
 
-        await handleTextPart(ctx, part.text);
+        await handleTextPart(ctx, part.text, userSession);
 
     } catch (error) {
         console.log("Error in message.part.updated handler:", error);

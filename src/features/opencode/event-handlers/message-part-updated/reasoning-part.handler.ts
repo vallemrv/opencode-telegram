@@ -1,33 +1,21 @@
 import type { Context } from "grammy";
+import type { UserSession } from "../../opencode.types.js";
 
-let reasoningMessageId: number | null = null;
-let reasoningDeleteTimeout: NodeJS.Timeout | null = null;
-
-export async function handleReasoningPart(ctx: Context): Promise<void> {
+/**
+ * Cuando OpenCode está "pensando" (reasoning), no enviamos ningún mensaje.
+ * Solo mandamos la acción "typing" para que Telegram muestre "escribiendo..."
+ * El texto final se enviará cuando llegue session.idle.
+ */
+export async function handleReasoningPart(ctx: Context, userSession: UserSession): Promise<void> {
     try {
-        // Clear existing reasoning delete timeout
-        if (reasoningDeleteTimeout) {
-            clearTimeout(reasoningDeleteTimeout);
-            reasoningDeleteTimeout = null;
+        // Cancelar cualquier timeout de borrado pendiente
+        if (userSession.streamingDeleteTimeout) {
+            clearTimeout(userSession.streamingDeleteTimeout);
+            userSession.streamingDeleteTimeout = undefined;
         }
 
-        if (!reasoningMessageId) {
-            // Send reasoning message
-            const sentMessage = await ctx.reply("Reasoning");
-            reasoningMessageId = sentMessage.message_id;
-        }
-
-        // Set timeout to delete message after 2.5 seconds (half of 5 seconds)
-        reasoningDeleteTimeout = setTimeout(async () => {
-            try {
-                if (reasoningMessageId) {
-                    await ctx.api.deleteMessage(ctx.chat!.id, reasoningMessageId);
-                    reasoningMessageId = null;
-                }
-            } catch (error) {
-                console.log("Error deleting reasoning message:", error);
-            }
-        }, 2500);
+        // Solo mostrar "escribiendo..." en Telegram — sin mensaje
+        ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => { });
 
     } catch (error) {
         console.log("Error in reasoning part handler:", error);

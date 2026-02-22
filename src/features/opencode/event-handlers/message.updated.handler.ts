@@ -14,8 +14,7 @@ export default async function messageUpdatedHandler(
     try {
         const { info } = event.properties;
         
-        // Check if title exists in info.summary
-        if (info?.summary?.title) {
+        if (info?.summary && typeof info.summary === 'object' && info.summary.title) {
             const title = info.summary.title;
             
             // Update the session title using OpenCode SDK

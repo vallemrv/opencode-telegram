@@ -2,6 +2,7 @@ import { Bot } from "grammy";
 import { ConfigService } from './services/config.service.js';
 import { OpenCodeService } from './features/opencode/opencode.service.js';
 import { OpenCodeBot } from './features/opencode/opencode.bot.js';
+import { OpenCodeServerService } from './services/opencode-server.service.js';
 import { AccessControlMiddleware } from './middleware/access-control.middleware.js';
 import dotenv from 'dotenv';
 import * as fs from 'fs';
@@ -54,12 +55,33 @@ AccessControlMiddleware.setBot(bot);
 // Initialize the OpenCode bot
 const opencodeBot = new OpenCodeBot(opencodeService, configService);
 
+const serverService = new OpenCodeServerService();
+
+async function ensureServerRunning(): Promise<void> {
+    if (await serverService.isServerRunning()) {
+        console.log('[TelegramCoder] OpenCode server is already running');
+        return;
+    }
+
+    console.log('[TelegramCoder] Starting OpenCode server...');
+    const result = await serverService.startServer();
+
+    if (!result.success) {
+        console.error('[TelegramCoder] Failed to start OpenCode server:', result.message);
+        console.error('[TelegramCoder] Bot will continue but OpenCode features may not work');
+    } else {
+        console.log('[TelegramCoder] ✅ OpenCode server started:', result.message);
+    }
+}
+
 // Register handlers
 opencodeBot.registerHandlers(bot);
 
 async function startBot() {
     try {
         console.log('[TelegramCoder] Starting initialization...');
+
+        await ensureServerRunning();
 
         // Clean up media directory if configured
         if (configService.shouldCleanUpMediaDir()) {
@@ -85,6 +107,8 @@ async function startBot() {
             await bot.api.setMyCommands([
                 { command: 'start', description: 'Show help message' },
                 { command: 'help', description: 'Show help message' },
+                { command: 'new', description: 'Create a new Gitea project' },
+                { command: 'projects', description: 'List your Gitea projects' },
                 { command: 'opencode', description: 'Start an OpenCode session' },
                 { command: 'rename', description: 'Rename current session' },
                 { command: 'endsession', description: 'End your OpenCode session' },

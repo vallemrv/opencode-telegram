@@ -1,7 +1,7 @@
 {
   "type": "file.watcher.updated",
   "properties": {
-    "file": "/home/tom/telegramCoder/.git/index.lock",
-    "event": "unlink"
+    "file": "/home/valle/Documentos/proyectos/gitea-projects/gotocheck/m4g-mongodb.service",
+    "event": "change"
   }
 }

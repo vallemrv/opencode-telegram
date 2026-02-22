@@ -1,33 +1,20 @@
 import type { Context } from "grammy";
+import type { UserSession } from "../../opencode.types.js";
 
-let toolMessageId: number | null = null;
-let toolDeleteTimeout: NodeJS.Timeout | null = null;
-
-export async function handleToolPart(ctx: Context, part: any): Promise<void> {
+/**
+ * Cuando OpenCode ejecuta una herramienta (tool), no enviamos ningún mensaje.
+ * Solo mandamos "typing" para que Telegram muestre "escribiendo..."
+ */
+export async function handleToolPart(ctx: Context, part: any, userSession: UserSession): Promise<void> {
     try {
-        // Clear existing tool delete timeout
-        if (toolDeleteTimeout) {
-            clearTimeout(toolDeleteTimeout);
-            toolDeleteTimeout = null;
+        // Cancelar cualquier timeout pendiente
+        if (userSession.streamingDeleteTimeout) {
+            clearTimeout(userSession.streamingDeleteTimeout);
+            userSession.streamingDeleteTimeout = undefined;
         }
 
-        if (!toolMessageId && part.tool) {
-            // Send tool name message
-            const sentMessage = await ctx.reply(`🔧 ${part.tool}`);
-            toolMessageId = sentMessage.message_id;
-        }
-
-        // Set timeout to delete message after 2.5 seconds (half of 5 seconds)
-        toolDeleteTimeout = setTimeout(async () => {
-            try {
-                if (toolMessageId) {
-                    await ctx.api.deleteMessage(ctx.chat!.id, toolMessageId);
-                    toolMessageId = null;
-                }
-            } catch (error) {
-                console.log("Error deleting tool message:", error);
-            }
-        }, 2500);
+        // Solo mostrar "escribiendo..." en Telegram — sin mensaje
+        ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => { });
 
     } catch (error) {
         console.log("Error in tool part handler:", error);

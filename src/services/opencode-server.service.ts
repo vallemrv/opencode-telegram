@@ -24,14 +24,27 @@ export class OpenCodeServerService {
         }
     }
 
+    private getOpenCodeCommand(): string {
+        // Check local node_modules first
+        const localPath = join(process.cwd(), "node_modules", ".bin", "opencode");
+        return localPath;
+    }
+
     private async isOpenCodeInstalled(): Promise<boolean> {
         try {
-            // Check if opencode command is available
-            const { execSync } = require("child_process");
-            execSync("opencode --version", { stdio: "ignore" });
+            // Check local node_modules first
+            const localPath = this.getOpenCodeCommand();
+            await access(localPath, constants.X_OK);
             return true;
         } catch {
-            return false;
+            // Fall back to global check
+            try {
+                const { execSync } = require("child_process");
+                execSync("opencode --version", { stdio: "ignore" });
+                return true;
+            } catch {
+                return false;
+            }
         }
     }
 
@@ -58,9 +71,13 @@ export class OpenCodeServerService {
             // Start OpenCode server using: opencode serve --port <number> --hostname <string>
             const args = ["serve", "--port", port, "--hostname", hostname];
 
-            this.serverProcess = spawn("opencode", args, {
+            const opencodeCmd = this.getOpenCodeCommand();
+            const workDir = process.env.GITEA_DEFAULT_WORKDIR || process.cwd();
+            
+            this.serverProcess = spawn(opencodeCmd, args, {
                 detached: true,
                 stdio: "ignore",
+                cwd: workDir,
             });
 
             // Unref so the parent process can exit independently

@@ -8,5 +8,15 @@ export interface UserSession {
     createdAt: Date;
     chatId?: number;
     lastMessageId?: number;
-    currentAgent?: string; // Track the current agent for this session
+    currentAgent?: string;
+    currentModel?: string;
+    // Streaming internos (solo para typing indicator, no se muestran)
+    streamingMessageId?: number;
+    streamingLastUpdate?: number;
+    streamingDeleteTimeout?: NodeJS.Timeout;
+    streamingLatestText?: string;
+    // Texto final acumulado que se envía cuando OpenCode termina (session.idle)
+    finalResponseText?: string;
+    // Bloqueo: true mientras OpenCode está procesando un prompt
+    isProcessing?: boolean;
 }

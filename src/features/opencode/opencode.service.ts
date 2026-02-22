@@ -3,22 +3,36 @@ import type { Event } from "@opencode-ai/sdk";
 import type { Context } from "grammy";
 import type { UserSession } from "./opencode.types.js";
 import { processEvent } from "./opencode.event-handlers.js";
+import { SessionPersistService } from "../../services/session-persist.service.js";
 
 export class OpenCodeService {
     private userSessions: Map<number, UserSession> = new Map();
     private baseUrl: string;
     private eventAbortControllers: Map<number, AbortController> = new Map();
+    private persistService: SessionPersistService;
 
     constructor(baseUrl?: string) {
         this.baseUrl = baseUrl || process.env.OPENCODE_SERVER_URL || "http://localhost:4096";
+        this.persistService = new SessionPersistService();
+        // Restore sessions from disk in background (don't block startup)
+        this.restoreSessionsFromDisk().catch(err =>
+            console.error('[OpenCodeService] Failed to restore sessions:', err)
+        );
     }
 
-    async createSession(userId: number, title?: string): Promise<UserSession> {
+    async createSession(userId: number, title?: string, model?: string, directory?: string): Promise<UserSession> {
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
 
         try {
             const result = await client.session.create({
-                body: { title: title || `Telegram Session ${new Date().toISOString()}` },
+                body: {
+                    title: title || `Telegram Session ${new Date().toISOString()}`,
+                    permission: [
+                        { permission: "command", pattern: "*", action: "allow" },
+                        { permission: "file", pattern: "*", action: "allow" }
+                    ]
+                } as any,
+                query: directory ? { directory } : undefined,
             });
 
             if (!result.data) {
@@ -31,12 +45,22 @@ export class OpenCodeService {
                 session: result.data,
                 createdAt: new Date(),
                 currentAgent: "build",
+                currentModel: model || process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5-free",
             };
 
             this.userSessions.set(userId, userSession);
+
+            // Persist to disk so session survives bot restarts
+            this.persistService.saveSession({
+                userId,
+                sessionId: result.data.id,
+                currentAgent: "build",
+                currentModel: userSession.currentModel,
+                createdAt: new Date().toISOString(),
+            });
+
             return userSession;
         } catch (error) {
-            // Provide more helpful error message for connection failures
             if (error instanceof Error && (error.message.includes('fetch failed') || error.message.includes('ECONNREFUSED'))) {
                 throw new Error(`Cannot connect to OpenCode server at ${this.baseUrl}. Please ensure:\n1. OpenCode server is running\n2. OPENCODE_SERVER_URL is configured correctly in .env file`);
             }
@@ -53,12 +77,17 @@ export class OpenCodeService {
         if (session) {
             session.chatId = chatId;
             session.lastMessageId = messageId;
+            // Keep disk in sync
+            this.persistService.updateSession(userId, { chatId, lastMessageId: messageId });
         }
     }
+
+    // ─── Event Stream ────────────────────────────────────────────────────────
 
     async startEventStream(userId: number, ctx: Context): Promise<void> {
         const userSession = this.getUserSession(userId);
         if (!userSession || !userSession.chatId) {
+            console.warn(`[EventStream] Cannot start for user ${userId}: no session or chatId`);
             return;
         }
 
@@ -69,23 +98,33 @@ export class OpenCodeService {
         this.eventAbortControllers.set(userId, abortController);
 
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
+        let retryDelay = 2000;
+        const maxRetryDelay = 30000;
 
-        try {
-            const events = await client.event.subscribe();
+        console.log(`[EventStream] Starting for user ${userId}`);
 
-            for await (const event of events.stream) {
-                if (abortController.signal.aborted) {
-                    break;
+        while (!abortController.signal.aborted) {
+            try {
+                const events = await client.event.subscribe();
+                retryDelay = 2000; // Reset on success
+
+                for await (const event of events.stream) {
+                    if (abortController.signal.aborted) break;
+                    // Refresh session reference in case it was updated
+                    const currentSession = this.getUserSession(userId);
+                    if (!currentSession) break;
+                    await processEvent(event, ctx, currentSession);
                 }
-
-                // Process event through handler
-                await processEvent(event, ctx, userSession);
+            } catch (error) {
+                if (abortController.signal.aborted) break;
+                console.error(`[EventStream] Error for user ${userId}, retrying in ${retryDelay}ms:`, error);
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+                retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
             }
-        } catch (error) {
-            console.error("Event stream error:", error);
-        } finally {
-            this.eventAbortControllers.delete(userId);
         }
+
+        this.eventAbortControllers.delete(userId);
+        console.log(`[EventStream] Stopped for user ${userId}`);
     }
 
     stopEventStream(userId: number): void {
@@ -96,7 +135,35 @@ export class OpenCodeService {
         }
     }
 
-    async sendPrompt(userId: number, text: string, fileContext?: string): Promise<string> {
+    /** Returns true if the SSE event stream is currently active for this user */
+    hasEventStream(userId: number): boolean {
+        return this.eventAbortControllers.has(userId);
+    }
+
+    /**
+     * Ensures the event stream is running for a user.
+     * Call this before sending any prompt to guarantee responses will be received.
+     */
+    ensureEventStream(userId: number, ctx: Context): void {
+        if (this.hasEventStream(userId)) return;
+        const session = this.getUserSession(userId);
+        if (!session) return;
+
+        // If chatId not set yet, use it from the incoming context
+        if (!session.chatId && ctx.chat?.id) {
+            session.chatId = ctx.chat.id;
+            this.persistService.updateSession(userId, { chatId: ctx.chat.id });
+        }
+
+        console.log(`[EventStream] Reconnecting for user ${userId} (was not running)`);
+        this.startEventStream(userId, ctx).catch(err =>
+            console.error(`[EventStream] Failed to reconnect for user ${userId}:`, err)
+        );
+    }
+
+    // ─── Prompt ──────────────────────────────────────────────────────────────
+
+    async sendPrompt(userId: number, text: string, fileContext?: string): Promise<void> {
         const userSession = this.getUserSession(userId);
 
         if (!userSession) {
@@ -106,10 +173,11 @@ export class OpenCodeService {
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
 
         try {
-            // Prepend file context if provided
             const fullPrompt = fileContext ? `${fileContext}\n\n${text}` : text;
-            
-            const result = await client.session.prompt({
+
+            // 🔑 USE promptAsync: returns immediately, AI response comes through SSE stream
+            // Do NOT use session.prompt() — it blocks until GLM-5 finishes, causing timeouts
+            const result = await (client.session as any).promptAsync({
                 path: { id: userSession.sessionId },
                 body: {
                     parts: [{ type: "text", text: fullPrompt }],
@@ -117,25 +185,22 @@ export class OpenCodeService {
                 },
             });
 
-            if (!result.data) {
-                throw new Error("Failed to send prompt");
+            if (result.error) {
+                throw new Error(`OpenCode rejected prompt: ${JSON.stringify(result.error)}`);
             }
 
-            // Extract text from response parts
-            const textParts = result.data.parts
-                ?.filter((part) => part.type === "text")
-                .map((part) => part.text)
-                .join("\n");
+            console.log(`[OpenCode] Prompt queued for session ${userSession.sessionId}`);
+            // Response will arrive via SSE → session.idle handler sends it to Telegram
 
-            return textParts || "No response received";
         } catch (error) {
-            // Provide more helpful error message for connection failures
             if (error instanceof Error && (error.message.includes('fetch failed') || error.message.includes('ECONNREFUSED'))) {
                 throw new Error(`Cannot connect to OpenCode server at ${this.baseUrl}. Please ensure the OpenCode server is running.`);
             }
             throw error;
         }
     }
+
+    // ─── Session Management ──────────────────────────────────────────────────
 
     async deleteSession(userId: number): Promise<boolean> {
         const userSession = this.getUserSession(userId);
@@ -144,7 +209,6 @@ export class OpenCodeService {
             return false;
         }
 
-        // Stop event stream first
         this.stopEventStream(userId);
 
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
@@ -154,6 +218,7 @@ export class OpenCodeService {
                 path: { id: userSession.sessionId },
             });
             this.userSessions.delete(userId);
+            this.persistService.deleteSession(userId);
             return true;
         } catch (error) {
             console.error(`Failed to delete session for user ${userId}:`, error);
@@ -185,43 +250,25 @@ export class OpenCodeService {
         }
     }
 
+    // ─── Agents ──────────────────────────────────────────────────────────────
+
     async getAvailableAgents(): Promise<Array<{ name: string; mode?: string; description?: string }>> {
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
 
         try {
             const result = await client.app.agents();
-            
+
             if (!result.data) {
                 return [];
             }
 
-            // Filter for user-selectable agents:
-            // - mode must be "primary" (not "subagent")
-            // - hidden must NOT be true
-            // - exclude internal utility agents by name as well
             const internalAgents = ['compaction', 'title', 'summary'];
 
             const filtered = result.data
                 .filter((agent: any) => {
-                    // Exclude hidden agents
-                    if (agent.hidden === true) {
-                        console.log(`Filtering out hidden agent: ${agent.name}`);
-                        return false;
-                    }
-                    
-                    // Exclude subagents (only meant to be called by other agents)
-                    if (agent.mode === "subagent") {
-                        console.log(`Filtering out subagent: ${agent.name}`);
-                        return false;
-                    }
-                    
-                    // Exclude internal utility agents by name
-                    if (internalAgents.includes(agent.name)) {
-                        console.log(`Filtering out internal agent: ${agent.name}`);
-                        return false;
-                    }
-                    
-                    // Only include primary agents
+                    if (agent.hidden === true) return false;
+                    if (agent.mode === "subagent") return false;
+                    if (internalAgents.includes(agent.name)) return false;
                     return agent.mode === "primary" || agent.mode === "all";
                 })
                 .map((agent: any) => ({
@@ -245,39 +292,29 @@ export class OpenCodeService {
             return { success: false };
         }
 
-        const client = createOpencodeClient({ baseUrl: this.baseUrl });
-
         try {
-            // Get available primary agents (not hidden, not subagents)
             const agents = await this.getAvailableAgents();
-            
+
             if (agents.length === 0) {
-                console.error("No available agents to cycle through");
                 return { success: false };
             }
 
-            // Get current agent or default to first one
             const currentAgent = userSession.currentAgent || agents[0].name;
-            
-            // Find current agent index
             const currentIndex = agents.findIndex(a => a.name === currentAgent);
-            
-            // Cycle to next agent (wrap around to start if at end)
             const nextIndex = (currentIndex + 1) % agents.length;
             const nextAgent = agents[nextIndex].name;
-            
-            // Update user session with new agent
+
             userSession.currentAgent = nextAgent;
-            
+
             console.log(`✓ Cycled agent for user ${userId}: ${currentAgent} → ${nextAgent}`);
-            console.log(`  Available agents: ${agents.map(a => a.name).join(", ")}`);
-            
             return { success: true, currentAgent: nextAgent };
         } catch (error) {
             console.error(`Failed to cycle agent for user ${userId}:`, error);
             return { success: false };
         }
     }
+
+    // ─── Session Title ────────────────────────────────────────────────────────
 
     async updateSessionTitle(userId: number, title: string): Promise<{ success: boolean; message?: string }> {
         const userSession = this.getUserSession(userId);
@@ -302,12 +339,14 @@ export class OpenCodeService {
         }
     }
 
+    // ─── Projects & Sessions List ─────────────────────────────────────────────
+
     async getProjects(): Promise<Array<{ id: string; worktree: string }>> {
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
 
         try {
             const result = await client.project.list();
-            
+
             if (!result.data) {
                 return [];
             }
@@ -322,17 +361,18 @@ export class OpenCodeService {
         }
     }
 
-    async getSessions(limit: number = 5): Promise<Array<{ id: string; title: string; created: number; updated: number }>> {
+    async getSessions(limit: number = 5, directory?: string): Promise<Array<{ id: string; title: string; created: number; updated: number; worktree?: string }>> {
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
 
         try {
-            const result = await client.session.list();
-            
+            const result = await client.session.list(
+                directory ? { query: { directory } } : undefined
+            );
+
             if (!result.data) {
                 return [];
             }
 
-            // Sort by updated time (most recent first) and limit to specified number
             return result.data
                 .sort((a: any, b: any) => b.time.updated - a.time.updated)
                 .slice(0, limit)
@@ -340,13 +380,16 @@ export class OpenCodeService {
                     id: session.id,
                     title: session.title,
                     created: session.time.created,
-                    updated: session.time.updated
+                    updated: session.time.updated,
+                    worktree: session.worktree
                 }));
         } catch (error) {
             console.error("Failed to get sessions:", error);
             return [];
         }
     }
+
+    // ─── Undo / Redo ─────────────────────────────────────────────────────────
 
     async undoLastMessage(userId: number): Promise<{ success: boolean; message?: string }> {
         const userSession = this.getUserSession(userId);
@@ -358,7 +401,6 @@ export class OpenCodeService {
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
 
         try {
-            // Check if revert method exists on the client
             if (typeof client.session.revert !== 'function') {
                 return { success: false, message: "Undo is not available in this SDK version" };
             }
@@ -385,7 +427,6 @@ export class OpenCodeService {
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
 
         try {
-            // Check if unrevert method exists on the client
             if (typeof client.session.unrevert !== 'function') {
                 return { success: false, message: "Redo is not available in this SDK version" };
             }
@@ -399,6 +440,59 @@ export class OpenCodeService {
         } catch (error) {
             console.error(`Failed to redo message for user ${userId}:`, error);
             return { success: false, message: "Failed to redo last message" };
+        }
+    }
+
+    // ─── Session Restore ──────────────────────────────────────────────────────
+
+    /**
+     * Restore sessions persisted on disk after a bot restart.
+     * For each persisted session, verify it still exists on the OpenCode server.
+     */
+    private async restoreSessionsFromDisk(): Promise<void> {
+        const persisted = this.persistService.loadSessions();
+        if (persisted.size === 0) return;
+
+        const client = createOpencodeClient({ baseUrl: this.baseUrl });
+
+        let serverSessions: any[] = [];
+        try {
+            const result = await client.session.list() as any;
+            serverSessions = (result.data as any[]) || [];
+        } catch (err) {
+            console.warn('[OpenCodeService] Could not reach OpenCode server during restore, skipping session restore');
+            return;
+        }
+
+        const serverSessionIds = new Set(serverSessions.map((s: any) => s.id));
+        let restored = 0;
+
+        for (const [userId, p] of persisted.entries()) {
+            if (!serverSessionIds.has(p.sessionId)) {
+                console.log(`[OpenCodeService] Session ${p.sessionId} for user ${userId} no longer exists on server, removing from disk`);
+                this.persistService.deleteSession(userId);
+                continue;
+            }
+
+            const serverSession = serverSessions.find((s: any) => s.id === p.sessionId);
+            const userSession: UserSession = {
+                userId,
+                sessionId: p.sessionId,
+                session: serverSession,
+                createdAt: new Date(p.createdAt),
+                chatId: p.chatId,
+                lastMessageId: p.lastMessageId,
+                currentAgent: p.currentAgent || 'build',
+                currentModel: p.currentModel || process.env.OPENCODE_DEFAULT_MODEL || 'opencode/glm-5-free',
+            };
+
+            this.userSessions.set(userId, userSession);
+            restored++;
+            console.log(`[OpenCodeService] ✅ Restored session for user ${userId}: ${p.sessionId} (chatId: ${p.chatId})`);
+        }
+
+        if (restored > 0) {
+            console.log(`[OpenCodeService] Restored ${restored} session(s) from disk — event stream will reconnect on next message`);
         }
     }
 }

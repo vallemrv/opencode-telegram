@@ -1,7 +1,7 @@
 {
   "type": "lsp.client.diagnostics",
   "properties": {
-    "path": "/home/tom/telegramCoder/src/features/opencode/opencode.event-handlers.ts",
-    "serverID": "typescript"
+    "path": "/home/valle/Documentos/proyectos/gitea-projects/gotocheck/m4g/docker-compose.yml",
+    "serverID": "yaml-ls"
   }
 }

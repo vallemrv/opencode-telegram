@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenCode Telegram Bot - AI-powered coding assistant
+After=network.target
+
+[Service]
+Type=simple
+User=valle
+WorkingDirectory=/home/valle/Documentos/proyectos/opencode-telegram
+ExecStart=/usr/bin/node dist/cli.js
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/valle/Documentos/proyectos/opencode-telegram/.env
+StandardOutput=append:/home/valle/Documentos/proyectos/opencode-telegram/bot.log
+StandardError=append:/home/valle/Documentos/proyectos/opencode-telegram/bot.log
+
+[Install]
+WantedBy=multi-user.target
