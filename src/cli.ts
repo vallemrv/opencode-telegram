@@ -225,7 +225,7 @@ function startBot() {
 
     // Windows-compatible process spawning
     const isWindows = process.platform === 'win32';
-    const child = spawn('node', [appPath], {
+    const child = spawn(process.execPath, [appPath], {
         stdio: 'inherit',
         env: { ...process.env, NODE_ENV: 'production' },
         // On Windows, we need shell: false for proper signal handling

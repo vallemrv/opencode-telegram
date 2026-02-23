@@ -24,28 +24,42 @@ export class OpenCodeServerService {
         }
     }
 
-    private getOpenCodeCommand(): string {
-        // Check local node_modules first
+    private async getResolvedOpenCodeCommand(): Promise<string | null> {
+        // 1. Check local node_modules first
         const localPath = join(process.cwd(), "node_modules", ".bin", "opencode");
-        return localPath;
+        try {
+            await access(localPath, constants.X_OK);
+            return localPath;
+        } catch {
+            // Not in local node_modules
+        }
+
+        // 2. Check in PATH
+        try {
+            const { execSync } = await import("child_process");
+            const path = execSync("which opencode").toString().trim();
+            if (path) {
+                return path;
+            }
+        } catch {
+            // Not in PATH
+        }
+
+        // 3. Check known user location
+        const userPath = join(process.env.HOME || "", ".opencode", "bin", "opencode");
+        try {
+            await access(userPath, constants.X_OK);
+            return userPath;
+        } catch {
+            // Not in user home
+        }
+
+        return null;
     }
 
     private async isOpenCodeInstalled(): Promise<boolean> {
-        try {
-            // Check local node_modules first
-            const localPath = this.getOpenCodeCommand();
-            await access(localPath, constants.X_OK);
-            return true;
-        } catch {
-            // Fall back to global check
-            try {
-                const { execSync } = require("child_process");
-                execSync("opencode --version", { stdio: "ignore" });
-                return true;
-            } catch {
-                return false;
-            }
-        }
+        const cmd = await this.getResolvedOpenCodeCommand();
+        return cmd !== null;
     }
 
     async startServer(): Promise<{ success: boolean; message: string }> {
@@ -55,7 +69,8 @@ export class OpenCodeServerService {
         }
 
         // Check if opencode is available
-        if (!(await this.isOpenCodeInstalled())) {
+        const opencodeCmd = await this.getResolvedOpenCodeCommand();
+        if (!opencodeCmd) {
             return {
                 success: false,
                 message: "opencode command is not available. Please install OpenCode: npm install -g opencode-ai",
@@ -71,7 +86,6 @@ export class OpenCodeServerService {
             // Start OpenCode server using: opencode serve --port <number> --hostname <string>
             const args = ["serve", "--port", port, "--hostname", hostname];
 
-            const opencodeCmd = this.getOpenCodeCommand();
             const workDir = process.env.GITEA_DEFAULT_WORKDIR || process.cwd();
             
             this.serverProcess = spawn(opencodeCmd, args, {
