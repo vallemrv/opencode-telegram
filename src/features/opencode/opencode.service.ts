@@ -3,18 +3,18 @@ import type { Event } from "@opencode-ai/sdk";
 import type { Context } from "grammy";
 import type { UserSession } from "./opencode.types.js";
 import { processEvent } from "./opencode.event-handlers.js";
-import { SessionPersistService } from "../../services/session-persist.service.js";
+import { SessionDbService } from "../../services/session-db.service.js";
 
 export class OpenCodeService {
     private userSessions: Map<number, UserSession> = new Map();
     private baseUrl: string;
     private eventAbortControllers: Map<number, AbortController> = new Map();
-    private persistService: SessionPersistService;
+    public dbService: SessionDbService;
 
     constructor(baseUrl?: string) {
         this.baseUrl = baseUrl || process.env.OPENCODE_SERVER_URL || "http://localhost:4096";
-        this.persistService = new SessionPersistService();
-        // Restore sessions from disk in background (don't block startup)
+        this.dbService = new SessionDbService();
+        // Restore sessions from DB in background (don't block startup)
         this.restoreSessionsFromDisk().catch(err =>
             console.error('[OpenCodeService] Failed to restore sessions:', err)
         );
@@ -24,15 +24,19 @@ export class OpenCodeService {
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
 
         try {
+            const actualModel = model || process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5-free";
+            const sessionTitle = title ? `${title} [${actualModel}]` : `Session [${actualModel}] ${new Date().toISOString()}`;
+
             const result = await client.session.create({
                 body: {
-                    title: title || `Telegram Session ${new Date().toISOString()}`,
+                    title: sessionTitle,
                     permission: [
                         { permission: "command", pattern: "*", action: "allow" },
                         { permission: "file", pattern: "*", action: "allow" }
                     ]
                 } as any,
-                query: directory ? { directory } : undefined,
+                // Omit directory to force creation in global context, as requested
+                query: undefined,
             });
 
             if (!result.data) {
@@ -50,14 +54,20 @@ export class OpenCodeService {
 
             this.userSessions.set(userId, userSession);
 
-            // Persist to disk so session survives bot restarts
-            this.persistService.saveSession({
+            // Persist to SQLite DB so session survives bot restarts
+            this.dbService.saveSession({
+                id: result.data.id,
                 userId,
-                sessionId: result.data.id,
+                projectId: title || "global",
+                title: sessionTitle,
+                model: userSession.currentModel,
+                chatId: null,
+                lastMessageId: null,
                 currentAgent: "build",
-                currentModel: userSession.currentModel,
                 createdAt: new Date().toISOString(),
+                isActive: true
             });
+            this.dbService.setActiveSession(userId, result.data.id);
 
             return userSession;
         } catch (error) {
@@ -68,6 +78,8 @@ export class OpenCodeService {
         }
     }
 
+
+
     getUserSession(userId: number): UserSession | undefined {
         return this.userSessions.get(userId);
     }
@@ -77,8 +89,8 @@ export class OpenCodeService {
         if (session) {
             session.chatId = chatId;
             session.lastMessageId = messageId;
-            // Keep disk in sync
-            this.persistService.updateSession(userId, { chatId, lastMessageId: messageId });
+            // Keep DB in sync
+            this.dbService.updateSession(session.sessionId, { chatId, lastMessageId: messageId });
         }
     }
 
@@ -152,7 +164,7 @@ export class OpenCodeService {
         // If chatId not set yet, use it from the incoming context
         if (!session.chatId && ctx.chat?.id) {
             session.chatId = ctx.chat.id;
-            this.persistService.updateSession(userId, { chatId: ctx.chat.id });
+            this.dbService.updateSession(session.sessionId, { chatId: ctx.chat.id });
         }
 
         console.log(`[EventStream] Reconnecting for user ${userId} (was not running)`);
@@ -175,6 +187,14 @@ export class OpenCodeService {
         try {
             const fullPrompt = fileContext ? `${fileContext}\n\n${text}` : text;
 
+            let modelConfig = undefined;
+            if (userSession.currentModel) {
+                const parts = userSession.currentModel.split('/');
+                if (parts.length === 2) {
+                    modelConfig = { providerID: parts[0], modelID: parts[1] };
+                }
+            }
+
             // 🔑 USE promptAsync: returns immediately, AI response comes through SSE stream
             // Do NOT use session.prompt() — it blocks until GLM-5 finishes, causing timeouts
             const result = await (client.session as any).promptAsync({
@@ -182,6 +202,7 @@ export class OpenCodeService {
                 body: {
                     parts: [{ type: "text", text: fullPrompt }],
                     agent: userSession.currentAgent,
+                    model: modelConfig, // Ahora es un objeto { providerID, modelID }
                 },
             });
 
@@ -215,10 +236,10 @@ export class OpenCodeService {
 
         try {
             await client.session.delete({
-                path: { id: userSession.sessionId },
-            });
+                sessionID: userSession.sessionId,
+            } as any);
             this.userSessions.delete(userId);
-            this.persistService.deleteSession(userId);
+            this.dbService.deleteSession(userSession.sessionId);
             return true;
         } catch (error) {
             console.error(`Failed to delete session for user ${userId}:`, error);
@@ -316,7 +337,7 @@ export class OpenCodeService {
 
     // ─── Session Title ────────────────────────────────────────────────────────
 
-    async updateSessionTitle(userId: number, title: string): Promise<{ success: boolean; message?: string }> {
+    async updateSessionTitle(userId: number, title: string): Promise<{ success: boolean; message?: string; title?: string }> {
         const userSession = this.getUserSession(userId);
 
         if (!userSession) {
@@ -325,14 +346,31 @@ export class OpenCodeService {
 
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
 
+        // Ensure title contains the model bracket
+        const currentModel = userSession.currentModel || process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5-free";
+        let finalTitle = title;
+
+        // Remove existing model bracket if any to avoid duplicates
+        finalTitle = finalTitle.replace(/\s*\[.*?\]$/, "");
+        finalTitle = `${finalTitle} [${currentModel}]`;
+
         try {
             await client.session.update({
                 path: { id: userSession.sessionId },
-                body: { title }
+                body: { title: finalTitle }
             });
 
-            console.log(`✓ Updated session title for user ${userId}: "${title}"`);
-            return { success: true };
+            // Keep local state in sync
+            userSession.session.title = finalTitle;
+
+            // Sync with local DB
+            this.dbService.updateSession(userSession.sessionId, {
+                title: finalTitle,
+                model: currentModel
+            });
+
+            console.log(`✓ Updated session title for user ${userId}: "${finalTitle}"`);
+            return { success: true, title: finalTitle };
         } catch (error) {
             console.error(`Failed to update session title for user ${userId}:`, error);
             return { success: false, message: "Failed to update session title" };
@@ -450,8 +488,8 @@ export class OpenCodeService {
      * For each persisted session, verify it still exists on the OpenCode server.
      */
     private async restoreSessionsFromDisk(): Promise<void> {
-        const persisted = this.persistService.loadSessions();
-        if (persisted.size === 0) return;
+        const persisted = this.dbService.getAllActiveSessions();
+        if (persisted.length === 0) return;
 
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
 
@@ -467,32 +505,34 @@ export class OpenCodeService {
         const serverSessionIds = new Set(serverSessions.map((s: any) => s.id));
         let restored = 0;
 
-        for (const [userId, p] of persisted.entries()) {
-            if (!serverSessionIds.has(p.sessionId)) {
-                console.log(`[OpenCodeService] Session ${p.sessionId} for user ${userId} no longer exists on server, removing from disk`);
-                this.persistService.deleteSession(userId);
+        for (const p of persisted) {
+            const userId = p.userId;
+
+            if (!serverSessionIds.has(p.id)) {
+                console.log(`[OpenCodeService] Session ${p.id} for user ${userId} no longer exists on server, removing from DB`);
+                this.dbService.deleteSession(p.id);
                 continue;
             }
 
-            const serverSession = serverSessions.find((s: any) => s.id === p.sessionId);
+            const serverSession = serverSessions.find((s: any) => s.id === p.id);
             const userSession: UserSession = {
                 userId,
-                sessionId: p.sessionId,
+                sessionId: p.id,
                 session: serverSession,
                 createdAt: new Date(p.createdAt),
-                chatId: p.chatId,
-                lastMessageId: p.lastMessageId,
+                chatId: p.chatId || undefined,
+                lastMessageId: p.lastMessageId || undefined,
                 currentAgent: p.currentAgent || 'build',
-                currentModel: p.currentModel || process.env.OPENCODE_DEFAULT_MODEL || 'opencode/glm-5-free',
+                currentModel: p.model || process.env.OPENCODE_DEFAULT_MODEL || 'opencode/glm-5-free',
             };
 
             this.userSessions.set(userId, userSession);
             restored++;
-            console.log(`[OpenCodeService] ✅ Restored session for user ${userId}: ${p.sessionId} (chatId: ${p.chatId})`);
+            console.log(`[OpenCodeService] ✅ Restored active session for user ${userId}: ${p.id} (chatId: ${p.chatId})`);
         }
 
         if (restored > 0) {
-            console.log(`[OpenCodeService] Restored ${restored} session(s) from disk — event stream will reconnect on next message`);
+            console.log(`[OpenCodeService] Restored ${restored} active session(s) from DB — event stream will reconnect on next message`);
         }
     }
 }

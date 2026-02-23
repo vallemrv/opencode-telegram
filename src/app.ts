@@ -109,6 +109,8 @@ async function startBot() {
                 { command: 'help', description: 'Show help message' },
                 { command: 'new', description: 'Create a new Gitea project' },
                 { command: 'projects', description: 'List your Gitea projects' },
+                { command: 'sessions', description: 'List sessions for current project' },
+                { command: 'models', description: 'Change current AI model' },
                 { command: 'opencode', description: 'Start an OpenCode session' },
                 { command: 'rename', description: 'Rename current session' },
                 { command: 'endsession', description: 'End your OpenCode session' },

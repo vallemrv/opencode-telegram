@@ -52,6 +52,8 @@ export class OpenCodeBot {
         bot.command("sessions", AccessControlMiddleware.requireAccess, this.handleSessions.bind(this));
         bot.command("undo", AccessControlMiddleware.requireAccess, this.handleUndo.bind(this));
         bot.command("redo", AccessControlMiddleware.requireAccess, this.handleRedo.bind(this));
+        bot.command("delete", AccessControlMiddleware.requireAccess, this.handleDeleteSession.bind(this));
+        bot.command("deleteall", AccessControlMiddleware.requireAccess, this.handleDeleteAllSessions.bind(this));
 
         // Handle keyboard button presses
         bot.hears("⏹️ ESC", AccessControlMiddleware.requireAccess, this.handleEsc.bind(this));
@@ -608,7 +610,7 @@ export class OpenCodeBot {
             const result = await this.opencodeService.updateSessionTitle(userId, newTitle);
 
             if (result.success) {
-                const message = await ctx.reply(`✅ Session renamed to: <b>${newTitle}</b>`, { parse_mode: "HTML" });
+                const message = await ctx.reply(`✅ Session renamed to: <b>${result.title || newTitle}</b>`, { parse_mode: "HTML" });
 
                 // Schedule auto-deletion
                 await MessageUtils.scheduleMessageDeletion(
@@ -663,40 +665,110 @@ export class OpenCodeBot {
 
     private async handleSessions(ctx: Context): Promise<void> {
         try {
-            const sessions = await this.opencodeService.getSessions(5);
+            const userId = ctx.from?.id;
+            if (!userId) return;
 
-            if (sessions.length === 0) {
-                const message = await ctx.reply("💬 No sessions found");
-                await MessageUtils.scheduleMessageDeletion(
-                    ctx,
-                    message.message_id,
-                    this.configService.getMessageDeleteTimeout()
-                );
+            const existingSession = this.opencodeService.getUserSession(userId);
+            if (!existingSession) {
+                const msg = await ctx.reply("❌ No hay una sesión activa. Usa /projects para elegir un proyecto primero.");
+                await MessageUtils.scheduleMessageDeletion(ctx, msg.message_id, 10000);
                 return;
             }
 
-            // Format sessions with title and short ID
-            const sessionList = sessions
-                .map((session, index) => {
+            // Get current project directory
+            const projectPath = existingSession.session.directory || process.env.GITEA_DEFAULT_WORKDIR || "/home/valle/Documentos/proyectos/gitea-projects";
+            const nodePath = await import("path");
+            const projectName = nodePath.basename(projectPath);
+
+            const recentSessions = this.opencodeService.dbService.getUserSessions(userId, 10)
+                .filter(s => s.projectId === projectName);
+
+            const keyboard = new InlineKeyboard();
+
+            if (recentSessions.length > 0) {
+                for (const session of recentSessions) {
                     const shortId = session.id.substring(0, 8);
                     const title = session.title || "Untitled";
-                    const date = new Date(session.updated * 1000).toLocaleString();
-                    return `${index + 1}. <b>${title}</b>\n   ID: <code>${shortId}</code>\n   Updated: ${date}`;
-                })
-                .join("\n\n");
+                    const activeMarker = session.isActive ? "✅" : "🔁";
+                    const label = `${activeMarker} ${title} (${shortId})`;
+                    keyboard.text(label, `session:resume:${session.id}:${projectName}`).row();
+                }
+            }
 
-            const message = await ctx.reply(`💬 <b>Recent Sessions (Last 5):</b>\n\n${sessionList}`, {
-                parse_mode: "HTML"
-            });
+            keyboard.text("🆕 Nueva sesión", `project:new:${projectName}`);
 
-            // Schedule auto-deletion
-            await MessageUtils.scheduleMessageDeletion(
-                ctx,
-                message.message_id,
-                this.configService.getMessageDeleteTimeout()
+            await ctx.reply(
+                `📂 <b>${projectName}</b>\n\nAquí están las sesiones de este proyecto. ¿Qué quieres hacer?`,
+                { parse_mode: "HTML", reply_markup: keyboard }
             );
+
         } catch (error) {
             await ctx.reply(ErrorUtils.createErrorMessage("list sessions", error));
+        }
+    }
+
+    private async handleDeleteSession(ctx: Context): Promise<void> {
+        try {
+            const userId = ctx.from?.id;
+            if (!userId) return;
+
+            const hasActive = this.opencodeService.hasActiveSession(userId);
+            if (!hasActive) {
+                await ctx.reply("❌ No hay una sesión activa que borrar. Usa /sessions para ver tus sesiones guardadas, entra a una y bórrala.");
+                return;
+            }
+
+            const success = await this.opencodeService.deleteSession(userId);
+            if (success) {
+                await ctx.reply("🗑️ Sesión actual borrada con éxito de OpenCode y de la bot-DB local.\n\nUsa /opencode o /sessions para continuar.");
+            } else {
+                await ctx.reply("❌ Falló el intento de borrar la sesión.");
+            }
+        } catch (error) {
+            await ctx.reply(ErrorUtils.createErrorMessage("delete session", error));
+        }
+    }
+
+    private async handleDeleteAllSessions(ctx: Context): Promise<void> {
+        try {
+            const userId = ctx.from?.id;
+            if (!userId) return;
+
+            const sessions = this.opencodeService.dbService.getUserSessions(userId, 100);
+            if (sessions.length === 0) {
+                await ctx.reply("❌ No se encontraron sesiones para borrar.");
+                return;
+            }
+
+            // Avisamos por adelantado porque puede tardar
+            const msg = await ctx.reply("⏳ Borrando todas las sesiones de este usuario en OpenCode y DB...");
+
+            // Delete one by one through OpenCodeService
+            for (const s of sessions) {
+                try {
+                    // Activate sequentially to delete through the unified method
+                    this.opencodeService.dbService.setActiveSession(userId, s.id);
+                    // Mock UserSession in memory so deleteSession can work on it
+                    const mockSession = { sessionId: s.id } as any;
+                    (this.opencodeService as any).userSessions.set(userId, mockSession);
+                    await this.opencodeService.deleteSession(userId);
+                } catch (err) {
+                    console.error("Failed to delete", err);
+                }
+            }
+
+            // Clean up left-overs in DB
+            this.opencodeService.dbService.deleteAllUserSessions(userId);
+
+            // Clear memory
+            if (this.opencodeService.hasActiveSession(userId)) {
+                this.opencodeService.stopEventStream(userId);
+                (this.opencodeService as any).userSessions.delete(userId);
+            }
+
+            await ctx.api.editMessageText(msg.chat.id, msg.message_id, `🗑️ Se han borrado exitosamente las ${sessions.length} sesiones.`);
+        } catch (error) {
+            await ctx.reply(ErrorUtils.createErrorMessage("delete all sessions", error));
         }
     }
 
@@ -952,37 +1024,33 @@ export class OpenCodeBot {
                 return;
             }
 
-            // If user already has an active session → show options
-            if (this.opencodeService.hasActiveSession(userId)) {
-                // Determine project path to filter sessions
-                const workDir = process.env.GITEA_DEFAULT_WORKDIR || "/home/valle/Documentos/proyectos/gitea-projects";
-                const projectPath = nodePath.join(workDir, projectName);
+            // Determine project path to filter sessions
+            const workDir = process.env.GITEA_DEFAULT_WORKDIR || "/home/valle/Documentos/proyectos/gitea-projects";
+            const projectPath = nodePath.join(workDir, projectName);
 
-                // Fetch recent sessions restricted to this project
-                const recentSessions = await this.opencodeService.getSessions(5, projectPath);
+            // Siempre buscamos en OpenCode si ya hay sesiones para este proyecto
+            const recentSessions = await this.opencodeService.getSessions(5, projectPath);
 
+            if (recentSessions.length > 0) {
                 const keyboard = new InlineKeyboard();
 
-                if (recentSessions.length > 0) {
-                    for (const session of recentSessions) {
-                        const shortId = session.id.substring(0, 8);
-                        const title = session.title || "Untitled";
-                        const label = `🔁 ${title} (${shortId})`;
-                        keyboard.text(label, `session:resume:${session.id}:${projectName}`).row();
-                    }
+                for (const session of recentSessions) {
+                    const shortId = session.id.substring(0, 8);
+                    const title = session.title || "Untitled";
+                    const label = `🔁 ${title} (${shortId})`;
+                    keyboard.text(label, `session:resume:${session.id}:${projectName}`).row();
                 }
 
                 keyboard.text("🆕 Nueva sesión", `project:new:${projectName}`);
 
                 await ctx.reply(
-                    `📂 <b>${projectName}</b>\n\nYa tienes una sesión activa. ¿Qué quieres hacer?`,
+                    `📂 <b>${projectName}</b>\n\nTienes sesiones previas en este proyecto. ¿Qué quieres hacer?`,
                     { parse_mode: "HTML", reply_markup: keyboard }
                 );
-                return;
+            } else {
+                // Si OpenCode no tiene ninguna sesión para este proyecto, empezamos una de cero directo
+                await this.startSessionForProject(ctx, userId, projectName);
             }
-
-            // No active session → start directly
-            await this.startSessionForProject(ctx, userId, projectName);
 
         } catch (error) {
             console.error("Error in handleProjectSelection:", error);
@@ -1052,18 +1120,25 @@ export class OpenCodeBot {
 
             // Re-attach to the existing session by ID
             const existingUserSession = this.opencodeService.getUserSession(userId);
-            const currentModel = existingUserSession?.currentModel ||
-                process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5-free";
 
             // Find the session data from the list (SDK has no retrieve by ID)
             const workDir = process.env.GITEA_DEFAULT_WORKDIR || "/home/valle/Documentos/proyectos/gitea-projects";
             const projectPath = (await import("path")).join(workDir, projectName);
             const client = (await import("@opencode-ai/sdk")).createOpencodeClient({ baseUrl: process.env.OPENCODE_SERVER_URL || "http://localhost:4096" });
-            const listResult = await client.session.list({ query: { directory: projectPath } }) as any;
+            const listResult = await client.session.list() as any;
+
             const sessionData = (listResult.data as any[])?.find((s: any) => s.id === sessionId);
             if (!sessionData) {
                 await ctx.editMessageText("❌ No se pudo recuperar la sesión. Es posible que haya sido eliminada de OpenCode.");
                 return;
+            }
+
+            // Extract model from session title if present: "My Project [opencode/glm-5]"
+            let currentModel = existingUserSession?.currentModel || process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5-free";
+            const sessionTitleDisplay = sessionData.title || projectName;
+            const titleMatch = sessionTitleDisplay.match(/\[(.*?)\]/);
+            if (titleMatch && titleMatch[1]) {
+                currentModel = titleMatch[1];
             }
 
             // Register the session in memory
@@ -1076,15 +1151,10 @@ export class OpenCodeBot {
                 currentModel,
             });
 
-            // Make sure the session state is saved to disk immediately
-            (this.opencodeService as any).persistService.saveSession({
-                userId,
-                sessionId,
-                currentAgent: "build",
-                currentModel,
-                createdAt: new Date().toISOString(),
-                chatId: ctx.chat!.id
-            });
+            // Set session active in local DB
+            this.opencodeService.dbService.setActiveSession(userId, sessionId);
+            // Re-attach context
+            this.opencodeService.updateSessionContext(userId, ctx.chat?.id || 0, ctx.message?.message_id || 0);
 
             await ctx.deleteMessage();
             const modelInfo = currentModel ? `\n🤖 Model: <code>${currentModel}</code>` : "";
@@ -1377,6 +1447,16 @@ export class OpenCodeBot {
             const userSession = this.opencodeService.getUserSession(userId);
             if (userSession) {
                 userSession.currentModel = fullModelId;
+
+                // Update the session title in OpenCode so the [model] tag changes
+                const currentTitle = userSession.session.title || "Telegram Session";
+                await this.opencodeService.updateSessionTitle(userId, currentTitle);
+
+                // Save explicitly to persist the model change in DB
+                this.opencodeService.dbService.updateSession(userSession.sessionId, {
+                    model: fullModelId,
+                    chatId: ctx.chat?.id || userSession.chatId,
+                });
 
                 // Show success with model change confirmation
                 const keyboard = new InlineKeyboard();

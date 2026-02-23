@@ -50,6 +50,7 @@ const commonOptions = {
     "ai",
     "archiver",
     "zod",
+    "better-sqlite3",
   ],
   banner: {
     js: "#!/usr/bin/env node",
