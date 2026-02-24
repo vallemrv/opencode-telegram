@@ -115,6 +115,8 @@ async function startBot() {
                 { command: 'endsession', description: 'Terminar sesión activa' },
                 { command: 'rename', description: 'Renombrar sesión actual' },
                 { command: 'new', description: 'Crear nuevo proyecto en Gitea' },
+                { command: 'run', description: 'Lanzar subagente en segundo plano' },
+                { command: 'restart', description: 'Reiniciar OpenCode server y bot' },
                 { command: 'help', description: 'Ayuda' },
             ]);
             console.log('[TelegramCoder] ✅ Bot commands registered');

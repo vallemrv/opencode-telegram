@@ -36,7 +36,16 @@ GITEA_TOKEN=
 # Supports ~ expansion.  Default: ~/proyectos/gitea-projects
 GITEA_DEFAULT_WORKDIR=~/proyectos/gitea-projects
 
-# ─── Messages ────────────────────────────────────────────────────────────────
+# ─── Background Agent (/run command) ────────────────────────────────────────
+# Default model for background opencode run tasks (provider/model-id)
+# If not set, falls back to OPENCODE_DEFAULT_MODEL
+BACKGROUND_MODEL=github-copilot/claude-sonnet-4.6
+
+# Default working directory for /run tasks (optional, the command will ask)
+# Supports ~ expansion. If empty, /run always asks the user.
+BACKGROUND_WORKDIR=
+
+
 # Auto-delete timeout for confirmation messages in milliseconds (0 = disable)
 MESSAGE_DELETE_TIMEOUT=10000
 

@@ -3,6 +3,9 @@ import { OpenCodeService } from "./opencode.service.js";
 import { ConfigService } from "../../services/config.service.js";
 import { OpenCodeServerService } from "../../services/opencode-server.service.js";
 import { GiteaService } from "../../services/gitea.service.js";
+import { BackgroundAgentService, resolveDir } from "../../services/background-agent.service.js";
+import { AgentDbService } from "../../services/agent-db.service.js";
+import { PersistentAgentService, pickPort } from "../../services/persistent-agent.service.js";
 import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
 import { MessageUtils } from "../../utils/message.utils.js";
 import { ErrorUtils } from "../../utils/error.utils.js";
@@ -11,6 +14,16 @@ import { FileMentionService, FileMentionUI } from "../file-mentions/index.js";
 import * as fs from "fs";
 import * as nodePath from "path";
 import * as os from "os";
+import { randomUUID } from "crypto";
+
+// ─── /createagent wizard state ────────────────────────────────────────────────
+interface CreateAgentWizardState {
+    step: "name" | "role" | "workdir" | "model";
+    name?: string;
+    role?: string;
+    workdir?: string;
+}
+
 
 /** Resuelve ~ en rutas y expande variables de entorno básicas */
 function resolveWorkDir(p: string): string {
@@ -35,8 +48,14 @@ export class OpenCodeBot {
     private configService: ConfigService;
     private serverService: OpenCodeServerService;
     private giteaService: GiteaService;
+    private backgroundAgentService: BackgroundAgentService;
+    private agentDb: AgentDbService;
+    private persistentAgentService: PersistentAgentService;
     private fileMentionService: FileMentionService;
     private fileMentionUI: FileMentionUI;
+
+    /** Wizard state per user for /createagent multi-step flow */
+    private createAgentWizardState: Map<number, CreateAgentWizardState> = new Map();
 
     constructor(
         opencodeService: OpenCodeService,
@@ -46,6 +65,9 @@ export class OpenCodeBot {
         this.configService = configService;
         this.serverService = new OpenCodeServerService();
         this.giteaService = new GiteaService();
+        this.backgroundAgentService = new BackgroundAgentService();
+        this.agentDb = new AgentDbService();
+        this.persistentAgentService = new PersistentAgentService();
         this.fileMentionService = new FileMentionService();
         this.fileMentionUI = new FileMentionUI();
     }
@@ -59,6 +81,25 @@ export class OpenCodeBot {
     }
 
     registerHandlers(bot: Bot): void {
+        // Restore persistent agents in background; notify owners of failures
+        this.persistentAgentService.restoreAll(this.agentDb.getAll())
+            .then(async (failed) => {
+                for (const agent of failed) {
+                    try {
+                        await bot.api.sendMessage(
+                            agent.userId,
+                            `⚠️ <b>Agente "${agent.name}" no pudo restaurarse</b>\n\n` +
+                            `Puerto: <code>${agent.port}</code> — el servidor <code>opencode serve</code> no respondió en 20s.\n\n` +
+                            `El agente sigue en la base de datos. Cuando le envíes un prompt, intentará arrancar de nuevo automáticamente.`,
+                            { parse_mode: "HTML" }
+                        );
+                    } catch (err) {
+                        console.error(`[OpenCodeBot] Could not notify user ${agent.userId} of failed restore:`, err);
+                    }
+                }
+            })
+            .catch(err => console.error("[OpenCodeBot] Failed to restore persistent agents:", err));
+
         bot.command("start", AccessControlMiddleware.requireAccess, this.handleStart.bind(this));
         bot.command("help", AccessControlMiddleware.requireAccess, this.handleStart.bind(this));
         bot.command("opencode", AccessControlMiddleware.requireAccess, this.handleOpenCode.bind(this));
@@ -73,6 +114,16 @@ export class OpenCodeBot {
         bot.command("redo", AccessControlMiddleware.requireAccess, this.handleRedo.bind(this));
         bot.command("delete", AccessControlMiddleware.requireAccess, this.handleDeleteSession.bind(this));
         bot.command("deleteall", AccessControlMiddleware.requireAccess, this.handleDeleteAllSessions.bind(this));
+        bot.command("restart", AccessControlMiddleware.requireAccess, this.handleRestart.bind(this));
+        bot.command("run", AccessControlMiddleware.requireAccess, this.handleRun.bind(this));
+        bot.command("createagent", AccessControlMiddleware.requireAccess, this.handleCreateAgent.bind(this));
+        bot.command("agents", AccessControlMiddleware.requireAccess, this.handleAgents.bind(this));
+
+        // Inline callbacks for persistent agents
+        bot.callbackQuery(/^pagent:switch:/, AccessControlMiddleware.requireAccess, this.handleAgentSwitch.bind(this));
+        bot.callbackQuery(/^pagent:main$/, AccessControlMiddleware.requireAccess, this.handleAgentSwitchMain.bind(this));
+        bot.callbackQuery(/^pagent:del:/, AccessControlMiddleware.requireAccess, this.handleAgentDelete.bind(this));
+        bot.callbackQuery(/^pagent:delconfirm:/, AccessControlMiddleware.requireAccess, this.handleAgentDeleteConfirm.bind(this));
 
         // Handle keyboard button presses
         bot.hears("⏹️ ESC", AccessControlMiddleware.requireAccess, this.handleEsc.bind(this));
@@ -110,7 +161,13 @@ export class OpenCodeBot {
             if (ctx.message?.text === "⏹️ ESC" || ctx.message?.text === "⇥ TAB") {
                 return next();
             }
-            // Treat as prompt
+            // Intercept /createagent wizard replies
+            const userId = ctx.from?.id;
+            if (userId && this.createAgentWizardState.has(userId)) {
+                await this.handleCreateAgentWizardReply(ctx);
+                return;
+            }
+            // Treat as prompt — route to active persistent agent or main OpenCode
             await this.handleMessageAsPrompt(ctx);
         });
     }
@@ -143,6 +200,10 @@ export class OpenCodeBot {
                 '/esc - Abort the current AI operation',
                 '/undo - Revert the last message/change',
                 '/redo - Restore a previously undone change',
+                '/run - Switch active persistent agent',
+                '/createagent - Create a new persistent subagent',
+                '/agents - List / delete persistent agents',
+                '/restart - Restart OpenCode server and bot',
                 '⇥ TAB button - Cycle between agents (build ↔ plan)',
                 '⏹️ ESC button - Same as /esc command',
                 '',
@@ -325,54 +386,88 @@ export class OpenCodeBot {
                 return;
             }
 
-            // Si no hay sesión en memoria, intentar recuperarla de OpenCode
+            const promptText = ctx.message?.text?.trim() || "";
+            if (!promptText) return;
+
+            // ── Route to persistent subagent if one is active ─────────────────
+            const activeAgentId = this.persistentAgentService.getActiveAgentId(userId);
+            if (activeAgentId) {
+                const agent = this.agentDb.getById(activeAgentId);
+                if (agent) {
+                    await this.sendPromptToPersistentAgent(ctx, agent, promptText);
+                    return;
+                } else {
+                    // Agent was deleted — clear sticky state
+                    this.persistentAgentService.clearActiveAgent(userId);
+                }
+            }
+
+            // ── Main OpenCode session ─────────────────────────────────────────
             if (!this.opencodeService.hasActiveSession(userId)) {
                 await this.opencodeService.tryRestoreLatestSession(userId, ctx);
             }
 
-            // Tras el intento de restaurar, comprobamos de nuevo
             if (!this.opencodeService.hasActiveSession(userId)) {
                 await ctx.reply("❌ No hay sesión activa. Usa /projects para elegir un proyecto.");
                 return;
             }
 
-            // Asegurar que el event stream está vivo
             this.opencodeService.ensureEventStream(userId, ctx);
 
-            // 🚦 BUSY GUARD
             const userSession = this.opencodeService.getUserSession(userId);
             if (userSession?.isProcessing) {
                 await ctx.reply("⏳ Espera — OpenCode aún está procesando. Responderá enseguida.");
                 return;
             }
 
-            const promptText = ctx.message?.text?.trim() || "";
+            if (userSession) userSession.isProcessing = true;
 
-            if (!promptText) {
-                return;
-            }
-
-            // Marcar como ocupado antes de enviar
-            if (userSession) {
-                userSession.isProcessing = true;
-            }
-
-            // Check for file mentions
             const mentions = this.fileMentionService.parseMentions(promptText);
-
             if (mentions.length > 0 && this.fileMentionService.isEnabled()) {
                 await this.handlePromptWithMentions(ctx, userId, promptText, mentions);
             } else {
                 await this.sendPromptToOpenCode(ctx, userId, promptText);
             }
         } catch (error) {
-            // Clear processing flag on error too
             const userId = ctx.from?.id;
             if (userId) {
                 const s = this.opencodeService.getUserSession(userId);
                 if (s) s.isProcessing = false;
             }
             await ctx.reply(ErrorUtils.createErrorMessage("send prompt to OpenCode", error));
+        }
+    }
+
+    /** Send a prompt to a persistent agent and deliver the response */
+    private async sendPromptToPersistentAgent(ctx: Context, agent: any, promptText: string): Promise<void> {
+        const statusMsg = await ctx.reply(
+            `🤖 <b>${escapeHtml(agent.name)}</b> procesando…`,
+            { parse_mode: "HTML" }
+        );
+        await ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => { });
+
+        const result = await this.persistentAgentService.sendPrompt(agent, promptText);
+
+        const header = `🤖 <b>${escapeHtml(agent.name)}</b>\n\n`;
+        const body = result.output || "(sin salida)";
+        const MAX = 3800;
+
+        if (body.length <= MAX) {
+            await ctx.api.editMessageText(
+                statusMsg.chat.id,
+                statusMsg.message_id,
+                `${header}${formatAsHtml(body)}`,
+                { parse_mode: "HTML" }
+            ).catch(async () => {
+                await ctx.reply(`${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
+            });
+        } else {
+            await ctx.api.deleteMessage(statusMsg.chat.id, statusMsg.message_id).catch(() => { });
+            const buf = Buffer.from(body, "utf8");
+            await ctx.replyWithDocument(new InputFile(buf, `${agent.name}-respuesta.md`), {
+                caption: `${header}(resultado adjunto por longitud)`,
+                parse_mode: "HTML",
+            });
         }
     }
 
@@ -1734,6 +1829,417 @@ export class OpenCodeBot {
         } catch (error) {
             console.error("Error in handleModelSelection:", error);
             await ctx.reply(ErrorUtils.createErrorMessage("select model", error));
+        }
+    }
+
+    private async handleRestart(ctx: Context): Promise<void> {
+        const { execSync } = await import("child_process");
+
+        const statusMsg = await ctx.reply(
+            "🔄 <b>Reiniciando servicios...</b>\n\n" +
+            "⏳ Ejecutando <code>npm run build</code>...",
+            { parse_mode: "HTML" }
+        );
+
+        const editStatus = async (text: string) => {
+            await ctx.api.editMessageText(
+                statusMsg.chat.id,
+                statusMsg.message_id,
+                text,
+                { parse_mode: "HTML" }
+            ).catch(() => { });
+        };
+
+        try {
+            // 1. Build
+            execSync("npm run build", {
+                cwd: "/home/valle/Documentos/proyectos/opencode-telegram",
+                stdio: "pipe",
+            });
+
+            await editStatus(
+                "🔄 <b>Reiniciando servicios...</b>\n\n" +
+                "✅ Build completado\n" +
+                "⏳ Ejecutando <code>sudo systemctl restart opencode-telegram</code>..."
+            );
+
+            // 2. Restart the systemd service — this kills the current process too,
+            //    so systemd will bring everything back fresh (opencode serve + bot).
+            execSync("sudo systemctl restart opencode-telegram.service", {
+                stdio: "pipe",
+            });
+
+            // If we somehow reach here before systemd kills us, let the user know
+            await editStatus(
+                "✅ <b>Reinicio en curso</b>\n\n" +
+                "✅ Build completado\n" +
+                "✅ Servicio reiniciado — el bot volverá en unos segundos."
+            );
+
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            await editStatus(
+                "❌ <b>Error durante el reinicio</b>\n\n" +
+                `<pre>${msg.slice(0, 800)}</pre>`
+            ).catch(() => { });
+        }
+    }
+
+    // ─── /run — switch active agent ───────────────────────────────────────────
+
+    /**
+     * /run — if the user has persistent agents, show an inline keyboard to switch
+     * the active agent (or go back to the main session). If no agents exist, redirect
+     * to /createagent.
+     */
+    private async handleRun(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const agents = this.agentDb.getByUser(userId);
+
+        if (agents.length === 0) {
+            await ctx.reply(
+                "ℹ️ No tienes agentes persistentes todavía.\n\n" +
+                "Usa /createagent para crear tu primer agente."
+            );
+            return;
+        }
+
+        const activeId = this.persistentAgentService.getActiveAgentId(userId);
+        const keyboard = new InlineKeyboard();
+
+        for (const agent of agents) {
+            const isActive = agent.id === activeId;
+            const label = `${isActive ? "● " : ""}${agent.name} [${agent.model}]`;
+            keyboard.text(label, `pagent:switch:${agent.id}`).row();
+        }
+        keyboard.text("▶ Agente principal (OpenCode)", "pagent:main");
+
+        const activeAgent = activeId ? agents.find(a => a.id === activeId) : null;
+        const activeLine = activeAgent
+            ? `Activo ahora: <b>${escapeHtml(activeAgent.name)}</b>`
+            : `Activo ahora: <b>Agente principal (OpenCode)</b>`;
+
+        await ctx.reply(
+            `🤖 <b>Selecciona agente activo</b>\n\n${activeLine}\n\n` +
+            `Los mensajes que envíes irán al agente seleccionado:`,
+            { parse_mode: "HTML", reply_markup: keyboard }
+        );
+    }
+
+    // ─── /createagent wizard ──────────────────────────────────────────────────
+
+    /** Step 1: /createagent — ask for agent name */
+    private async handleCreateAgent(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        this.createAgentWizardState.set(userId, { step: "name" });
+
+        await ctx.reply(
+            `🤖 <b>Crear agente persistente</b>\n\n` +
+            `Paso 1/4 — <b>Nombre</b>\n\n` +
+            `Escribe un nombre corto para el agente (ej: <code>backend-helper</code>):`,
+            {
+                parse_mode: "HTML",
+                reply_markup: { force_reply: true, selective: true },
+            }
+        );
+    }
+
+    /** Handles each wizard reply for /createagent */
+    private async handleCreateAgentWizardReply(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const state = this.createAgentWizardState.get(userId);
+        if (!state) return;
+
+        const text = ctx.message?.text?.trim() || "";
+        if (!text) {
+            await ctx.reply("❌ No puede estar vacío. Inténtalo de nuevo:",
+                { reply_markup: { force_reply: true, selective: true } });
+            return;
+        }
+
+        if (state.step === "name") {
+            state.name = text;
+            state.step = "role";
+
+            await ctx.reply(
+                `✅ Nombre: <b>${escapeHtml(text)}</b>\n\n` +
+                `Paso 2/4 — <b>Rol (system prompt)</b>\n\n` +
+                `Describe el rol y comportamiento del agente. Este texto se inyectará al inicio de cada prompt.\n` +
+                `Escribe <code>.</code> para omitir (sin rol específico):`,
+                {
+                    parse_mode: "HTML",
+                    reply_markup: { force_reply: true, selective: true },
+                }
+            );
+            return;
+        }
+
+        if (state.step === "role") {
+            state.role = text === "." ? "" : text;
+            state.step = "workdir";
+
+            const defaultWorkdir = this.configService.getBackgroundWorkdir();
+            const hint = defaultWorkdir
+                ? `Deja vacío o escribe <code>.</code> para usar:\n<code>${defaultWorkdir}</code>`
+                : `Ej: <code>~/proyectos/mi-proyecto</code>`;
+
+            await ctx.reply(
+                `✅ Rol guardado.\n\n` +
+                `Paso 3/4 — <b>Directorio de trabajo</b>\n\n` +
+                `Ruta del proyecto donde operará el agente.\n${hint}`,
+                {
+                    parse_mode: "HTML",
+                    reply_markup: { force_reply: true, selective: true },
+                }
+            );
+            return;
+        }
+
+        if (state.step === "workdir") {
+            const defaultWorkdir = this.configService.getBackgroundWorkdir();
+            const rawDir = (text === "" || text === ".") ? defaultWorkdir : text;
+
+            if (!rawDir) {
+                await ctx.reply("❌ No hay directorio configurado. Escribe una ruta válida:",
+                    { reply_markup: { force_reply: true, selective: true } });
+                return;
+            }
+
+            const resolved = resolveDir(rawDir);
+            const fs = await import("fs");
+            if (!fs.existsSync(resolved)) {
+                await ctx.reply(
+                    `❌ El directorio no existe:\n<code>${resolved}</code>\n\nEscribe otra ruta:`,
+                    {
+                        parse_mode: "HTML",
+                        reply_markup: { force_reply: true, selective: true },
+                    }
+                );
+                return;
+            }
+
+            state.workdir = resolved;
+            state.step = "model";
+
+            const defaultModel = this.configService.getBackgroundModel();
+            await ctx.reply(
+                `✅ Directorio: <code>${resolved}</code>\n\n` +
+                `Paso 4/4 — <b>Modelo</b>\n\n` +
+                `Modelo a usar en formato <code>provider/model</code>.\n` +
+                `Escribe <code>.</code> para usar el predeterminado:\n<code>${defaultModel}</code>`,
+                {
+                    parse_mode: "HTML",
+                    reply_markup: { force_reply: true, selective: true },
+                }
+            );
+            return;
+        }
+
+        if (state.step === "model") {
+            const defaultModel = this.configService.getBackgroundModel();
+            const model = (text === "" || text === ".") ? defaultModel : text;
+
+            this.createAgentWizardState.delete(userId);
+
+            const id = randomUUID();
+            const port = pickPort(this.agentDb.usedPorts());
+
+            const agent = {
+                id,
+                userId,
+                name: state.name!,
+                role: state.role ?? "",
+                workdir: state.workdir!,
+                model,
+                port,
+                createdAt: new Date().toISOString(),
+            };
+
+            this.agentDb.save(agent);
+
+            const statusMsg = await ctx.reply(
+                `✅ <b>Agente creado</b>\n\n` +
+                `Nombre: <b>${escapeHtml(agent.name)}</b>\n` +
+                `Modelo: <code>${model}</code>\n` +
+                `Puerto: <code>${port}</code>\n` +
+                `Dir: <code>${agent.workdir}</code>\n\n` +
+                `⏳ Arrancando servidor...`,
+                { parse_mode: "HTML" }
+            );
+
+            this.persistentAgentService.startAgent(agent)
+                .then(async (result) => {
+                    const icon = result.success ? "✅" : "⚠️";
+                    await ctx.api.editMessageText(
+                        statusMsg.chat.id,
+                        statusMsg.message_id,
+                        `${icon} <b>Agente "${escapeHtml(agent.name)}"</b> listo en <code>:${port}</code>\n\n` +
+                        `Modelo: <code>${model}</code>\n` +
+                        `Dir: <code>${agent.workdir}</code>\n\n` +
+                        `Usa <b>/run</b> para seleccionarlo como agente activo.`,
+                        { parse_mode: "HTML" }
+                    ).catch(() => {});
+                })
+                .catch(async (err) => {
+                    await ctx.api.editMessageText(
+                        statusMsg.chat.id,
+                        statusMsg.message_id,
+                        `⚠️ Agente creado pero el servidor no arrancó:\n<pre>${escapeHtml(String(err))}</pre>`,
+                        { parse_mode: "HTML" }
+                    ).catch(() => {});
+                });
+        }
+    }
+
+    // ─── /agents — list and delete ────────────────────────────────────────────
+
+    private async handleAgents(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const agents = this.agentDb.getByUser(userId);
+
+        if (agents.length === 0) {
+            await ctx.reply(
+                "📋 No tienes agentes persistentes.\n\nUsa /createagent para crear uno."
+            );
+            return;
+        }
+
+        const activeId = this.persistentAgentService.getActiveAgentId(userId);
+
+        const keyboard = new InlineKeyboard();
+        for (const agent of agents) {
+            const isActive = agent.id === activeId;
+            const label = `${isActive ? "● " : ""}${agent.name} [${agent.model}]`;
+            keyboard.text(label, `pagent:switch:${agent.id}`).text("🗑️", `pagent:del:${agent.id}`).row();
+        }
+        keyboard.text("▶ Agente principal", "pagent:main");
+
+        const activeAgent = activeId ? agents.find(a => a.id === activeId) : null;
+        const activeLine = activeAgent
+            ? `\nActivo: <b>${escapeHtml(activeAgent.name)}</b>`
+            : "\nActivo: <b>Agente principal (OpenCode)</b>";
+
+        await ctx.reply(
+            `🤖 <b>Tus agentes persistentes</b>${activeLine}\n\n` +
+            `Selecciona para hacer switch o toca 🗑️ para borrar:`,
+            { parse_mode: "HTML", reply_markup: keyboard }
+        );
+    }
+
+    // ─── Callbacks: switch, delete ────────────────────────────────────────────
+
+    private async handleAgentSwitch(ctx: Context): Promise<void> {
+        try {
+            await ctx.answerCallbackQuery();
+            const userId = ctx.from?.id;
+            if (!userId) return;
+
+            const agentId = (ctx.callbackQuery?.data || "").replace("pagent:switch:", "");
+            const agent = this.agentDb.getById(agentId);
+            if (!agent) {
+                await ctx.editMessageText("❌ Agente no encontrado.");
+                return;
+            }
+
+            this.persistentAgentService.setActiveAgent(userId, agentId);
+
+            await ctx.editMessageText(
+                `✅ Agente activo: <b>${escapeHtml(agent.name)}</b>\n\n` +
+                `Ahora tus mensajes irán a este agente.\n` +
+                `Usa /run para cambiar de agente o /agents para ver la lista.`,
+                { parse_mode: "HTML" }
+            );
+        } catch (error) {
+            console.error("handleAgentSwitch error:", error);
+            await ctx.reply(ErrorUtils.createErrorMessage("switch agent", error));
+        }
+    }
+
+    private async handleAgentSwitchMain(ctx: Context): Promise<void> {
+        try {
+            await ctx.answerCallbackQuery();
+            const userId = ctx.from?.id;
+            if (!userId) return;
+
+            this.persistentAgentService.clearActiveAgent(userId);
+
+            await ctx.editMessageText(
+                `✅ Agente activo: <b>Agente principal (OpenCode)</b>\n\n` +
+                `Tus mensajes vuelven a la sesión OpenCode principal.`,
+                { parse_mode: "HTML" }
+            );
+        } catch (error) {
+            console.error("handleAgentSwitchMain error:", error);
+            await ctx.reply(ErrorUtils.createErrorMessage("switch to main agent", error));
+        }
+    }
+
+    private async handleAgentDelete(ctx: Context): Promise<void> {
+        try {
+            await ctx.answerCallbackQuery();
+            const userId = ctx.from?.id;
+            if (!userId) return;
+
+            const agentId = (ctx.callbackQuery?.data || "").replace("pagent:del:", "");
+            const agent = this.agentDb.getById(agentId);
+            if (!agent) {
+                await ctx.editMessageText("❌ Agente no encontrado.");
+                return;
+            }
+
+            const keyboard = new InlineKeyboard()
+                .text("✅ Sí, borrar", `pagent:delconfirm:${agentId}`)
+                .text("❌ Cancelar", "pagent:main");
+
+            await ctx.editMessageText(
+                `🗑️ ¿Borrar agente <b>${escapeHtml(agent.name)}</b>?\n\n` +
+                `Esto detendrá su servidor y eliminará toda la configuración.`,
+                { parse_mode: "HTML", reply_markup: keyboard }
+            );
+        } catch (error) {
+            console.error("handleAgentDelete error:", error);
+            await ctx.reply(ErrorUtils.createErrorMessage("delete agent prompt", error));
+        }
+    }
+
+    private async handleAgentDeleteConfirm(ctx: Context): Promise<void> {
+        try {
+            await ctx.answerCallbackQuery();
+            const userId = ctx.from?.id;
+            if (!userId) return;
+
+            const agentId = (ctx.callbackQuery?.data || "").replace("pagent:delconfirm:", "");
+            const agent = this.agentDb.getById(agentId);
+            if (!agent) {
+                await ctx.editMessageText("❌ Agente no encontrado.");
+                return;
+            }
+
+            // Stop process and delete from DB
+            this.persistentAgentService.stopAgent(agentId);
+            this.agentDb.delete(agentId);
+
+            // If this was the active agent, clear sticky state
+            if (this.persistentAgentService.getActiveAgentId(userId) === agentId) {
+                this.persistentAgentService.clearActiveAgent(userId);
+            }
+
+            await ctx.editMessageText(
+                `🗑️ Agente <b>${escapeHtml(agent.name)}</b> eliminado.\n\n` +
+                `Usa /createagent para crear uno nuevo o /agents para ver la lista.`,
+                { parse_mode: "HTML" }
+            );
+        } catch (error) {
+            console.error("handleAgentDeleteConfirm error:", error);
+            await ctx.reply(ErrorUtils.createErrorMessage("delete agent confirm", error));
         }
     }
 

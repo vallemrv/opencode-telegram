@@ -4,6 +4,33 @@ import type { Context } from "grammy";
 import type { UserSession } from "./opencode.types.js";
 import { processEvent } from "./opencode.event-handlers.js";
 import { SessionDbService } from "../../services/session-db.service.js";
+import * as os from "os";
+import * as nodePath from "path";
+
+/** Builds a Gitea context block to prepend to prompts when Gitea is configured */
+function buildGiteaContext(): string | null {
+    const url = process.env.GITEA_URL?.trim();
+    const token = process.env.GITEA_TOKEN?.trim();
+    const rawWorkdir = process.env.GITEA_DEFAULT_WORKDIR?.trim() || '~/proyectos/gitea-projects';
+
+    if (!url || !token) return null;
+
+    const workdir = rawWorkdir.startsWith('~')
+        ? nodePath.join(os.homedir(), rawWorkdir.slice(1))
+        : rawWorkdir;
+
+    return `<gitea_context>
+You have access to a Gitea instance with the following configuration:
+- Gitea URL: ${url}
+- API base: ${url}/api/v1
+- Authentication: use header "Authorization: token ${token}" for all API requests
+- Local projects directory: ${workdir}
+
+When the user asks you to create a repository, delete a repository, list repositories, or perform any Gitea operation, use this configuration to make the appropriate API calls directly. Do not ask the user for the URL or token — they are already provided above.
+</gitea_context>
+
+`;
+}
 
 export class OpenCodeService {
     private userSessions: Map<number, UserSession> = new Map();
@@ -185,7 +212,9 @@ export class OpenCodeService {
         const client = createOpencodeClient({ baseUrl: this.baseUrl });
 
         try {
-            const fullPrompt = fileContext ? `${fileContext}\n\n${text}` : text;
+            const giteaContext = buildGiteaContext();
+            const basePrompt = fileContext ? `${fileContext}\n\n${text}` : text;
+            const fullPrompt = giteaContext ? `${giteaContext}${basePrompt}` : basePrompt;
 
             let modelConfig = undefined;
             if (userSession.currentModel) {

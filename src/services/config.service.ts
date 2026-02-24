@@ -18,6 +18,15 @@ export class ConfigService {
     // Message Configuration
     private readonly messageDeleteTimeout: number;
 
+    // Background Agent Configuration
+    private readonly backgroundModel: string;
+    private readonly backgroundWorkdir: string;
+
+    // Gitea Configuration
+    private readonly giteaUrl: string;
+    private readonly giteaToken: string;
+    private readonly giteaDefaultWorkdir: string;
+
     // System Environment
     private readonly homeDirectory: string;
     private readonly systemEnv: { [key: string]: string };
@@ -57,6 +66,15 @@ export class ConfigService {
         // Load message configuration
         this.messageDeleteTimeout = parseInt(process.env.MESSAGE_DELETE_TIMEOUT || '10000', 10);
 
+        // Load background agent configuration
+        this.backgroundModel = process.env.BACKGROUND_MODEL || process.env.OPENCODE_DEFAULT_MODEL || 'github-copilot/claude-sonnet-4.6';
+        this.backgroundWorkdir = process.env.BACKGROUND_WORKDIR || '';
+
+        // Load Gitea configuration
+        this.giteaUrl = process.env.GITEA_URL || '';
+        this.giteaToken = process.env.GITEA_TOKEN || '';
+        this.giteaDefaultWorkdir = process.env.GITEA_DEFAULT_WORKDIR || '~/proyectos/gitea-projects';
+
         // Load system environment
         this.homeDirectory = process.env.HOME || '/tmp';
         this.systemEnv = process.env as { [key: string]: string };
@@ -91,6 +109,32 @@ export class ConfigService {
     // Message Configuration Getters
     getMessageDeleteTimeout(): number {
         return this.messageDeleteTimeout;
+    }
+
+    // Background Agent Configuration Getters
+    getBackgroundModel(): string {
+        return this.backgroundModel;
+    }
+
+    getBackgroundWorkdir(): string {
+        return this.backgroundWorkdir;
+    }
+
+    // Gitea Configuration Getters
+    getGiteaUrl(): string {
+        return this.giteaUrl;
+    }
+
+    getGiteaToken(): string {
+        return this.giteaToken;
+    }
+
+    getGiteaDefaultWorkdir(): string {
+        return this.giteaDefaultWorkdir;
+    }
+
+    isGiteaConfigured(): boolean {
+        return this.giteaUrl.length > 0 && this.giteaToken.length > 0;
     }
 
     // System Environment Getters
