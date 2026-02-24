@@ -105,19 +105,23 @@ async function startBot() {
         // Set bot commands for Telegram UI
         try {
             await bot.api.setMyCommands([
-                { command: 'opencode', description: 'Iniciar sesión OpenCode' },
-                { command: 'projects', description: 'Lista de proyectos Gitea' },
-                { command: 'sessions', description: 'Sesiones del proyecto actual' },
-                { command: 'models', description: 'Cambiar modelo de IA' },
-                { command: 'delete', description: 'Borrar sesión actual' },
-                { command: 'deleteall', description: 'Borrar todas las sesiones' },
-                { command: 'esc', description: 'Abortar operación en curso' },
-                { command: 'endsession', description: 'Terminar sesión activa' },
-                { command: 'rename', description: 'Renombrar sesión actual' },
-                { command: 'new', description: 'Crear nuevo proyecto en Gitea' },
-                { command: 'run', description: 'Lanzar subagente en segundo plano' },
-                { command: 'restart', description: 'Reiniciar OpenCode server y bot' },
-                { command: 'help', description: 'Ayuda' },
+                { command: 'opencode',     description: 'Iniciar sesión OpenCode' },
+                { command: 'projects',     description: 'Lista de proyectos Gitea' },
+                { command: 'sessions',     description: 'Sesiones del proyecto actual' },
+                { command: 'models',       description: 'Cambiar modelo de IA' },
+                { command: 'run',          description: 'Seleccionar agente activo' },
+                { command: 'createagent',  description: 'Crear nuevo agente persistente' },
+                { command: 'agents',       description: 'Listar / borrar agentes persistentes' },
+                { command: 'new',          description: 'Crear nuevo proyecto en Gitea' },
+                { command: 'rename',       description: 'Renombrar sesión actual' },
+                { command: 'undo',         description: 'Revertir último cambio' },
+                { command: 'redo',         description: 'Restaurar cambio revertido' },
+                { command: 'esc',          description: 'Abortar operación en curso' },
+                { command: 'endsession',   description: 'Terminar sesión activa' },
+                { command: 'delete',       description: 'Borrar sesión actual' },
+                { command: 'deleteall',    description: 'Borrar todas las sesiones' },
+                { command: 'restart',      description: 'Reiniciar OpenCode server y bot' },
+                { command: 'help',         description: 'Mostrar ayuda' },
             ]);
             console.log('[TelegramCoder] ✅ Bot commands registered');
         } catch (error) {
