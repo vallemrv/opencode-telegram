@@ -2,15 +2,28 @@
   "type": "session.created",
   "properties": {
     "info": {
-      "id": "ses_46596afd7ffe1uqC5achJKHL4H",
-      "version": "1.0.204",
-      "projectID": "0438392ff4fdf2709d867f4c380fa2dd6661167a",
-      "directory": "/home/tom/telegramCoder",
-      "parentID": "ses_4659b7035ffeqZxOy4crpCpajl",
-      "title": "Analyze opencode events and handlers (@explore subagent)",
+      "id": "ses_372fefbdbffe5Nu7PXb2tYggAT",
+      "slug": "mighty-engine",
+      "version": "1.2.10",
+      "projectID": "global",
+      "directory": "/home/valle/Documentos/proyectos/gitea-projects",
+      "parentID": "ses_3730025b7ffe2Vs0qpddSsFGx3",
+      "title": "Find agent tools implementation (@explore subagent)",
+      "permission": [
+        {
+          "permission": "todowrite",
+          "pattern": "*",
+          "action": "deny"
+        },
+        {
+          "permission": "todoread",
+          "pattern": "*",
+          "action": "deny"
+        }
+      ],
       "time": {
-        "created": 1767822151720,
-        "updated": 1767822151720
+        "created": 1771892180004,
+        "updated": 1771892180004
       }
     }
   }

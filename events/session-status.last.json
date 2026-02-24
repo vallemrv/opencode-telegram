@@ -1,9 +1,12 @@
 {
   "type": "session.status",
   "properties": {
-    "sessionID": "ses_37836fdc7ffenTig9yWcRt6umb",
+    "sessionID": "ses_37589d97cffe0QuRUH0jYeoIXk",
     "status": {
-      "type": "idle"
+      "type": "retry",
+      "attempt": 9,
+      "message": "Too Many Requests: {\"error\":{\"code\":\"1302\",\"message\":\"Rate limit reached for requests\"}}data: {\"choices\":[],\"cost\":\"0\"}",
+      "next": 1771862624402
     }
   }
 }

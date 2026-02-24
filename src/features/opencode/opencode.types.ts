@@ -19,4 +19,8 @@ export interface UserSession {
     finalResponseText?: string;
     // Bloqueo: true mientras OpenCode está procesando un prompt
     isProcessing?: boolean;
+    // ID de la petición de permiso pendiente de respuesta del usuario
+    pendingPermissionId?: string;
+    // Message ID del mensaje de permiso enviado al usuario (para editarlo al responder)
+    pendingPermissionMsgId?: number;
 }

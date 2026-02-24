@@ -35,9 +35,8 @@ export class OpenCodeService {
                         { permission: "file", pattern: "*", action: "allow" }
                     ]
                 } as any,
-                // Omit directory to force creation in global context, as requested
-                query: undefined,
-            });
+                query: directory ? { cwd: directory } : undefined,
+            } as any);
 
             if (!result.data) {
                 throw new Error("Failed to create session");
@@ -124,7 +123,8 @@ export class OpenCodeService {
                     if (abortController.signal.aborted) break;
                     // Refresh session reference in case it was updated
                     const currentSession = this.getUserSession(userId);
-                    if (!currentSession) break;
+                    // If session is not in memory, skip event but keep stream alive
+                    if (!currentSession) continue;
                     await processEvent(event, ctx, currentSession);
                 }
             } catch (error) {
@@ -399,19 +399,18 @@ export class OpenCodeService {
         }
     }
 
-    async getSessions(limit: number = 5, directory?: string): Promise<Array<{ id: string; title: string; created: number; updated: number; worktree?: string }>> {
-        const client = createOpencodeClient({ baseUrl: this.baseUrl });
-
+    async getSessions(limit: number = 5, directory?: string): Promise<Array<{ id: string; title: string; created: number; updated: number; directory?: string }>> {
         try {
-            const result = await client.session.list(
-                directory ? { query: { directory } } : undefined
-            );
+            // Use fetch directly — the SDK wrapper drops the directory query param
+            const url = new URL(`${this.baseUrl}/session`);
+            if (directory) url.searchParams.set("directory", directory);
 
-            if (!result.data) {
-                return [];
-            }
+            const response = await fetch(url.toString());
+            if (!response.ok) return [];
 
-            return result.data
+            const data: any[] = await response.json();
+
+            return data
                 .sort((a: any, b: any) => b.time.updated - a.time.updated)
                 .slice(0, limit)
                 .map((session: any) => ({
@@ -419,7 +418,7 @@ export class OpenCodeService {
                     title: session.title,
                     created: session.time.created,
                     updated: session.time.updated,
-                    worktree: session.worktree
+                    directory: session.directory
                 }));
         } catch (error) {
             console.error("Failed to get sessions:", error);
@@ -484,6 +483,59 @@ export class OpenCodeService {
     // ─── Session Restore ──────────────────────────────────────────────────────
 
     /**
+     * Try to restore the most recently updated session from OpenCode for this user.
+     * Used when the user sends a message but the bot has no session in memory
+     * (e.g. after a restart). Picks the most recently updated session in OpenCode.
+     */
+    async tryRestoreLatestSession(userId: number, ctx: any): Promise<void> {
+        try {
+            const resp = await fetch(`${this.baseUrl}/session`);
+            if (!resp.ok) return;
+            const all: any[] = await resp.json();
+            if (all.length === 0) return;
+
+            // Pick the most recently updated session
+            const latest = all.sort((a, b) => b.time.updated - a.time.updated)[0];
+
+            const currentModel =
+                latest.title?.match(/\[(.*?)\]/)?.[1] ||
+                process.env.OPENCODE_DEFAULT_MODEL ||
+                'github-copilot/claude-sonnet-4.6';
+
+            const userSession: UserSession = {
+                userId,
+                sessionId: latest.id,
+                session: latest,
+                createdAt: new Date(latest.time.created),
+                chatId: ctx.chat?.id,
+                currentAgent: 'build',
+                currentModel,
+            };
+
+            this.userSessions.set(userId, userSession);
+
+            // Persist to DB so it survives next restart too
+            this.dbService.saveSession({
+                id: latest.id,
+                userId,
+                projectId: latest.title?.split(' [')[0] || 'global',
+                title: latest.title || latest.id,
+                model: currentModel,
+                chatId: ctx.chat?.id || null,
+                lastMessageId: null,
+                currentAgent: 'build',
+                createdAt: new Date(latest.time.created).toISOString(),
+                isActive: true,
+            });
+            this.dbService.setActiveSession(userId, latest.id);
+
+            console.log(`[OpenCodeService] ✅ Auto-restored session for user ${userId}: ${latest.id} (${latest.title})`);
+        } catch (err) {
+            console.error('[OpenCodeService] tryRestoreLatestSession failed:', err);
+        }
+    }
+
+    /**
      * Restore sessions persisted on disk after a bot restart.
      * For each persisted session, verify it still exists on the OpenCode server.
      */
@@ -529,10 +581,77 @@ export class OpenCodeService {
             this.userSessions.set(userId, userSession);
             restored++;
             console.log(`[OpenCodeService] ✅ Restored active session for user ${userId}: ${p.id} (chatId: ${p.chatId})`);
+
+            // Check if there's a pending response that was never delivered (bot died mid-stream)
+            if (p.chatId) {
+                this.deliverMissedResponse(userSession, client).catch(err =>
+                    console.error('[OpenCodeService] deliverMissedResponse failed:', err)
+                );
+            }
         }
 
         if (restored > 0) {
             console.log(`[OpenCodeService] Restored ${restored} active session(s) from DB — event stream will reconnect on next message`);
+        }
+    }
+
+    /**
+     * After a bot restart, check if the last assistant message was never sent to Telegram.
+     * If so, send it now.
+     */
+    private async deliverMissedResponse(userSession: UserSession, client: any): Promise<void> {
+        try {
+            const result = await client.session.message.list({
+                path: { id: userSession.sessionId },
+                query: { limit: 20 },
+            }) as any;
+
+            const messages: any[] = result.data || [];
+            if (messages.length === 0) return;
+
+            // Find the last assistant message
+            const lastAssistant = [...messages].reverse().find((m: any) => m.info?.role === 'assistant');
+            if (!lastAssistant) return;
+
+            // Extract text from parts
+            const parts: any[] = lastAssistant.parts || [];
+            const text = parts
+                .filter((p: any) => p.type === 'text')
+                .map((p: any) => p.text || '')
+                .join('');
+
+            if (!text.trim()) return;
+
+            // Only deliver if the session status is idle (not still processing)
+            const statusResp = await fetch(`${this.baseUrl}/session/status`);
+            if (statusResp.ok) {
+                const statuses: any = await statusResp.json();
+                const sessionStatus = statuses[userSession.sessionId];
+                if (sessionStatus && sessionStatus.type !== 'idle') return; // still busy
+            }
+
+            console.log(`[OpenCodeService] Delivering missed response for user ${userSession.userId}`);
+
+            // Import the idle handler logic inline to avoid circular deps
+            const { formatAsHtml } = await import('./event-handlers/utils.js');
+            const Bot = (await import('grammy')).Bot;
+            const token = process.env.TELEGRAM_BOT_TOKENS?.split(',')[0]?.trim();
+            if (!token || !userSession.chatId) return;
+
+            const bot = new Bot(token);
+            const html = formatAsHtml(text);
+            const MAX = 4000;
+            if (html.length <= MAX) {
+                await bot.api.sendMessage(userSession.chatId, `🔄 <b>Respuesta recuperada tras reinicio:</b>\n\n${html}`, { parse_mode: 'HTML' });
+            } else {
+                const { InputFile } = await import('grammy');
+                const buf = Buffer.from(text, 'utf8');
+                await bot.api.sendDocument(userSession.chatId, new InputFile(buf, 'respuesta.md'), {
+                    caption: '🔄 Respuesta recuperada tras reinicio (archivo adjunto)',
+                });
+            }
+        } catch (err) {
+            console.error('[OpenCodeService] Error in deliverMissedResponse:', err);
         }
     }
 }

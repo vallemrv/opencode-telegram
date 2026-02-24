@@ -105,16 +105,17 @@ async function startBot() {
         // Set bot commands for Telegram UI
         try {
             await bot.api.setMyCommands([
-                { command: 'start', description: 'Show help message' },
-                { command: 'help', description: 'Show help message' },
-                { command: 'new', description: 'Create a new Gitea project' },
-                { command: 'projects', description: 'List your Gitea projects' },
-                { command: 'sessions', description: 'List sessions for current project' },
-                { command: 'models', description: 'Change current AI model' },
-                { command: 'opencode', description: 'Start an OpenCode session' },
-                { command: 'rename', description: 'Rename current session' },
-                { command: 'endsession', description: 'End your OpenCode session' },
-                { command: 'esc', description: 'Abort current AI operation' }
+                { command: 'opencode', description: 'Iniciar sesión OpenCode' },
+                { command: 'projects', description: 'Lista de proyectos Gitea' },
+                { command: 'sessions', description: 'Sesiones del proyecto actual' },
+                { command: 'models', description: 'Cambiar modelo de IA' },
+                { command: 'delete', description: 'Borrar sesión actual' },
+                { command: 'deleteall', description: 'Borrar todas las sesiones' },
+                { command: 'esc', description: 'Abortar operación en curso' },
+                { command: 'endsession', description: 'Terminar sesión activa' },
+                { command: 'rename', description: 'Renombrar sesión actual' },
+                { command: 'new', description: 'Crear nuevo proyecto en Gitea' },
+                { command: 'help', description: 'Ayuda' },
             ]);
             console.log('[TelegramCoder] ✅ Bot commands registered');
         } catch (error) {
