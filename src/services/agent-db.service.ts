@@ -84,6 +84,17 @@ export class AgentDbService {
         return row ? this.mapRow(row) : undefined;
     }
 
+    /** Look up an agent by the first 8 characters of its UUID (for compact callback data). */
+    getByPrefix(prefix: string): PersistentAgent | undefined {
+        const row = this.db.prepare("SELECT * FROM persistent_agents WHERE id LIKE ?").get(prefix + '%') as any;
+        return row ? this.mapRow(row) : undefined;
+    }
+
+    /** Returns the first 8 characters of the agent UUID — safe for Telegram callback_data. */
+    static shortId(agent: PersistentAgent): string {
+        return agent.id.slice(0, 8);
+    }
+
     getByPort(port: number): PersistentAgent | undefined {
         const row = this.db.prepare('SELECT * FROM persistent_agents WHERE port = ?').get(port) as any;
         return row ? this.mapRow(row) : undefined;

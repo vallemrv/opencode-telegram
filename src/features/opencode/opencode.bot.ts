@@ -1697,7 +1697,7 @@ export class OpenCodeBot {
                     const mainModel = userSession?.currentModel || process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5-free";
 
                     const keyboard = new InlineKeyboard()
-                        .text(`🤖 Agente: ${agent.name} [${agent.model}]`, `pagent:model:${agent.id}:__choose_provider`).row()
+                        .text(`🤖 Agente: ${agent.name} [${agent.model}]`, `pagent:model:${AgentDbService.shortId(agent)}:__choose_provider`).row()
                         .text(`💻 Sesión principal [${mainModel}]`, "provider:__main__").row();
 
                     await ctx.reply(
@@ -1725,7 +1725,7 @@ export class OpenCodeBot {
         const providers = Array.from(models.keys());
         const keyboard = new InlineKeyboard();
 
-        const prefix = target === "main" ? "provider:" : `pagent:model:${target}:provider:`;
+        const prefix = target === "main" ? "provider:" : `pagent:model:${target.slice(0, 8)}:provider:`;
 
         providers.forEach((provider) => {
             keyboard.text(`🔹 ${provider}`, `${prefix}${provider}`).row();
@@ -2299,17 +2299,19 @@ export class OpenCodeBot {
             const userId = ctx.from?.id;
             if (!userId) return;
 
-            // Format: pagent:model:<agentId>:<rest>
+            // Format: pagent:model:<shortId(8 chars)>:<rest>
             const data = (ctx.callbackQuery?.data || "").replace(/^pagent:model:/, "");
             const colonIdx = data.indexOf(":");
-            const agentId = colonIdx === -1 ? data : data.slice(0, colonIdx);
+            const shortId = colonIdx === -1 ? data : data.slice(0, colonIdx);
             const rest = colonIdx === -1 ? "" : data.slice(colonIdx + 1);
 
-            const agent = this.agentDb.getById(agentId);
+            // Resolve short ID (8 char prefix) to full agent record
+            const agent = this.agentDb.getByPrefix(shortId);
             if (!agent) {
                 await ctx.editMessageText("❌ Agente no encontrado.");
                 return;
             }
+            const sid = AgentDbService.shortId(agent); // always use short form for callbacks
 
             // Show provider list
             if (rest === "__choose_provider" || rest === "") {
@@ -2330,9 +2332,9 @@ export class OpenCodeBot {
 
                 const keyboard = new InlineKeyboard();
                 providerModels.forEach((model) => {
-                    keyboard.text(`⚡ ${model}`, `pagent:model:${agentId}:${provider}/${model}`).row();
+                    keyboard.text(`⚡ ${model}`, `pagent:model:${sid}:${provider}/${model}`).row();
                 });
-                keyboard.text("◀️ Volver a proveedores", `pagent:model:${agentId}:__choose_provider`);
+                keyboard.text("◀️ Volver a proveedores", `pagent:model:${sid}:__choose_provider`);
 
                 await ctx.editMessageText(
                     `🤖 <b>${provider}</b> — Agente <b>${escapeHtml(agent.name)}</b>\n\nSelecciona modelo:`,
@@ -2343,13 +2345,13 @@ export class OpenCodeBot {
 
             // rest is "provider/model" — save
             const newModel = rest;
-            this.agentDb.updateModel(agentId, newModel);
+            this.agentDb.updateModel(agent.id, newModel);
 
             // Restart the agent process so it picks up the new model on next sendPrompt
-            this.persistentAgentService.stopAgent(agentId);
-            const updatedAgent = this.agentDb.getById(agentId)!;
+            this.persistentAgentService.stopAgent(agent.id);
+            const updatedAgent = this.agentDb.getById(agent.id)!;
             this.persistentAgentService.startAgent(updatedAgent).catch(err =>
-                console.error(`[OpenCodeBot] Failed to restart agent ${agentId} after model change:`, err)
+                console.error(`[OpenCodeBot] Failed to restart agent ${agent.id} after model change:`, err)
             );
 
             await ctx.editMessageText(
@@ -2369,8 +2371,9 @@ export class OpenCodeBot {
     private async replyWithAgentProviders(ctx: Context, agent: any, edit: boolean): Promise<void> {
         const models = this.getAvailableModels();
         const keyboard = new InlineKeyboard();
+        const sid = AgentDbService.shortId(agent);
         for (const provider of models.keys()) {
-            keyboard.text(`🔹 ${provider}`, `pagent:model:${agent.id}:provider:${provider}`).row();
+            keyboard.text(`🔹 ${provider}`, `pagent:model:${sid}:provider:${provider}`).row();
         }
         const text =
             `🤖 <b>Cambiar modelo de agente</b>\n\n` +
