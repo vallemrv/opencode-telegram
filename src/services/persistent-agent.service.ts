@@ -354,8 +354,13 @@ export class PersistentAgentService {
             const sessions: any[] = await sessRes.json();
             if (sessions.length === 0) return EMPTY;
 
-            // Pick most recently updated session
-            const session = sessions.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))[0];
+            // Only consider sessions created by this bot (title starts with "tg-").
+            // Ignores interactive/subagent sessions that happen to run on the same server.
+            const botSessions = sessions.filter((s: any) => (s.title ?? "").startsWith("tg-"));
+            if (botSessions.length === 0) return EMPTY;
+
+            // Pick most recently updated bot session
+            const session = botSessions.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))[0];
 
             // Fetch messages for this session
             const msgRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
