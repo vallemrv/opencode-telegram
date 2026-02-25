@@ -61,12 +61,16 @@ export class OpenCodeBot {
     private sessionDb: SessionDbService;
     private fileMentionService: FileMentionService;
     private fileMentionUI: FileMentionUI;
+    private bot?: Bot;
 
     /** Wizard state per user for /createagent multi-step flow */
     private createAgentWizardState: Map<number, CreateAgentWizardState> = new Map();
 
     /** Pending prompt per user waiting for agent selection via /run */
     private runWizardState: Map<number, RunWizardState> = new Map();
+
+    /** Pending agent questions keyed by shortKey (8 random chars), so callback data stays short */
+    private pendingAgentQuestions: Map<string, { agentId: string; port: number; req: any }> = new Map();
 
     constructor(
         opencodeService: OpenCodeService,
@@ -93,6 +97,12 @@ export class OpenCodeBot {
     }
 
     registerHandlers(bot: Bot): void {
+        this.bot = bot;
+
+        // Register question callback for persistent agents
+        this.persistentAgentService.setOnQuestionCallback(
+            this.handleAgentQuestion.bind(this)
+        );
         // If a /restart was in progress, confirm readiness to the user who triggered it
         const restartChatId = this.sessionDb.getState("restart_pending_chat_id");
         const restartMsgId  = this.sessionDb.getState("restart_pending_message_id");
@@ -157,6 +167,9 @@ export class OpenCodeBot {
         bot.callbackQuery(/^pagent:delconfirm:/, AccessControlMiddleware.requireAccess, this.handleAgentDeleteConfirm.bind(this));
         bot.callbackQuery(/^pagent:delcancel$/, AccessControlMiddleware.requireAccess, this.handleAgentDeleteCancel.bind(this));
         bot.callbackQuery(/^pagent:model:/, AccessControlMiddleware.requireAccess, this.handleAgentModelSelection.bind(this));
+
+        // Agent question reply callbacks
+        bot.callbackQuery(/^agq:/, AccessControlMiddleware.requireAccess, this.handleAgentQuestionCallback.bind(this));
 
         // Handle keyboard button presses
         bot.hears("⏹️ ESC", AccessControlMiddleware.requireAccess, this.handleEsc.bind(this));
@@ -2448,8 +2461,7 @@ export class OpenCodeBot {
         }
     }
 
-    private async handleBackToProviders(ctx: Context): Promise<void> {
-        try {
+    private async handleBackToProviders(ctx: Context): Promise<void> {        try {
             await ctx.answerCallbackQuery();
 
             const userId = ctx.from?.id;
@@ -2488,6 +2500,108 @@ export class OpenCodeBot {
         } catch (error) {
             console.error("Error in handleBackToProviders:", error);
             await ctx.reply(ErrorUtils.createErrorMessage("go back to providers", error));
+        }
+    }
+
+    // ─── Agent question handling ──────────────────────────────────────────────
+
+    /**
+     * Called by PersistentAgentService when a persistent agent asks a question.
+     * Looks up the agent's owner and sends an inline-keyboard message to Telegram.
+     */
+    private async handleAgentQuestion(agentId: string, req: any): Promise<void> {
+        const agent = this.agentDb.getById(agentId);
+        if (!agent || !this.bot) {
+            console.warn(`[OpenCodeBot] handleAgentQuestion: agent ${agentId} not found or bot not initialised`);
+            return;
+        }
+
+        const requestId: string = req.id;
+        const questions: any[] = req.questions ?? [];
+
+        // Generate a short random key so callback data stays under 64 bytes
+        const shortKey = randomUUID().replace(/-/g, "").slice(0, 8);
+        this.pendingAgentQuestions.set(shortKey, { agentId, port: agent.port, req });
+
+        // Auto-expire after 10 minutes to avoid memory leaks
+        setTimeout(() => this.pendingAgentQuestions.delete(shortKey), 10 * 60 * 1000);
+
+        for (let qIdx = 0; qIdx < questions.length; qIdx++) {
+            const q = questions[qIdx];
+            const keyboard = new InlineKeyboard();
+
+            const options: any[] = q.options ?? [];
+            for (let optIdx = 0; optIdx < options.length; optIdx++) {
+                const opt = options[optIdx];
+                // agq:<shortKey>:<qIdx>:<optIdx>  — always ≤ 64 bytes
+                keyboard.text(opt.label, `agq:${shortKey}:${qIdx}:${optIdx}`).row();
+            }
+            keyboard.text("❌ Cancelar", `agq:cancel:${shortKey}`);
+
+            await this.bot.api.sendMessage(
+                agent.userId,
+                `🤖 <b>${escapeHtml(agent.name)}</b> necesita una respuesta:\n\n` +
+                `<b>${escapeHtml(q.header ?? "Pregunta")}</b>\n${escapeHtml(q.question ?? "")}`,
+                { parse_mode: "HTML", reply_markup: keyboard }
+            );
+        }
+    }
+
+    /**
+     * Callback handler for agq: buttons.
+     * Format: agq:<shortKey>:<qIdx>:<optIdx>  or  agq:cancel:<shortKey>
+     */
+    private async handleAgentQuestionCallback(ctx: Context): Promise<void> {
+        try {
+            await ctx.answerCallbackQuery();
+            const data = ctx.callbackQuery?.data ?? "";
+
+            // Cancel
+            if (data.startsWith("agq:cancel:")) {
+                const shortKey = data.replace("agq:cancel:", "");
+                const pending = this.pendingAgentQuestions.get(shortKey);
+                if (pending) {
+                    this.pendingAgentQuestions.delete(shortKey);
+                    await this.persistentAgentService.rejectQuestion(pending.port, pending.req.id);
+                }
+                await ctx.editMessageText("❌ Pregunta cancelada.").catch(() => {});
+                return;
+            }
+
+            // Reply: agq:<shortKey>:<qIdx>:<optIdx>
+            const parts = data.replace("agq:", "").split(":");
+            if (parts.length < 3) return;
+            const [shortKey, qIdxStr, optIdxStr] = parts;
+            const qIdx = parseInt(qIdxStr, 10);
+            const optIdx = parseInt(optIdxStr, 10);
+
+            const pending = this.pendingAgentQuestions.get(shortKey);
+            if (!pending) {
+                await ctx.editMessageText("⚠️ Esta pregunta ya fue respondida o expiró.").catch(() => {});
+                return;
+            }
+
+            const questions: any[] = pending.req.questions ?? [];
+            const q = questions[qIdx];
+            if (!q) return;
+            const opt = (q.options ?? [])[optIdx];
+            if (!opt) return;
+
+            // Build answers: one array per question (only this one answered)
+            const answers: string[][] = questions.map((qq: any, i: number) =>
+                i === qIdx ? [opt.label] : []
+            );
+
+            this.pendingAgentQuestions.delete(shortKey);
+            await this.persistentAgentService.replyQuestion(pending.port, pending.req.id, answers);
+
+            await ctx.editMessageText(
+                `✅ Respondido: <b>${escapeHtml(opt.label)}</b>`,
+                { parse_mode: "HTML" }
+            ).catch(() => {});
+        } catch (error) {
+            console.error("handleAgentQuestionCallback error:", error);
+            await ctx.reply(ErrorUtils.createErrorMessage("responder pregunta de agente", error));
         }
     }
 }

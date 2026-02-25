@@ -10,18 +10,24 @@
  * - Check whether a given port has a live opencode server
  * - Send a prompt to an agent's server and collect the SSE response
  * - Restart all known agents on bot startup
+ * - Stream SSE events from each agent and fire onQuestion callback for tool:question
  */
 
 import { spawn, ChildProcess } from "child_process";
 import { access, constants } from "fs/promises";
 import * as path from "path";
 import * as os from "os";
+import { createOpencodeClient } from "@opencode-ai/sdk";
 import type { PersistentAgent } from "./agent-db.service.js";
 
 export interface AgentSendResult {
     output: string;
     sessionId?: string;
 }
+
+/** Called by OpenCodeBot when the agent has a pending question for the user */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type OnQuestionCallback = (agentId: string, req: any) => Promise<void>;
 
 /** Resolve ~ in paths */
 export function resolveDir(p: string): string {
@@ -68,8 +74,19 @@ export class PersistentAgentService {
     /** Map of agentId → child process */
     private processes: Map<string, ChildProcess> = new Map();
 
+    /** Map of agentId → SSE abort controller */
+    private sseControllers: Map<string, AbortController> = new Map();
+
     /** Map of userId → active agentId (sticky switch) */
     private activeAgentByUser: Map<number, string> = new Map();
+
+    /** Callback registered by OpenCodeBot to handle pending questions */
+    private onQuestion?: OnQuestionCallback;
+
+    /** Register the question callback (called once at startup by OpenCodeBot) */
+    setOnQuestionCallback(cb: OnQuestionCallback): void {
+        this.onQuestion = cb;
+    }
 
     // ─── Server lifecycle ─────────────────────────────────────────────────────
 
@@ -79,6 +96,7 @@ export class PersistentAgentService {
         }
 
         if (await this.isServerRunning(agent.port)) {
+            this.startSseStream(agent);
             return { success: true, message: "already running (external)" };
         }
 
@@ -99,6 +117,7 @@ export class PersistentAgentService {
         child.on("exit", (code) => {
             console.log(`[PersistentAgent] Agent "${agent.name}" (port ${agent.port}) exited with code ${code}`);
             this.processes.delete(agent.id);
+            this.stopSseStream(agent.id);
         });
 
         this.processes.set(agent.id, child);
@@ -107,6 +126,7 @@ export class PersistentAgentService {
         const deadline = Date.now() + 20000;
         while (Date.now() < deadline) {
             if (await this.isServerRunning(agent.port)) {
+                this.startSseStream(agent);
                 return { success: true, message: `opencode serve ready on :${agent.port}` };
             }
             await new Promise(r => setTimeout(r, 800));
@@ -116,6 +136,7 @@ export class PersistentAgentService {
     }
 
     stopAgent(agentId: string): void {
+        this.stopSseStream(agentId);
         const child = this.processes.get(agentId);
         if (child && !child.killed) {
             child.kill("SIGTERM");
@@ -137,6 +158,77 @@ export class PersistentAgentService {
 
     isProcessManaged(agentId: string): boolean {
         return this.processes.has(agentId);
+    }
+
+    // ─── SSE stream per agent ────────────────────────────────────────────────
+
+    private startSseStream(agent: PersistentAgent): void {
+        // Avoid duplicate streams
+        if (this.sseControllers.has(agent.id)) return;
+
+        const abort = new AbortController();
+        this.sseControllers.set(agent.id, abort);
+
+        // Run in background — no await
+        this.runSseLoop(agent, abort).catch(err =>
+            console.error(`[PersistentAgent] SSE loop error for agent ${agent.name}:`, err)
+        );
+    }
+
+    private stopSseStream(agentId: string): void {
+        const ctrl = this.sseControllers.get(agentId);
+        if (ctrl) {
+            ctrl.abort();
+            this.sseControllers.delete(agentId);
+        }
+    }
+
+    private async runSseLoop(agent: PersistentAgent, abort: AbortController): Promise<void> {
+        const baseUrl = `http://localhost:${agent.port}`;
+        const client = createOpencodeClient({ baseUrl });
+        let retryDelay = 3000;
+
+        while (!abort.signal.aborted) {
+            try {
+                const events = await client.event.subscribe();
+                retryDelay = 3000;
+
+                for await (const event of events.stream) {
+                    if (abort.signal.aborted) break;
+
+                    if ((event as any).type === "question.asked" && this.onQuestion) {
+                        const req = (event as any).properties;
+                        console.log(`[PersistentAgent] question.asked for agent "${agent.name}": ${req.id}`);
+                        this.onQuestion(agent.id, req).catch(err =>
+                            console.error(`[PersistentAgent] onQuestion callback error:`, err)
+                        );
+                    }
+                }
+            } catch (err) {
+                if (abort.signal.aborted) break;
+                console.warn(`[PersistentAgent] SSE stream for agent "${agent.name}" disconnected, retrying in ${retryDelay}ms`);
+                await new Promise(r => setTimeout(r, retryDelay));
+                retryDelay = Math.min(retryDelay * 2, 30000);
+            }
+        }
+    }
+
+    // ─── Reply to a question ──────────────────────────────────────────────────
+
+    async replyQuestion(port: number, requestId: string, answers: string[][]): Promise<void> {
+        await fetch(`http://localhost:${port}/question/${requestId}/reply`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ answers }),
+            signal: AbortSignal.timeout(10000),
+        });
+    }
+
+    async rejectQuestion(port: number, requestId: string): Promise<void> {
+        await fetch(`http://localhost:${port}/question/${requestId}/reject`, {
+            method: "POST",
+            signal: AbortSignal.timeout(10000),
+        });
     }
 
     // ─── Prompt ───────────────────────────────────────────────────────────────
