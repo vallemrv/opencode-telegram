@@ -25,6 +25,12 @@ interface CreateAgentWizardState {
     workdir?: string;
 }
 
+// ─── /run wizard state ────────────────────────────────────────────────────────
+interface RunWizardState {
+    prompt: string;              // prompt waiting for agent selection
+    preselectedAgentId?: string; // set when agent is already chosen (from /agents tap)
+}
+
 
 /** Resuelve ~ en rutas y expande variables de entorno básicas */
 function resolveWorkDir(p: string): string {
@@ -58,6 +64,9 @@ export class OpenCodeBot {
 
     /** Wizard state per user for /createagent multi-step flow */
     private createAgentWizardState: Map<number, CreateAgentWizardState> = new Map();
+
+    /** Pending prompt per user waiting for agent selection via /run */
+    private runWizardState: Map<number, RunWizardState> = new Map();
 
     constructor(
         opencodeService: OpenCodeService,
@@ -142,8 +151,8 @@ export class OpenCodeBot {
         bot.command("agents", AccessControlMiddleware.requireAccess, this.handleAgents.bind(this));
 
         // Inline callbacks for persistent agents
-        bot.callbackQuery(/^pagent:switch:/, AccessControlMiddleware.requireAccess, this.handleAgentSwitch.bind(this));
-        bot.callbackQuery(/^pagent:main$/, AccessControlMiddleware.requireAccess, this.handleAgentSwitchMain.bind(this));
+        bot.callbackQuery(/^pagent:run:/, AccessControlMiddleware.requireAccess, this.handleRunAgentSelected.bind(this));
+        bot.callbackQuery(/^pagent:runpick:/, AccessControlMiddleware.requireAccess, this.handleRunPickAgent.bind(this));
         bot.callbackQuery(/^pagent:del:/, AccessControlMiddleware.requireAccess, this.handleAgentDelete.bind(this));
         bot.callbackQuery(/^pagent:delconfirm:/, AccessControlMiddleware.requireAccess, this.handleAgentDeleteConfirm.bind(this));
         bot.callbackQuery(/^pagent:delcancel$/, AccessControlMiddleware.requireAccess, this.handleAgentDeleteCancel.bind(this));
@@ -185,13 +194,34 @@ export class OpenCodeBot {
             if (ctx.message?.text === "⏹️ ESC" || ctx.message?.text === "⇥ TAB") {
                 return next();
             }
-            // Intercept /createagent wizard replies
             const userId = ctx.from?.id;
+            // Intercept /createagent wizard replies
             if (userId && this.createAgentWizardState.has(userId)) {
                 await this.handleCreateAgentWizardReply(ctx);
                 return;
             }
-            // Treat as prompt — route to active persistent agent or main OpenCode
+            // Intercept /run wizard: user typed the prompt, now show agent picker (or send directly if preselected)
+            if (userId && this.runWizardState.has(userId)) {
+                const prompt = ctx.message?.text?.trim() || "";
+                if (prompt) {
+                    const state = this.runWizardState.get(userId)!;
+                    if (state.preselectedAgentId) {
+                        // Agent was pre-selected from /agents — send directly
+                        this.runWizardState.delete(userId);
+                        const agent = this.agentDb.getById(state.preselectedAgentId);
+                        if (agent) {
+                            await this.sendPromptToPersistentAgent(ctx, agent, prompt);
+                        } else {
+                            await ctx.reply("❌ Agente no encontrado.");
+                        }
+                    } else {
+                        this.runWizardState.set(userId, { prompt });
+                        await this.showRunAgentPicker(ctx, prompt);
+                    }
+                }
+                return;
+            }
+            // Regular message → always goes to main OpenCode session
             await this.handleMessageAsPrompt(ctx);
         });
     }
@@ -413,20 +443,7 @@ export class OpenCodeBot {
             const promptText = ctx.message?.text?.trim() || "";
             if (!promptText) return;
 
-            // ── Route to persistent subagent if one is active ─────────────────
-            const activeAgentId = this.persistentAgentService.getActiveAgentId(userId);
-            if (activeAgentId) {
-                const agent = this.agentDb.getById(activeAgentId);
-                if (agent) {
-                    await this.sendPromptToPersistentAgent(ctx, agent, promptText);
-                    return;
-                } else {
-                    // Agent was deleted — clear sticky state
-                    this.persistentAgentService.clearActiveAgent(userId);
-                }
-            }
-
-            // ── Main OpenCode session ─────────────────────────────────────────
+            // ── Always route to main OpenCode session ─────────────────────
             if (!this.opencodeService.hasActiveSession(userId)) {
                 await this.opencodeService.tryRestoreLatestSession(userId, ctx);
             }
@@ -1710,29 +1727,7 @@ export class OpenCodeBot {
                 return;
             }
 
-            // If user has an active persistent agent, ask what they want to change
-            const activeAgentId = this.persistentAgentService.getActiveAgentId(userId);
-            if (activeAgentId) {
-                const agent = this.agentDb.getById(activeAgentId);
-                if (agent) {
-                    const userSession = this.opencodeService.getUserSession(userId);
-                    const mainModel = userSession?.currentModel || process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5-free";
-
-                    const keyboard = new InlineKeyboard()
-                        .text(`🤖 Agente: ${agent.name} [${agent.model}]`, `pagent:model:${AgentDbService.shortId(agent)}:__choose_provider`).row()
-                        .text(`💻 Sesión principal [${mainModel}]`, "provider:__main__").row();
-
-                    await ctx.reply(
-                        `🤖 <b>¿Qué modelo quieres cambiar?</b>\n\n` +
-                        `Tienes el agente <b>${escapeHtml(agent.name)}</b> activo.\n\n` +
-                        `Elige si cambias el modelo del agente o de la sesión principal:`,
-                        { parse_mode: "HTML", reply_markup: keyboard }
-                    );
-                    return;
-                }
-            }
-
-            // Default: show providers for main session
+            // Always show the main session model picker
             const userSession = this.opencodeService.getUserSession(userId);
             const currentModel = userSession?.currentModel || process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5-free";
             await this.replyWithProviders(ctx, currentModel, "main");
@@ -1945,19 +1940,17 @@ export class OpenCodeBot {
         }
     }
 
-    // ─── /run — switch active agent ───────────────────────────────────────────
+    // ─── /run — fire-and-forget prompt to a subagent ─────────────────────────
 
     /**
-     * /run — if the user has persistent agents, show an inline keyboard to switch
-     * the active agent (or go back to the main session). If no agents exist, redirect
-     * to /createagent.
+     * /run [prompt] — if prompt provided inline, show agent picker immediately.
+     * If no prompt, ask user to type it first (wizard step).
      */
     private async handleRun(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
         if (!userId) return;
 
         const agents = this.agentDb.getByUser(userId);
-
         if (agents.length === 0) {
             await ctx.reply(
                 "ℹ️ No tienes agentes persistentes todavía.\n\n" +
@@ -1966,26 +1959,129 @@ export class OpenCodeBot {
             return;
         }
 
-        const activeId = this.persistentAgentService.getActiveAgentId(userId);
-        const keyboard = new InlineKeyboard();
-
-        for (const agent of agents) {
-            const isActive = agent.id === activeId;
-            const label = `${isActive ? "● " : ""}${agent.name} [${agent.model}]`;
-            keyboard.text(label, `pagent:switch:${agent.id}`).row();
+        // Prompt can be provided inline: /run haz un resumen de los cambios
+        const inlinePrompt = ctx.message?.text?.replace(/^\/run\s*/i, "").trim() || "";
+        if (inlinePrompt) {
+            this.runWizardState.set(userId, { prompt: inlinePrompt });
+            await this.showRunAgentPicker(ctx, inlinePrompt);
+        } else {
+            // Ask user to type the prompt
+            this.runWizardState.set(userId, { prompt: "" });
+            await ctx.reply(
+                "🤖 <b>Enviar prompt a un subagente</b>\n\n" +
+                "Escribe el mensaje que quieres enviar al agente:",
+                { parse_mode: "HTML", reply_markup: { force_reply: true, selective: true } }
+            );
         }
-        keyboard.text("▶ Agente principal (OpenCode)", "pagent:main");
+    }
 
-        const activeAgent = activeId ? agents.find(a => a.id === activeId) : null;
-        const activeLine = activeAgent
-            ? `Activo ahora: <b>${escapeHtml(activeAgent.name)}</b>`
-            : `Activo ahora: <b>Agente principal (OpenCode)</b>`;
+    /** Sends the agent picker keyboard for a confirmed prompt */
+    private async showRunAgentPicker(ctx: Context, prompt: string): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
 
+        const agents = this.agentDb.getByUser(userId);
+        const keyboard = new InlineKeyboard();
+        for (const agent of agents) {
+            keyboard.text(`🤖 ${agent.name} [${agent.model}]`, `pagent:run:${agent.id}`).row();
+        }
+
+        const preview = prompt.length > 80 ? prompt.slice(0, 80) + "…" : prompt;
         await ctx.reply(
-            `🤖 <b>Selecciona agente activo</b>\n\n${activeLine}\n\n` +
-            `Los mensajes que envíes irán al agente seleccionado:`,
+            `🤖 <b>¿A qué agente envías esto?</b>\n\n` +
+            `<i>${escapeHtml(preview)}</i>\n\n` +
+            `Selecciona el agente:`,
             { parse_mode: "HTML", reply_markup: keyboard }
         );
+    }
+
+    /** Callback: user tapped an agent name in /agents → ask for prompt for that specific agent */
+    private async handleRunPickAgent(ctx: Context): Promise<void> {
+        try {
+            await ctx.answerCallbackQuery();
+            const userId = ctx.from?.id;
+            if (!userId) return;
+
+            const agentId = (ctx.callbackQuery?.data || "").replace("pagent:runpick:", "");
+            const agent = this.agentDb.getById(agentId);
+            if (!agent) {
+                await ctx.editMessageText("❌ Agente no encontrado.");
+                return;
+            }
+
+            // Store which agent is pre-selected so the wizard reply goes directly to it
+            this.runWizardState.set(userId, { prompt: "", preselectedAgentId: agentId });
+
+            await ctx.reply(
+                `🤖 <b>${escapeHtml(agent.name)}</b>\n\n` +
+                `Escribe el prompt que quieres enviar a este agente:`,
+                { parse_mode: "HTML", reply_markup: { force_reply: true, selective: true } }
+            );
+        } catch (error) {
+            console.error("handleRunPickAgent error:", error);
+            await ctx.reply(ErrorUtils.createErrorMessage("pick agent", error));
+        }
+    }
+
+    /** Callback: user selected an agent from the /run picker */
+    private async handleRunAgentSelected(ctx: Context): Promise<void> {
+        try {
+            await ctx.answerCallbackQuery();
+            const userId = ctx.from?.id;
+            if (!userId) return;
+
+            const agentId = (ctx.callbackQuery?.data || "").replace("pagent:run:", "");
+            const agent = this.agentDb.getById(agentId);
+            if (!agent) {
+                await ctx.editMessageText("❌ Agente no encontrado.");
+                return;
+            }
+
+            const wizardState = this.runWizardState.get(userId);
+            const prompt = wizardState?.prompt || "";
+            this.runWizardState.delete(userId);
+
+            if (!prompt) {
+                await ctx.editMessageText("❌ No hay prompt pendiente. Usa /run de nuevo.");
+                return;
+            }
+
+            await ctx.editMessageText(
+                `🤖 <b>${escapeHtml(agent.name)}</b> procesando…`,
+                { parse_mode: "HTML" }
+            );
+            await ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => { });
+
+            const result = await this.persistentAgentService.sendPrompt(agent, prompt);
+
+            const header = `🤖 <b>${escapeHtml(agent.name)}</b>\n\n`;
+            const body = result.output || "(sin salida)";
+            const MAX = 3800;
+
+            if (body.length <= MAX) {
+                await ctx.api.editMessageText(
+                    ctx.callbackQuery!.message!.chat.id,
+                    ctx.callbackQuery!.message!.message_id,
+                    `${header}${formatAsHtml(body)}`,
+                    { parse_mode: "HTML" }
+                ).catch(async () => {
+                    await ctx.reply(`${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
+                });
+            } else {
+                await ctx.api.deleteMessage(
+                    ctx.callbackQuery!.message!.chat.id,
+                    ctx.callbackQuery!.message!.message_id
+                ).catch(() => { });
+                const buf = Buffer.from(body, "utf8");
+                await ctx.replyWithDocument(new InputFile(buf, `${agent.name}-respuesta.md`), {
+                    caption: `${header}(resultado adjunto por longitud)`,
+                    parse_mode: "HTML",
+                });
+            }
+        } catch (error) {
+            console.error("handleRunAgentSelected error:", error);
+            await ctx.reply(ErrorUtils.createErrorMessage("run agent", error));
+        }
     }
 
     // ─── /createagent wizard ──────────────────────────────────────────────────
@@ -2172,75 +2268,19 @@ export class OpenCodeBot {
             return;
         }
 
-        const activeId = this.persistentAgentService.getActiveAgentId(userId);
-
         const keyboard = new InlineKeyboard();
         for (const agent of agents) {
-            const isActive = agent.id === activeId;
-            const label = `${isActive ? "● " : ""}${agent.name} [${agent.model}]`;
-            keyboard.text(label, `pagent:switch:${agent.id}`).text("🗑️", `pagent:del:${agent.id}`).row();
+            keyboard.text(`${agent.name} [${agent.model}]`, `pagent:runpick:${agent.id}`).text("🗑️", `pagent:del:${agent.id}`).row();
         }
-        keyboard.text("▶ Agente principal", "pagent:main");
-
-        const activeAgent = activeId ? agents.find(a => a.id === activeId) : null;
-        const activeLine = activeAgent
-            ? `\nActivo: <b>${escapeHtml(activeAgent.name)}</b>`
-            : "\nActivo: <b>Agente principal (OpenCode)</b>";
 
         await ctx.reply(
-            `🤖 <b>Tus agentes persistentes</b>${activeLine}\n\n` +
-            `Selecciona para hacer switch o toca 🗑️ para borrar:`,
+            `🤖 <b>Tus agentes persistentes</b>\n\n` +
+            `Toca el nombre del agente para enviarle un prompt, o 🗑️ para borrar:`,
             { parse_mode: "HTML", reply_markup: keyboard }
         );
     }
 
-    // ─── Callbacks: switch, delete ────────────────────────────────────────────
-
-    private async handleAgentSwitch(ctx: Context): Promise<void> {
-        try {
-            await ctx.answerCallbackQuery();
-            const userId = ctx.from?.id;
-            if (!userId) return;
-
-            const agentId = (ctx.callbackQuery?.data || "").replace("pagent:switch:", "");
-            const agent = this.agentDb.getById(agentId);
-            if (!agent) {
-                await ctx.editMessageText("❌ Agente no encontrado.");
-                return;
-            }
-
-            this.persistentAgentService.setActiveAgent(userId, agentId);
-
-            await ctx.editMessageText(
-                `✅ Agente activo: <b>${escapeHtml(agent.name)}</b>\n\n` +
-                `Ahora tus mensajes irán a este agente.\n` +
-                `Usa /run para cambiar de agente o /agents para ver la lista.`,
-                { parse_mode: "HTML" }
-            );
-        } catch (error) {
-            console.error("handleAgentSwitch error:", error);
-            await ctx.reply(ErrorUtils.createErrorMessage("switch agent", error));
-        }
-    }
-
-    private async handleAgentSwitchMain(ctx: Context): Promise<void> {
-        try {
-            await ctx.answerCallbackQuery();
-            const userId = ctx.from?.id;
-            if (!userId) return;
-
-            this.persistentAgentService.clearActiveAgent(userId);
-
-            await ctx.editMessageText(
-                `✅ Agente activo: <b>Agente principal (OpenCode)</b>\n\n` +
-                `Tus mensajes vuelven a la sesión OpenCode principal.`,
-                { parse_mode: "HTML" }
-            );
-        } catch (error) {
-            console.error("handleAgentSwitchMain error:", error);
-            await ctx.reply(ErrorUtils.createErrorMessage("switch to main agent", error));
-        }
-    }
+    // ─── Callbacks: delete ────────────────────────────────────────────────────
 
     private async handleAgentDelete(ctx: Context): Promise<void> {
         try {
@@ -2286,11 +2326,6 @@ export class OpenCodeBot {
             // Stop process and delete from DB
             this.persistentAgentService.stopAgent(agentId);
             this.agentDb.delete(agentId);
-
-            // If this was the active agent, clear sticky state
-            if (this.persistentAgentService.getActiveAgentId(userId) === agentId) {
-                this.persistentAgentService.clearActiveAgent(userId);
-            }
 
             await ctx.editMessageText(
                 `🗑️ Agente <b>${escapeHtml(agent.name)}</b> eliminado.\n\n` +

@@ -1,7 +1,0 @@
-{
-  "type": "lsp.client.diagnostics",
-  "properties": {
-    "path": "/home/valle/Documentos/proyectos/gitea-projects/gotocheck/m4g/server/routes/csvProcessor.ts",
-    "serverID": "typescript"
-  }
-}
