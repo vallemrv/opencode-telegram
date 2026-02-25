@@ -124,6 +124,8 @@ export class OpenCodeBot {
         bot.callbackQuery(/^pagent:main$/, AccessControlMiddleware.requireAccess, this.handleAgentSwitchMain.bind(this));
         bot.callbackQuery(/^pagent:del:/, AccessControlMiddleware.requireAccess, this.handleAgentDelete.bind(this));
         bot.callbackQuery(/^pagent:delconfirm:/, AccessControlMiddleware.requireAccess, this.handleAgentDeleteConfirm.bind(this));
+        bot.callbackQuery(/^pagent:delcancel$/, AccessControlMiddleware.requireAccess, this.handleAgentDeleteCancel.bind(this));
+        bot.callbackQuery(/^pagent:model:/, AccessControlMiddleware.requireAccess, this.handleAgentModelSelection.bind(this));
 
         // Handle keyboard button presses
         bot.hears("⏹️ ESC", AccessControlMiddleware.requireAccess, this.handleEsc.bind(this));
@@ -1686,35 +1688,62 @@ export class OpenCodeBot {
                 return;
             }
 
-            // Get current session to show current model
+            // If user has an active persistent agent, ask what they want to change
+            const activeAgentId = this.persistentAgentService.getActiveAgentId(userId);
+            if (activeAgentId) {
+                const agent = this.agentDb.getById(activeAgentId);
+                if (agent) {
+                    const userSession = this.opencodeService.getUserSession(userId);
+                    const mainModel = userSession?.currentModel || process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5-free";
+
+                    const keyboard = new InlineKeyboard()
+                        .text(`🤖 Agente: ${agent.name} [${agent.model}]`, `pagent:model:${agent.id}:__choose_provider`).row()
+                        .text(`💻 Sesión principal [${mainModel}]`, "provider:__main__").row();
+
+                    await ctx.reply(
+                        `🤖 <b>¿Qué modelo quieres cambiar?</b>\n\n` +
+                        `Tienes el agente <b>${escapeHtml(agent.name)}</b> activo.\n\n` +
+                        `Elige si cambias el modelo del agente o de la sesión principal:`,
+                        { parse_mode: "HTML", reply_markup: keyboard }
+                    );
+                    return;
+                }
+            }
+
+            // Default: show providers for main session
             const userSession = this.opencodeService.getUserSession(userId);
             const currentModel = userSession?.currentModel || process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5-free";
-
-            // Get providers
-            const models = this.getAvailableModels();
-            const providers = Array.from(models.keys());
-
-            // Create keyboard with providers
-            const keyboard = new InlineKeyboard();
-
-            providers.forEach((provider) => {
-                keyboard.text(
-                    `🔹 ${provider}`,
-                    `provider:${provider}`
-                ).row();
-            });
-
-            await ctx.reply(
-                `🤖 <b>Select AI Model Provider</b>\n\n` +
-                `Current model: <code>${currentModel}</code>\n\n` +
-                `Choose a provider to see available models:`,
-                {
-                    parse_mode: "HTML",
-                    reply_markup: keyboard
-                }
-            );
+            await this.replyWithProviders(ctx, currentModel, "main");
         } catch (error) {
             await ctx.reply(ErrorUtils.createErrorMessage("show models", error));
+        }
+    }
+
+    /** Shared helper: sends the provider picker message */
+    private async replyWithProviders(ctx: Context, currentModel: string, target: "main" | string, edit = false): Promise<void> {
+        const models = this.getAvailableModels();
+        const providers = Array.from(models.keys());
+        const keyboard = new InlineKeyboard();
+
+        const prefix = target === "main" ? "provider:" : `pagent:model:${target}:provider:`;
+
+        providers.forEach((provider) => {
+            keyboard.text(`🔹 ${provider}`, `${prefix}${provider}`).row();
+        });
+
+        const targetLabel = target === "main"
+            ? "sesión principal"
+            : `agente <b>${escapeHtml(this.agentDb.getById(target)?.name ?? target)}</b>`;
+
+        const text =
+            `🤖 <b>Selecciona proveedor</b>\n\n` +
+            `Cambiando modelo de: ${targetLabel}\n` +
+            `Modelo actual: <code>${currentModel}</code>`;
+
+        if (edit) {
+            await ctx.editMessageText(text, { parse_mode: "HTML", reply_markup: keyboard });
+        } else {
+            await ctx.reply(text, { parse_mode: "HTML", reply_markup: keyboard });
         }
     }
 
@@ -1727,6 +1756,15 @@ export class OpenCodeBot {
 
             if (!provider) {
                 await ctx.reply("❌ Invalid provider selection");
+                return;
+            }
+
+            // "__main__" means user chose to change the main session model
+            if (provider === "__main__") {
+                const userId = ctx.from?.id;
+                const userSession = userId ? this.opencodeService.getUserSession(userId) : undefined;
+                const currentModel = userSession?.currentModel || process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5-free";
+                await this.replyWithProviders(ctx, currentModel, "main", true);
                 return;
             }
 
@@ -2197,7 +2235,7 @@ export class OpenCodeBot {
 
             const keyboard = new InlineKeyboard()
                 .text("✅ Sí, borrar", `pagent:delconfirm:${agentId}`)
-                .text("❌ Cancelar", "pagent:main");
+                .text("❌ Cancelar", "pagent:delcancel");
 
             await ctx.editMessageText(
                 `🗑️ ¿Borrar agente <b>${escapeHtml(agent.name)}</b>?\n\n` +
@@ -2240,6 +2278,113 @@ export class OpenCodeBot {
         } catch (error) {
             console.error("handleAgentDeleteConfirm error:", error);
             await ctx.reply(ErrorUtils.createErrorMessage("delete agent confirm", error));
+        }
+    }
+
+    /** Callback: pagent:delcancel — cancel delete confirmation, re-render /agents list */
+    private async handleAgentDeleteCancel(ctx: Context): Promise<void> {
+        try {
+            await ctx.answerCallbackQuery();
+            await ctx.deleteMessage().catch(() => {});
+            await this.handleAgents(ctx);
+        } catch (error) {
+            console.error("handleAgentDeleteCancel error:", error);
+        }
+    }
+
+    /**
+     * Callback: pagent:model:<agentId>:__choose_provider  → show provider list for agent
+     * Callback: pagent:model:<agentId>:provider:<prov>    → show model list for agent+provider
+     * Callback: pagent:model:<agentId>:<provider>/<model> → save new model for agent
+     */
+    private async handleAgentModelSelection(ctx: Context): Promise<void> {
+        try {
+            await ctx.answerCallbackQuery();
+            const userId = ctx.from?.id;
+            if (!userId) return;
+
+            // Format: pagent:model:<agentId>:<rest>
+            const data = (ctx.callbackQuery?.data || "").replace(/^pagent:model:/, "");
+            const colonIdx = data.indexOf(":");
+            const agentId = colonIdx === -1 ? data : data.slice(0, colonIdx);
+            const rest = colonIdx === -1 ? "" : data.slice(colonIdx + 1);
+
+            const agent = this.agentDb.getById(agentId);
+            if (!agent) {
+                await ctx.editMessageText("❌ Agente no encontrado.");
+                return;
+            }
+
+            // Show provider list
+            if (rest === "__choose_provider" || rest === "") {
+                await this.replyWithAgentProviders(ctx, agent, true);
+                return;
+            }
+
+            // Show model list for a provider
+            if (rest.startsWith("provider:")) {
+                const provider = rest.replace("provider:", "");
+                const models = this.getAvailableModels();
+                const providerModels = models.get(provider) || [];
+
+                if (providerModels.length === 0) {
+                    await ctx.editMessageText(`❌ No models found for provider: ${provider}`);
+                    return;
+                }
+
+                const keyboard = new InlineKeyboard();
+                providerModels.forEach((model) => {
+                    keyboard.text(`⚡ ${model}`, `pagent:model:${agentId}:${provider}/${model}`).row();
+                });
+                keyboard.text("◀️ Volver a proveedores", `pagent:model:${agentId}:__choose_provider`);
+
+                await ctx.editMessageText(
+                    `🤖 <b>${provider}</b> — Agente <b>${escapeHtml(agent.name)}</b>\n\nSelecciona modelo:`,
+                    { parse_mode: "HTML", reply_markup: keyboard }
+                );
+                return;
+            }
+
+            // rest is "provider/model" — save
+            const newModel = rest;
+            this.agentDb.updateModel(agentId, newModel);
+
+            // Restart the agent process so it picks up the new model on next sendPrompt
+            this.persistentAgentService.stopAgent(agentId);
+            const updatedAgent = this.agentDb.getById(agentId)!;
+            this.persistentAgentService.startAgent(updatedAgent).catch(err =>
+                console.error(`[OpenCodeBot] Failed to restart agent ${agentId} after model change:`, err)
+            );
+
+            await ctx.editMessageText(
+                `✅ Modelo actualizado para <b>${escapeHtml(agent.name)}</b>\n\n` +
+                `Antes: <code>${agent.model}</code>\n` +
+                `Ahora: <code>${newModel}</code>\n\n` +
+                `El servidor del agente se ha reiniciado.`,
+                { parse_mode: "HTML" }
+            );
+        } catch (error) {
+            console.error("handleAgentModelSelection error:", error);
+            await ctx.reply(ErrorUtils.createErrorMessage("change agent model", error));
+        }
+    }
+
+    /** Shows the provider picker for changing an agent's model */
+    private async replyWithAgentProviders(ctx: Context, agent: any, edit: boolean): Promise<void> {
+        const models = this.getAvailableModels();
+        const keyboard = new InlineKeyboard();
+        for (const provider of models.keys()) {
+            keyboard.text(`🔹 ${provider}`, `pagent:model:${agent.id}:provider:${provider}`).row();
+        }
+        const text =
+            `🤖 <b>Cambiar modelo de agente</b>\n\n` +
+            `Agente: <b>${escapeHtml(agent.name)}</b>\n` +
+            `Modelo actual: <code>${agent.model}</code>\n\n` +
+            `Selecciona proveedor:`;
+        if (edit) {
+            await ctx.editMessageText(text, { parse_mode: "HTML", reply_markup: keyboard });
+        } else {
+            await ctx.reply(text, { parse_mode: "HTML", reply_markup: keyboard });
         }
     }
 

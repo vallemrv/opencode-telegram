@@ -93,6 +93,10 @@ export class AgentDbService {
         this.db.prepare('DELETE FROM persistent_agents WHERE id = ?').run(id);
     }
 
+    updateModel(id: string, model: string): void {
+        this.db.prepare('UPDATE persistent_agents SET model = ? WHERE id = ?').run(model, id);
+    }
+
     /** Returns all ports already in use by persistent agents */
     usedPorts(): number[] {
         return (this.db.prepare('SELECT port FROM persistent_agents').all() as any[]).map(r => r.port);
