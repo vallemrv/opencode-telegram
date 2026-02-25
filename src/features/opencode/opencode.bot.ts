@@ -72,6 +72,12 @@ export class OpenCodeBot {
     /** Pending agent questions keyed by shortKey (8 random chars), so callback data stays short */
     private pendingAgentQuestions: Map<string, { agentId: string; port: number; req: any }> = new Map();
 
+    /**
+     * Last heartbeat summary sent per agent, used to suppress duplicate notifications.
+     * Key: agentId, Value: { status, msgCount } of the last sent message.
+     */
+    private lastSentHeartbeat: Map<string, { status: string; msgCount: number }> = new Map();
+
     constructor(
         opencodeService: OpenCodeService,
         configService: ConfigService
@@ -2477,21 +2483,52 @@ export class OpenCodeBot {
 
     /**
      * Called by PersistentAgentService every 3 minutes with the agent's status.
-     * Sends a new Telegram message to the agent's owner each time.
+     *
+     * Deduplication: skips sending if status + msgCount haven't changed since
+     * the last notification, UNLESS we're transitioning to "idle" (completion)
+     * which is always notified once.
      */
     private async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<void> {
         const agent = this.agentDb.getById(agentId);
         if (!agent || !this.bot) return;
 
-        const { status, msgCount, lastAction, minutesRunning } = summary;
+        const { status, msgCount, lastAction, minutesRunning, recentActions } = summary;
 
+        // --- Deduplication ---
+        const prev = this.lastSentHeartbeat.get(agentId);
+        const sameState = prev && prev.status === status && prev.msgCount === msgCount;
+
+        // Always notify on transition to idle (completion), suppress if no real change
+        if (sameState && status !== "idle") return;
+
+        // For repeated idle ticks (agent already finished, nothing new), skip too
+        if (sameState && status === "idle") return;
+
+        // Update last sent state
+        this.lastSentHeartbeat.set(agentId, { status, msgCount });
+
+        // --- Build message ---
         if (status === "idle") {
-            // Agent finished — send a final summary message
-            const text =
-                `✅ <b>${escapeHtml(agent.name)}</b> — terminado (${minutesRunning} min)\n` +
-                `📊 ${msgCount} pasos completados` +
-                (lastAction ? `\n💬 Último: "<i>${escapeHtml(lastAction)}</i>"` : "");
-            await this.bot.api.sendMessage(agent.userId, text, { parse_mode: "HTML" }).catch(() => {});
+            // Agent finished — send a rich summary
+            // Clear the tracker so if the agent runs again later we notify fresh
+            this.lastSentHeartbeat.delete(agentId);
+
+            const lines: string[] = [
+                `✅ <b>${escapeHtml(agent.name)}</b> — terminado (${minutesRunning} min) · ${msgCount} pasos`,
+            ];
+
+            if (recentActions.length > 0) {
+                lines.push("");
+                lines.push("<b>Resumen de lo realizado:</b>");
+                for (const action of recentActions) {
+                    // Each action as a bullet, trimmed to avoid wall-of-text
+                    lines.push(`• ${escapeHtml(action.slice(0, 280))}`);
+                }
+            } else if (lastAction) {
+                lines.push(`💬 Último: "<i>${escapeHtml(lastAction)}</i>"`);
+            }
+
+            await this.bot.api.sendMessage(agent.userId, lines.join("\n"), { parse_mode: "HTML" }).catch(() => {});
             return;
         }
 

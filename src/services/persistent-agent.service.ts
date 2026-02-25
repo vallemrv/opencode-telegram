@@ -41,6 +41,11 @@ export interface HeartbeatSummary {
     lastAction: string;
     /** Minutes elapsed since the first message of the active session */
     minutesRunning: number;
+    /**
+     * For idle status: last N assistant text snippets (up to 300 chars each),
+     * so the bot can build a meaningful completion summary.
+     */
+    recentActions: string[];
 }
 
 /** Called by OpenCodeBot on each heartbeat tick */
@@ -334,19 +339,20 @@ export class PersistentAgentService {
 
     private async buildHeartbeatSummary(agent: PersistentAgent): Promise<HeartbeatSummary> {
         const baseUrl = `http://localhost:${agent.port}`;
+        const EMPTY: HeartbeatSummary = { status: "idle", msgCount: 0, lastAction: "", minutesRunning: 0, recentActions: [] };
 
-        // Get all sessions, find the most recently updated one
         let msgCount = 0;
         let lastAction = "";
         let minutesRunning = 0;
         let status: HeartbeatSummary["status"] = "idle";
+        const recentActions: string[] = [];
 
         try {
             const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
-            if (!sessRes.ok) return { status: "idle", msgCount: 0, lastAction: "", minutesRunning: 0 };
+            if (!sessRes.ok) return EMPTY;
 
             const sessions: any[] = await sessRes.json();
-            if (sessions.length === 0) return { status: "idle", msgCount: 0, lastAction: "", minutesRunning: 0 };
+            if (sessions.length === 0) return EMPTY;
 
             // Pick most recently updated session
             const session = sessions.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))[0];
@@ -355,13 +361,15 @@ export class PersistentAgentService {
             const msgRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
                 signal: AbortSignal.timeout(5000),
             });
-            if (!msgRes.ok) return { status: "idle", msgCount: 0, lastAction: "", minutesRunning: 0 };
+            if (!msgRes.ok) return EMPTY;
 
             const messages: any[] = await msgRes.json();
             msgCount = messages.length;
 
-            // Extract last assistant text (first 100 chars)
+            // Extract assistant text parts
             const assistantMsgs = messages.filter((m: any) => m.role === "assistant");
+
+            // Last action: last 100 chars of the most recent assistant text
             if (assistantMsgs.length > 0) {
                 const lastMsg = assistantMsgs[assistantMsgs.length - 1];
                 const parts: any[] = lastMsg.parts ?? [];
@@ -371,13 +379,24 @@ export class PersistentAgentService {
                 }
             }
 
+            // Recent actions: last 5 unique assistant text snippets (up to 300 chars each)
+            // Used to build a rich completion summary
+            const seen = new Set<string>();
+            for (let i = assistantMsgs.length - 1; i >= 0 && recentActions.length < 5; i--) {
+                const parts: any[] = assistantMsgs[i].parts ?? [];
+                const textPart = [...parts].reverse().find((p: any) => p.type === "text" && p.text);
+                if (!textPart) continue;
+                const snippet = (textPart.text as string).replace(/\s+/g, " ").trim().slice(0, 300);
+                if (snippet && !seen.has(snippet)) {
+                    seen.add(snippet);
+                    recentActions.unshift(snippet);
+                }
+            }
+
             // Compute minutesRunning from first message timestamp
             if (messages.length > 0 && messages[0].time?.created) {
                 minutesRunning = Math.floor((Date.now() - messages[0].time.created) / 60000);
             }
-
-            // Determine status
-            // (unused variable removed — step detection uses lastAsst below)
 
             // Check if there's a running step (no step-finish in the last assistant msg)
             const lastAsst = assistantMsgs[assistantMsgs.length - 1];
@@ -404,7 +423,7 @@ export class PersistentAgentService {
             status = "idle";
         }
 
-        return { status, msgCount, lastAction, minutesRunning };
+        return { status, msgCount, lastAction, minutesRunning, recentActions };
     }
 
     // ─── Reply to a question ──────────────────────────────────────────────────
