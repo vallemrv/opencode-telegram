@@ -1871,7 +1871,7 @@ export class OpenCodeBot {
     }
 
     private async handleRestart(ctx: Context): Promise<void> {
-        const { execSync } = await import("child_process");
+        const { execSync, spawn } = await import("child_process");
 
         const statusMsg = await ctx.reply(
             "🔄 <b>Reiniciando servicios...</b>\n\n" +
@@ -1889,30 +1889,26 @@ export class OpenCodeBot {
         };
 
         try {
-            // 1. Build
+            // 1. Build (synchronous — we need the result before proceeding)
             execSync("npm run build", {
                 cwd: "/home/valle/Documentos/proyectos/opencode-telegram",
                 stdio: "pipe",
             });
 
+            // 2. Update status before triggering restart
             await editStatus(
                 "🔄 <b>Reiniciando servicios...</b>\n\n" +
                 "✅ Build completado\n" +
-                "⏳ Ejecutando <code>sudo systemctl restart opencode-telegram</code>..."
+                "⏳ Reiniciando servicio — el bot volverá en unos segundos..."
             );
 
-            // 2. Restart the systemd service — this kills the current process too,
-            //    so systemd will bring everything back fresh (opencode serve + bot).
-            execSync("sudo systemctl restart opencode-telegram.service", {
-                stdio: "pipe",
+            // 3. Fire-and-forget: detached spawn so the child outlives this process.
+            //    systemd will SIGTERM us and bring a fresh instance back up.
+            const child = spawn("sudo", ["systemctl", "restart", "opencode-telegram.service"], {
+                detached: true,
+                stdio: "ignore",
             });
-
-            // If we somehow reach here before systemd kills us, let the user know
-            await editStatus(
-                "✅ <b>Reinicio en curso</b>\n\n" +
-                "✅ Build completado\n" +
-                "✅ Servicio reiniciado — el bot volverá en unos segundos."
-            );
+            child.unref();
 
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
