@@ -34,7 +34,7 @@ import tuiToastShow from "./event-handlers/tui.toast.show.handler.js";
 import ptyUpdated from "./event-handlers/pty.updated.handler.js";
 import ptyDeleted from "./event-handlers/pty.deleted.handler.js";
 import serverConnected from "./event-handlers/server.connected.handler.js";
-import { escapeHtml } from "./event-handlers/utils.js";
+
 
 /**
  * Handler function signature for processing events
@@ -99,18 +99,6 @@ export const eventHandlers: EventHandlerMap = {
 };
 
 /**
- * Default handler for events that don't have a specific handler
- * Formats the event with its type and properties
- */
-async function defaultHandler(event: Event, ctx: Context, userSession: UserSession): Promise<string> {
-    const eventType = event.type;
-    const properties = event.properties || {};
-
-    const propsStr = JSON.stringify(properties, null, 2);
-    return `🔔 <b>Event:</b> ${escapeHtml(eventType)}\n<pre>${escapeHtml(propsStr)}</pre>`;
-}
-
-/**
  * Process an event through the appropriate handler
  * Returns a message to send to the user, or null to ignore the event
  */
@@ -120,21 +108,10 @@ export async function processEvent(
     userSession: UserSession
 ): Promise<string | null> {
     try {
-        // Check if we have a specific handler for this event type
         const handler = eventHandlers[event.type];
+        if (!handler) return null;
 
-        if (handler) {
-            // TypeScript knows the event type is correct here
-            const result = await handler(event as any, ctx, userSession);
-            if (result) {
-                // console.log(`[EventHandler] Handled event: ${event.type}`);
-                return result;
-            }
-        }
-
-        if (!handler) {
-            return null
-        }
+        return await handler(event as any, ctx, userSession);
     } catch (error) {
         console.error(`Error handling event ${event.type}:`, error);
         return null;

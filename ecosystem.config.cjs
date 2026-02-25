@@ -1,7 +1,7 @@
 const dotenv = require('dotenv');
 const path = require('path');
 
-// Load .env file from telegramCoder directory
+// Load .env file from the project directory (same dir as this config file)
 const envConfig = dotenv.config({ path: path.join(__dirname, '.env') });
 
 if (envConfig.error) {
@@ -13,7 +13,7 @@ module.exports = {
     {
       name: "telegramCoder",
       script: "./dist/app.js",
-      cwd: "/home/tom/telegramCoder",
+      cwd: __dirname,
       instances: 1,
       autorestart: true,
       watch: false,

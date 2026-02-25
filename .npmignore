@@ -18,7 +18,6 @@ logs/
 
 # Documentation (keep essential docs, exclude Docker-specific)
 docs/
-DOCKER_GUIDE.md
 
 # Development configs
 nodemon.json

@@ -247,15 +247,6 @@ function startBot() {
 
     // Cross-platform signal handling
     if (isWindows) {
-        // On Windows, use readline to handle Ctrl+C
-        if (process.stdin.isTTY) {
-            const readline = require('readline');
-            readline.createInterface({
-                input: process.stdin,
-                output: process.stdout
-            });
-        }
-
         // Windows doesn't support POSIX signals properly, just kill the child
         process.on('SIGINT', () => {
             child.kill();

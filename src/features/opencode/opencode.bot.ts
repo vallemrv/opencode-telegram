@@ -595,39 +595,6 @@ export class OpenCodeBot {
         }
     }
 
-    private isMarkdownContent(text: string): boolean {
-        // If first character is a hash, it's markdown
-        return text.trimStart().startsWith('#');
-    }
-
-
-
-    private splitIntoChunks(text: string, maxLength: number): string[] {
-        const chunks: string[] = [];
-        let currentChunk = "";
-
-        const lines = text.split("\n");
-        for (const line of lines) {
-            if (currentChunk.length + line.length + 1 > maxLength) {
-                if (currentChunk) {
-                    chunks.push(currentChunk);
-                }
-                currentChunk = line;
-            } else {
-                if (currentChunk) {
-                    currentChunk += "\n" + line;
-                } else {
-                    currentChunk = line;
-                }
-            }
-        }
-
-        if (currentChunk) {
-            chunks.push(currentChunk);
-        }
-
-        return chunks;
-    }
 
     private async handleEndSession(ctx: Context): Promise<void> {
         // Same behaviour as /delete
