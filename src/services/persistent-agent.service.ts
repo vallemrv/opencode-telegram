@@ -11,6 +11,8 @@
  * - Send a prompt to an agent's server and collect the SSE response
  * - Restart all known agents on bot startup
  * - Stream SSE events from each agent and fire onQuestion callback for tool:question
+ * - Periodic heartbeat every 3 min to notify the user of agent progress
+ * - Recover pending questions after SSE reconnects (via GET /question)
  */
 
 import { spawn, ChildProcess } from "child_process";
@@ -28,6 +30,21 @@ export interface AgentSendResult {
 /** Called by OpenCodeBot when the agent has a pending question for the user */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type OnQuestionCallback = (agentId: string, req: any) => Promise<void>;
+
+/** Summary sent to the bot on each heartbeat tick */
+export interface HeartbeatSummary {
+    /** Current agent status */
+    status: "working" | "idle" | "stuck";
+    /** Total message count in the latest active session */
+    msgCount: number;
+    /** Last 100 chars of the most recent assistant text */
+    lastAction: string;
+    /** Minutes elapsed since the first message of the active session */
+    minutesRunning: number;
+}
+
+/** Called by OpenCodeBot on each heartbeat tick */
+export type OnHeartbeatCallback = (agentId: string, summary: HeartbeatSummary) => Promise<void>;
 
 /** Resolve ~ in paths */
 export function resolveDir(p: string): string {
@@ -70,6 +87,12 @@ async function findOpencodeCmd(): Promise<string> {
     throw new Error("opencode binary not found");
 }
 
+/** Heartbeat interval in milliseconds (3 minutes) */
+const HEARTBEAT_INTERVAL_MS = 3 * 60 * 1000;
+
+/** Minutes of silence before an agent is considered "stuck" */
+const STUCK_THRESHOLD_MIN = 10;
+
 export class PersistentAgentService {
     /** Map of agentId → child process */
     private processes: Map<string, ChildProcess> = new Map();
@@ -83,9 +106,27 @@ export class PersistentAgentService {
     /** Callback registered by OpenCodeBot to handle pending questions */
     private onQuestion?: OnQuestionCallback;
 
+    /** Callback registered by OpenCodeBot to handle heartbeat ticks */
+    private onHeartbeat?: OnHeartbeatCallback;
+
+    /** Map of agentId → heartbeat timer handle */
+    private heartbeatTimers: Map<string, NodeJS.Timeout> = new Map();
+
+    /**
+     * Tracks message counts per agent to detect "stuck" state.
+     * count: last seen message count
+     * since: timestamp when count was last changed
+     */
+    private lastMsgCounts: Map<string, { count: number; since: number }> = new Map();
+
     /** Register the question callback (called once at startup by OpenCodeBot) */
     setOnQuestionCallback(cb: OnQuestionCallback): void {
         this.onQuestion = cb;
+    }
+
+    /** Register the heartbeat callback (called once at startup by OpenCodeBot) */
+    setOnHeartbeatCallback(cb: OnHeartbeatCallback): void {
+        this.onHeartbeat = cb;
     }
 
     // ─── Server lifecycle ─────────────────────────────────────────────────────
@@ -173,6 +214,9 @@ export class PersistentAgentService {
         this.runSseLoop(agent, abort).catch(err =>
             console.error(`[PersistentAgent] SSE loop error for agent ${agent.name}:`, err)
         );
+
+        // Start heartbeat timer
+        this.startHeartbeat(agent);
     }
 
     private stopSseStream(agentId: string): void {
@@ -181,12 +225,16 @@ export class PersistentAgentService {
             ctrl.abort();
             this.sseControllers.delete(agentId);
         }
+        this.stopHeartbeat(agentId);
     }
 
     private async runSseLoop(agent: PersistentAgent, abort: AbortController): Promise<void> {
         const baseUrl = `http://localhost:${agent.port}`;
         const client = createOpencodeClient({ baseUrl });
         let retryDelay = 3000;
+
+        // Recover any questions that were pending before this SSE connection
+        await this.recoverPendingQuestions(agent);
 
         while (!abort.signal.aborted) {
             try {
@@ -209,8 +257,154 @@ export class PersistentAgentService {
                 console.warn(`[PersistentAgent] SSE stream for agent "${agent.name}" disconnected, retrying in ${retryDelay}ms`);
                 await new Promise(r => setTimeout(r, retryDelay));
                 retryDelay = Math.min(retryDelay * 2, 30000);
+
+                // Recover pending questions after each reconnect
+                await this.recoverPendingQuestions(agent);
             }
         }
+    }
+
+    // ─── Question recovery ────────────────────────────────────────────────────
+
+    /**
+     * Queries GET /question?directory=<workdir> on the agent's server to find
+     * any questions that were asked while the bot was offline (their SSE event
+     * was never received).  For each unanswered question we fire onQuestion
+     * exactly as if the SSE event had just arrived.
+     */
+    private async recoverPendingQuestions(agent: PersistentAgent): Promise<void> {
+        if (!this.onQuestion) return;
+
+        try {
+            const workdir = resolveDir(agent.workdir);
+            const url = `http://localhost:${agent.port}/question?directory=${encodeURIComponent(workdir)}`;
+            const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+            if (!res.ok) return;
+
+            const questions: any[] = await res.json();
+            if (!Array.isArray(questions) || questions.length === 0) return;
+
+            console.log(`[PersistentAgent] Recovering ${questions.length} pending question(s) for agent "${agent.name}"`);
+            for (const q of questions) {
+                // Each item in the array IS the QuestionRequest (has .id, .questions[])
+                this.onQuestion(agent.id, q).catch(err =>
+                    console.error(`[PersistentAgent] recoverPendingQuestions callback error:`, err)
+                );
+            }
+        } catch (err) {
+            // Non-fatal — server may not have pending questions or endpoint may not exist
+            console.debug(`[PersistentAgent] recoverPendingQuestions for "${agent.name}": ${err}`);
+        }
+    }
+
+    // ─── Heartbeat ───────────────────────────────────────────────────────────
+
+    private startHeartbeat(agent: PersistentAgent): void {
+        if (this.heartbeatTimers.has(agent.id)) return;
+
+        const timer = setInterval(async () => {
+            await this.fireHeartbeat(agent);
+        }, HEARTBEAT_INTERVAL_MS);
+
+        // Allow the Node process to exit even if the timer is still running
+        if (timer.unref) timer.unref();
+
+        this.heartbeatTimers.set(agent.id, timer);
+    }
+
+    private stopHeartbeat(agentId: string): void {
+        const timer = this.heartbeatTimers.get(agentId);
+        if (timer) {
+            clearInterval(timer);
+            this.heartbeatTimers.delete(agentId);
+        }
+        this.lastMsgCounts.delete(agentId);
+    }
+
+    private async fireHeartbeat(agent: PersistentAgent): Promise<void> {
+        if (!this.onHeartbeat) return;
+
+        try {
+            const summary = await this.buildHeartbeatSummary(agent);
+            await this.onHeartbeat(agent.id, summary);
+        } catch (err) {
+            console.error(`[PersistentAgent] heartbeat error for "${agent.name}":`, err);
+        }
+    }
+
+    private async buildHeartbeatSummary(agent: PersistentAgent): Promise<HeartbeatSummary> {
+        const baseUrl = `http://localhost:${agent.port}`;
+
+        // Get all sessions, find the most recently updated one
+        let msgCount = 0;
+        let lastAction = "";
+        let minutesRunning = 0;
+        let status: HeartbeatSummary["status"] = "idle";
+
+        try {
+            const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
+            if (!sessRes.ok) return { status: "idle", msgCount: 0, lastAction: "", minutesRunning: 0 };
+
+            const sessions: any[] = await sessRes.json();
+            if (sessions.length === 0) return { status: "idle", msgCount: 0, lastAction: "", minutesRunning: 0 };
+
+            // Pick most recently updated session
+            const session = sessions.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))[0];
+
+            // Fetch messages for this session
+            const msgRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
+                signal: AbortSignal.timeout(5000),
+            });
+            if (!msgRes.ok) return { status: "idle", msgCount: 0, lastAction: "", minutesRunning: 0 };
+
+            const messages: any[] = await msgRes.json();
+            msgCount = messages.length;
+
+            // Extract last assistant text (first 100 chars)
+            const assistantMsgs = messages.filter((m: any) => m.role === "assistant");
+            if (assistantMsgs.length > 0) {
+                const lastMsg = assistantMsgs[assistantMsgs.length - 1];
+                const parts: any[] = lastMsg.parts ?? [];
+                const textPart = [...parts].reverse().find((p: any) => p.type === "text" && p.text);
+                if (textPart) {
+                    lastAction = (textPart.text as string).replace(/\s+/g, " ").trim().slice(0, 100);
+                }
+            }
+
+            // Compute minutesRunning from first message timestamp
+            if (messages.length > 0 && messages[0].time?.created) {
+                minutesRunning = Math.floor((Date.now() - messages[0].time.created) / 60000);
+            }
+
+            // Determine status
+            // (unused variable removed — step detection uses lastAsst below)
+
+            // Check if there's a running step (no step-finish in the last assistant msg)
+            const lastAsst = assistantMsgs[assistantMsgs.length - 1];
+            const hasRunningStep = lastAsst &&
+                !(lastAsst.parts ?? []).some((p: any) => p.type === "step-finish");
+
+            if (hasRunningStep) {
+                // Check stuck: message count hasn't changed for > STUCK_THRESHOLD_MIN
+                const prev = this.lastMsgCounts.get(agent.id);
+                if (prev && prev.count === msgCount) {
+                    const silentMin = (Date.now() - prev.since) / 60000;
+                    status = silentMin >= STUCK_THRESHOLD_MIN ? "stuck" : "working";
+                } else {
+                    this.lastMsgCounts.set(agent.id, { count: msgCount, since: Date.now() });
+                    status = "working";
+                }
+            } else {
+                // No running step — agent is idle
+                this.lastMsgCounts.delete(agent.id);
+                status = "idle";
+            }
+        } catch {
+            // Server unreachable
+            status = "idle";
+        }
+
+        return { status, msgCount, lastAction, minutesRunning };
     }
 
     // ─── Reply to a question ──────────────────────────────────────────────────

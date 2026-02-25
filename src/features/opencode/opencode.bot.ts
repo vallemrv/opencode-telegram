@@ -5,7 +5,7 @@ import { OpenCodeServerService } from "../../services/opencode-server.service.js
 import { GiteaService } from "../../services/gitea.service.js";
 import { BackgroundAgentService, resolveDir } from "../../services/background-agent.service.js";
 import { AgentDbService } from "../../services/agent-db.service.js";
-import { PersistentAgentService, pickPort } from "../../services/persistent-agent.service.js";
+import { PersistentAgentService, pickPort, type HeartbeatSummary } from "../../services/persistent-agent.service.js";
 import { SessionDbService } from "../../services/session-db.service.js";
 import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
 import { MessageUtils } from "../../utils/message.utils.js";
@@ -103,6 +103,10 @@ export class OpenCodeBot {
         this.persistentAgentService.setOnQuestionCallback(
             this.handleAgentQuestion.bind(this)
         );
+        // Register heartbeat callback for persistent agents
+        this.persistentAgentService.setOnHeartbeatCallback(
+            this.handleAgentHeartbeat.bind(this)
+        );
         // If a /restart was in progress, confirm readiness to the user who triggered it
         const restartChatId = this.sessionDb.getState("restart_pending_chat_id");
         const restartMsgId  = this.sessionDb.getState("restart_pending_message_id");
@@ -170,7 +174,6 @@ export class OpenCodeBot {
 
         // Agent question reply callbacks
         bot.callbackQuery(/^agq:/, AccessControlMiddleware.requireAccess, this.handleAgentQuestionCallback.bind(this));
-
         // Handle keyboard button presses
         bot.hears("⏹️ ESC", AccessControlMiddleware.requireAccess, this.handleEsc.bind(this));
         bot.hears("⇥ TAB", AccessControlMiddleware.requireAccess, this.handleTab.bind(this));
@@ -2470,6 +2473,50 @@ export class OpenCodeBot {
         }
     }
 
+    // ─── Agent heartbeat handling ─────────────────────────────────────────────
+
+    /**
+     * Called by PersistentAgentService every 3 minutes with the agent's status.
+     * Sends a new Telegram message to the agent's owner each time.
+     */
+    private async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<void> {
+        const agent = this.agentDb.getById(agentId);
+        if (!agent || !this.bot) return;
+
+        const { status, msgCount, lastAction, minutesRunning } = summary;
+
+        if (status === "idle") {
+            // Agent finished — send a final summary message
+            const text =
+                `✅ <b>${escapeHtml(agent.name)}</b> — terminado (${minutesRunning} min)\n` +
+                `📊 ${msgCount} pasos completados` +
+                (lastAction ? `\n💬 Último: "<i>${escapeHtml(lastAction)}</i>"` : "");
+            await this.bot.api.sendMessage(agent.userId, text, { parse_mode: "HTML" }).catch(() => {});
+            return;
+        }
+
+        if (status === "stuck") {
+            const keyboard = new InlineKeyboard()
+                .text("🛑 Abortar sesión", `agq:abort:${agentId}`);
+            const text =
+                `⚠️ <b>${escapeHtml(agent.name)}</b> — sin actividad (${minutesRunning} min)\n` +
+                `📊 ${msgCount} pasos | Posiblemente bloqueado` +
+                (lastAction ? `\n💬 Último: "<i>${escapeHtml(lastAction)}</i>"` : "");
+            await this.bot.api.sendMessage(agent.userId, text, {
+                parse_mode: "HTML",
+                reply_markup: keyboard,
+            }).catch(() => {});
+            return;
+        }
+
+        // status === "working"
+        const text =
+            `🤖 <b>${escapeHtml(agent.name)}</b> — trabajando (${minutesRunning} min)\n` +
+            `📊 ${msgCount} pasos completados` +
+            (lastAction ? `\n💬 Último: "<i>${escapeHtml(lastAction)}</i>"` : "");
+        await this.bot.api.sendMessage(agent.userId, text, { parse_mode: "HTML" }).catch(() => {});
+    }
+
     // ─── Agent question handling ──────────────────────────────────────────────
 
     /**
@@ -2516,12 +2563,44 @@ export class OpenCodeBot {
 
     /**
      * Callback handler for agq: buttons.
-     * Format: agq:<shortKey>:<qIdx>:<optIdx>  or  agq:cancel:<shortKey>
+     * Format: agq:<shortKey>:<qIdx>:<optIdx>  or  agq:cancel:<shortKey>  or  agq:abort:<agentId>
      */
     private async handleAgentQuestionCallback(ctx: Context): Promise<void> {
         try {
             await ctx.answerCallbackQuery();
             const data = ctx.callbackQuery?.data ?? "";
+
+            // Abort agent session
+            if (data.startsWith("agq:abort:")) {
+                const agentId = data.replace("agq:abort:", "");
+                const agent = this.agentDb.getById(agentId);
+                if (agent) {
+                    try {
+                        // Delete all sessions on the agent's server
+                        const sessRes = await fetch(`http://localhost:${agent.port}/session`, {
+                            signal: AbortSignal.timeout(5000),
+                        });
+                        if (sessRes.ok) {
+                            const sessions: any[] = await sessRes.json();
+                            for (const s of sessions) {
+                                await fetch(`http://localhost:${agent.port}/session/${s.id}`, {
+                                    method: "DELETE",
+                                    signal: AbortSignal.timeout(5000),
+                                }).catch(() => {});
+                            }
+                        }
+                        await ctx.editMessageText(
+                            `🛑 <b>${escapeHtml(agent.name)}</b> — sesión abortada.\n\nEnvíale un nuevo prompt para continuar.`,
+                            { parse_mode: "HTML" }
+                        ).catch(() => {});
+                    } catch (err) {
+                        await ctx.editMessageText(`⚠️ No se pudo abortar: ${err}`).catch(() => {});
+                    }
+                } else {
+                    await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {});
+                }
+                return;
+            }
 
             // Cancel
             if (data.startsWith("agq:cancel:")) {
