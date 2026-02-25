@@ -2509,10 +2509,10 @@ export class OpenCodeBot {
 
         // --- Build message ---
         if (status === "idle") {
-            // Agent finished — send a rich summary
-            // Clear the tracker so if the agent runs again later we notify fresh
-            this.lastSentHeartbeat.delete(agentId);
-
+            // Agent finished — send a rich summary.
+            // Do NOT clear lastSentHeartbeat here: keeping { status: "idle", msgCount }
+            // ensures subsequent ticks with the same msgCount are suppressed as duplicates.
+            // When the agent gets a new prompt, msgCount will increase and notifications resume.
             const lines: string[] = [
                 `✅ <b>${escapeHtml(agent.name)}</b> — terminado (${minutesRunning} min) · ${msgCount} pasos`,
             ];
