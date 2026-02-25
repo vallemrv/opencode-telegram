@@ -6,6 +6,7 @@ import { GiteaService } from "../../services/gitea.service.js";
 import { BackgroundAgentService, resolveDir } from "../../services/background-agent.service.js";
 import { AgentDbService } from "../../services/agent-db.service.js";
 import { PersistentAgentService, pickPort } from "../../services/persistent-agent.service.js";
+import { SessionDbService } from "../../services/session-db.service.js";
 import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
 import { MessageUtils } from "../../utils/message.utils.js";
 import { ErrorUtils } from "../../utils/error.utils.js";
@@ -51,6 +52,7 @@ export class OpenCodeBot {
     private backgroundAgentService: BackgroundAgentService;
     private agentDb: AgentDbService;
     private persistentAgentService: PersistentAgentService;
+    private sessionDb: SessionDbService;
     private fileMentionService: FileMentionService;
     private fileMentionUI: FileMentionUI;
 
@@ -68,6 +70,7 @@ export class OpenCodeBot {
         this.backgroundAgentService = new BackgroundAgentService();
         this.agentDb = new AgentDbService();
         this.persistentAgentService = new PersistentAgentService();
+        this.sessionDb = new SessionDbService();
         this.fileMentionService = new FileMentionService();
         this.fileMentionUI = new FileMentionUI();
     }
@@ -81,6 +84,25 @@ export class OpenCodeBot {
     }
 
     registerHandlers(bot: Bot): void {
+        // If a /restart was in progress, confirm readiness to the user who triggered it
+        const restartChatId = this.sessionDb.getState("restart_pending_chat_id");
+        const restartMsgId  = this.sessionDb.getState("restart_pending_message_id");
+        if (restartChatId && restartMsgId) {
+            this.sessionDb.deleteState("restart_pending_chat_id");
+            this.sessionDb.deleteState("restart_pending_message_id");
+            // Small delay to let the bot's long-polling session establish before editing
+            setTimeout(() => {
+                bot.api.editMessageText(
+                    Number(restartChatId),
+                    Number(restartMsgId),
+                    "✅ <b>Bot listo</b>\n\n" +
+                    "✅ Build completado\n" +
+                    "✅ Servicio reiniciado y escuchando",
+                    { parse_mode: "HTML" }
+                ).catch(err => console.error("[OpenCodeBot] Could not edit restart message:", err));
+            }, 2000);
+        }
+
         // Restore persistent agents in background; notify owners of failures
         this.persistentAgentService.restoreAll(this.agentDb.getAll())
             .then(async (failed) => {
@@ -1902,7 +1924,11 @@ export class OpenCodeBot {
                 "⏳ Reiniciando servicio — el bot volverá en unos segundos..."
             );
 
-            // 3. Fire-and-forget: detached spawn so the child outlives this process.
+            // 3. Persist the message location so the new process can confirm readiness
+            this.sessionDb.setState("restart_pending_chat_id", String(statusMsg.chat.id));
+            this.sessionDb.setState("restart_pending_message_id", String(statusMsg.message_id));
+
+            // 4. Fire-and-forget: detached spawn so the child outlives this process.
             //    systemd will SIGTERM us and bring a fresh instance back up.
             const child = spawn("sudo", ["systemctl", "restart", "opencode-telegram.service"], {
                 detached: true,

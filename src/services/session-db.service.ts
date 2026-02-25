@@ -49,6 +49,30 @@ export class SessionDbService {
                 is_active BOOLEAN
             )
         `);
+
+        // Generic key/value store for bot state persistence across restarts
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        `);
+    }
+
+    setState(key: string, value: string): void {
+        this.db.prepare(`
+            INSERT INTO bot_state (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        `).run(key, value);
+    }
+
+    getState(key: string): string | undefined {
+        const row = this.db.prepare('SELECT value FROM bot_state WHERE key = ?').get(key) as any;
+        return row?.value;
+    }
+
+    deleteState(key: string): void {
+        this.db.prepare('DELETE FROM bot_state WHERE key = ?').run(key);
     }
 
     // Load the active session for a specific user
