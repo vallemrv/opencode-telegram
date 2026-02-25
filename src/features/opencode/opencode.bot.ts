@@ -72,12 +72,6 @@ export class OpenCodeBot {
     /** Pending agent questions keyed by shortKey (8 random chars), so callback data stays short */
     private pendingAgentQuestions: Map<string, { agentId: string; port: number; req: any }> = new Map();
 
-    /**
-     * Last heartbeat summary sent per agent, used to suppress duplicate notifications.
-     * Key: agentId, Value: { status, msgCount } of the last sent message.
-     */
-    private lastSentHeartbeat: Map<string, { status: string; msgCount: number }> = new Map();
-
     constructor(
         opencodeService: OpenCodeService,
         configService: ConfigService
@@ -2494,18 +2488,17 @@ export class OpenCodeBot {
 
         const { status, msgCount, lastAction, minutesRunning, recentActions } = summary;
 
-        // --- Deduplication ---
-        const prev = this.lastSentHeartbeat.get(agentId);
+        // --- Deduplication (persisted across restarts) ---
+        // Read last sent state from DB so reboots don't cause duplicate notifications.
+        const dbKey = `heartbeat_last:${agentId}`;
+        const storedRaw = this.sessionDb.getState(dbKey);
+        const prev = storedRaw ? JSON.parse(storedRaw) as { status: string; msgCount: number } : null;
         const sameState = prev && prev.status === status && prev.msgCount === msgCount;
 
-        // Always notify on transition to idle (completion), suppress if no real change
-        if (sameState && status !== "idle") return;
+        if (sameState) return;  // Nothing changed — skip regardless of status
 
-        // For repeated idle ticks (agent already finished, nothing new), skip too
-        if (sameState && status === "idle") return;
-
-        // Update last sent state
-        this.lastSentHeartbeat.set(agentId, { status, msgCount });
+        // Persist new state before sending (so even if send fails we don't spam)
+        this.sessionDb.setState(dbKey, JSON.stringify({ status, msgCount }));
 
         // --- Build message ---
         if (status === "idle") {
