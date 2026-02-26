@@ -1037,8 +1037,9 @@ export class OpenCodeBot {
             await this.editOrSendResult(chatId, hb?.msgId ?? placeholderMsgId, agent, result);
         }).catch(async (err) => {
             this.heartbeatMessages.delete(agent.id);
-            await this.bot!.api.editMessageText(
-                chatId, placeholderMsgId,
+            await this.bot!.api.deleteMessage(chatId, placeholderMsgId).catch(() => {});
+            await this.bot!.api.sendMessage(
+                chatId,
                 `❌ <b>${escapeHtml(agent.name)}</b> — error inesperado: ${escapeHtml(String(err))}`,
                 { parse_mode: "HTML" }
             ).catch(() => {});
@@ -1046,8 +1047,9 @@ export class OpenCodeBot {
     }
 
     /**
-     * Shared helper: edit a placeholder message with the agent result, or send a new one if edit fails.
-     * Used for immediate prompts (has a placeholder msgId to edit).
+     * Deletes the heartbeat placeholder and sends the result as a NEW message so
+     * Telegram triggers a sound/vibration notification. Editing is silent — only
+     * new messages notify the user audibly.
      */
     private async editOrSendResult(
         chatId: number,
@@ -1059,23 +1061,18 @@ export class OpenCodeBot {
         const body = result.output || "(sin salida)";
         const MAX = 3800;
 
+        // Always delete the placeholder first so it doesn't linger
+        await this.bot!.api.deleteMessage(chatId, msgId).catch(() => {});
+
         if (body.length <= MAX) {
-            await this.bot!.api.editMessageText(
-                chatId,
-                msgId,
-                `${header}${formatAsHtml(body)}`,
-                { parse_mode: "HTML" }
-            ).catch(async () => {
-                await this.bot!.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
-            });
+            await this.bot!.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" }).catch(() => {});
         } else {
-            await this.bot!.api.deleteMessage(chatId, msgId).catch(() => {});
             const buf = Buffer.from(body, "utf8");
             await this.bot!.api.sendDocument(
                 chatId,
                 new InputFile(buf, `${agent.name}-respuesta.md`),
                 { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
-            );
+            ).catch(() => {});
         }
     }
 
