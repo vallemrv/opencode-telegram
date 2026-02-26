@@ -14,6 +14,11 @@ export default async function messagePartUpdatedHandler(
 ): Promise<string | null> {
     try {
         const { part } = event.properties;
+
+        // 🔒 Ignorar partes de otras sesiones — el stream SSE es global
+        if ((part as any).sessionID && (part as any).sessionID !== userSession.sessionId) {
+            return null;
+        }
         
         if (part.type === "reasoning") {
             await handleReasoningPart(ctx, userSession);

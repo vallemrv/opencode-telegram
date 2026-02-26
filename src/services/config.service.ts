@@ -27,6 +27,9 @@ export class ConfigService {
     private readonly giteaToken: string;
     private readonly giteaDefaultWorkdir: string;
 
+    // Agent Configuration
+    private readonly maxAgents: number;
+
     // System Environment
     private readonly homeDirectory: string;
     private readonly systemEnv: { [key: string]: string };
@@ -74,6 +77,9 @@ export class ConfigService {
         this.giteaUrl = process.env.GITEA_URL || '';
         this.giteaToken = process.env.GITEA_TOKEN || '';
         this.giteaDefaultWorkdir = process.env.GITEA_DEFAULT_WORKDIR || '~/proyectos/gitea-projects';
+
+        // Load agent configuration
+        this.maxAgents = parseInt(process.env.MAX_AGENTS || '5', 10);
 
         // Load system environment
         this.homeDirectory = process.env.HOME || '/tmp';
@@ -135,6 +141,11 @@ export class ConfigService {
 
     isGiteaConfigured(): boolean {
         return this.giteaUrl.length > 0 && this.giteaToken.length > 0;
+    }
+
+    // Agent Configuration Getters
+    getMaxAgents(): number {
+        return this.maxAgents;
     }
 
     // System Environment Getters

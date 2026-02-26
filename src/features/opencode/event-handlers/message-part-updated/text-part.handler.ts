@@ -21,8 +21,13 @@ export async function handleTextPart(ctx: Context, text: string, userSession: Us
         // Mostrar "escribiendo..." en Telegram — sin mensaje visible
         ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => { });
 
-        // Guardar el texto más reciente para enviarlo al final
-        userSession.finalResponseText = text;
+        // Acumular el texto: OpenCode envía el texto completo acumulado en cada evento,
+        // así que simplemente reemplazamos con el último valor recibido (ya viene acumulado).
+        // Si por algún motivo el nuevo texto es más corto que el anterior (truncado),
+        // conservamos el más largo para no perder contenido.
+        if (!userSession.finalResponseText || text.length >= userSession.finalResponseText.length) {
+            userSession.finalResponseText = text;
+        }
 
     } catch (error) {
         console.log("Error in text part handler:", error);

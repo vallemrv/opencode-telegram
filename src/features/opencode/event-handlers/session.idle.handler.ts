@@ -35,6 +35,11 @@ export default async function sessionIdleHandler(
     userSession: UserSession
 ): Promise<string | null> {
     try {
+        // 🔒 Ignorar eventos de otras sesiones — el stream SSE es global
+        if (event.properties.sessionID && event.properties.sessionID !== userSession.sessionId) {
+            return null;
+        }
+
         // ✅ OpenCode ha terminado → liberar el bloqueo para nuevos prompts
         userSession.isProcessing = false;
 

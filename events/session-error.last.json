@@ -1,0 +1,26 @@
+{
+  "type": "session.error",
+  "properties": {
+    "sessionID": "ses_3730025b7ffe2Vs0qpddSsFGx3",
+    "error": {
+      "name": "APIError",
+      "data": {
+        "message": "Insufficient balance. Manage your billing here: https://opencode.ai/workspace/wrk_01KHRZG29ETKV0KZ7VJD6A7C29/billing",
+        "statusCode": 401,
+        "isRetryable": false,
+        "responseHeaders": {
+          "cf-ray": "9d39c8c3af7011de-DFW",
+          "connection": "keep-alive",
+          "content-length": "177",
+          "content-type": "text/plain;charset=UTF-8",
+          "date": "Wed, 25 Feb 2026 19:59:37 GMT",
+          "server": "cloudflare"
+        },
+        "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"CreditsError\",\"message\":\"Insufficient balance. Manage your billing here: https://opencode.ai/workspace/wrk_01KHRZG29ETKV0KZ7VJD6A7C29/billing\"}}",
+        "metadata": {
+          "url": "https://opencode.ai/zen/v1/messages"
+        }
+      }
+    }
+  }
+}

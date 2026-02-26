@@ -2,17 +2,19 @@
  * PersistentAgentService
  *
  * Manages long-lived `opencode serve` processes — one per persistent agent.
- * Each agent runs on its own fixed port, isolated from the main :4096 server.
  *
- * Responsibilities:
- * - Start an opencode serve process for an agent (if not already running)
- * - Stop a process (on agent deletion)
- * - Check whether a given port has a live opencode server
- * - Send a prompt to an agent's server and collect the SSE response
- * - Restart all known agents on bot startup
- * - Stream SSE events from each agent and fire onQuestion callback for tool:question
- * - Periodic heartbeat every 3 min to notify the user of agent progress
- * - Recover pending questions after SSE reconnects (via GET /question)
+ * Notification flow (correct):
+ *   1. User sends a prompt → sendPrompt() fires it async and returns a Promise
+ *      that is stored in pendingPromises keyed by agentId.
+ *   2. The SSE loop receives session.idle for that sessionId → resolves the
+ *      Promise with the last assistant message text.
+ *   3. OpenCodeBot receives the resolved text and sends it to Telegram.
+ *
+ * Heartbeat (safeguard only):
+ *   - Fires every HEARTBEAT_INTERVAL_MS while an agent has an in-flight prompt.
+ *   - If session.idle has NOT been received within STUCK_THRESHOLD_MIN minutes
+ *     since the prompt was sent, it notifies the user that the agent may be stuck.
+ *   - Resets when session.idle arrives (pendingPromises entry is cleared).
  */
 
 import { spawn, ChildProcess } from "child_process";
@@ -21,6 +23,7 @@ import * as path from "path";
 import * as os from "os";
 import { createOpencodeClient } from "@opencode-ai/sdk";
 import type { PersistentAgent } from "./agent-db.service.js";
+import type { AgentDbService } from "./agent-db.service.js";
 
 export interface AgentSendResult {
     output: string;
@@ -33,22 +36,15 @@ export type OnQuestionCallback = (agentId: string, req: any) => Promise<void>;
 
 /** Summary sent to the bot on each heartbeat tick */
 export interface HeartbeatSummary {
-    /** Current agent status */
-    status: "working" | "idle" | "stuck";
-    /** Total message count in the latest active session */
-    msgCount: number;
-    /** Last 100 chars of the most recent assistant text */
-    lastAction: string;
-    /** Minutes elapsed since the first message of the active session */
+    /** "working" → still running; "stuck" → no idle received in STUCK_THRESHOLD_MIN */
+    status: "working" | "stuck";
+    /** Minutes elapsed since the prompt was sent */
     minutesRunning: number;
-    /**
-     * For idle status: last N assistant text snippets (up to 300 chars each),
-     * so the bot can build a meaningful completion summary.
-     */
-    recentActions: string[];
+    /** Last 100 chars of the most recent assistant text (best-effort snapshot) */
+    lastAction: string;
 }
 
-/** Called by OpenCodeBot on each heartbeat tick */
+/** Called by OpenCodeBot on each heartbeat tick (only while a prompt is in-flight) */
 export type OnHeartbeatCallback = (agentId: string, summary: HeartbeatSummary) => Promise<void>;
 
 /** Resolve ~ in paths */
@@ -66,12 +62,6 @@ export function pickPort(usedPorts: number[]): number {
         if (!used.has(p)) return p;
     }
     throw new Error("No available ports in range 15000-16000");
-}
-
-/** Strip ANSI escape codes */
-function stripAnsi(s: string): string {
-    // eslint-disable-next-line no-control-regex
-    return s.replace(/\x1B\[[0-9;]*[mGKHFABCDJnsu]/g, "").replace(/\x1B\([A-Z]/g, "");
 }
 
 async function findOpencodeCmd(): Promise<string> {
@@ -92,11 +82,22 @@ async function findOpencodeCmd(): Promise<string> {
     throw new Error("opencode binary not found");
 }
 
-/** Heartbeat interval in milliseconds (3 minutes) */
+/** Heartbeat interval while a prompt is in-flight */
 const HEARTBEAT_INTERVAL_MS = 3 * 60 * 1000;
 
-/** Minutes of silence before an agent is considered "stuck" */
+/** Minutes without session.idle before considering an agent stuck */
 const STUCK_THRESHOLD_MIN = 10;
+
+/** Max time sendPrompt will wait for session.idle before timing out */
+const PROMPT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+interface PendingPrompt {
+    sessionId: string;
+    resolve: (result: AgentSendResult) => void;
+    reject: (err: Error) => void;
+    startedAt: number;
+    timeoutHandle: NodeJS.Timeout;
+}
 
 export class PersistentAgentService {
     /** Map of agentId → child process */
@@ -114,15 +115,22 @@ export class PersistentAgentService {
     /** Callback registered by OpenCodeBot to handle heartbeat ticks */
     private onHeartbeat?: OnHeartbeatCallback;
 
-    /** Map of agentId → heartbeat timer handle */
+    /** Map of agentId → heartbeat timer handle (only active while prompt is in-flight) */
     private heartbeatTimers: Map<string, NodeJS.Timeout> = new Map();
 
     /**
-     * Tracks message counts per agent to detect "stuck" state.
-     * count: last seen message count
-     * since: timestamp when count was last changed
+     * In-flight prompt promises, keyed by agentId.
+     * Resolved by the SSE loop when session.idle arrives for that agent's sessionId.
      */
-    private lastMsgCounts: Map<string, { count: number; since: number }> = new Map();
+    private pendingPrompts: Map<string, PendingPrompt> = new Map();
+
+    /**
+     * In-memory cache of agentId → OpenCode sessionId.
+     * Source of truth is SQLite (agent.sessionId); this cache avoids extra DB reads.
+     */
+    private sessionIds: Map<string, string> = new Map();
+
+    constructor(private readonly agentDb: AgentDbService) {}
 
     /** Register the question callback (called once at startup by OpenCodeBot) */
     setOnQuestionCallback(cb: OnQuestionCallback): void {
@@ -142,6 +150,7 @@ export class PersistentAgentService {
         }
 
         if (await this.isServerRunning(agent.port)) {
+            await this.ensureSession(agent);
             this.startSseStream(agent);
             return { success: true, message: "already running (external)" };
         }
@@ -164,6 +173,13 @@ export class PersistentAgentService {
             console.log(`[PersistentAgent] Agent "${agent.name}" (port ${agent.port}) exited with code ${code}`);
             this.processes.delete(agent.id);
             this.stopSseStream(agent.id);
+            // Reject any in-flight prompt
+            const pending = this.pendingPrompts.get(agent.id);
+            if (pending) {
+                clearTimeout(pending.timeoutHandle);
+                this.pendingPrompts.delete(agent.id);
+                pending.reject(new Error(`Agent server exited with code ${code}`));
+            }
         });
 
         this.processes.set(agent.id, child);
@@ -172,6 +188,7 @@ export class PersistentAgentService {
         const deadline = Date.now() + 20000;
         while (Date.now() < deadline) {
             if (await this.isServerRunning(agent.port)) {
+                await this.ensureSession(agent);
                 this.startSseStream(agent);
                 return { success: true, message: `opencode serve ready on :${agent.port}` };
             }
@@ -179,6 +196,70 @@ export class PersistentAgentService {
         }
 
         return { success: false, message: `Server did not respond within 20s on port ${agent.port}` };
+    }
+
+    /**
+     * Ensures the agent has a live long-lived OpenCode session.
+     */
+    private async ensureSession(agent: PersistentAgent): Promise<string> {
+        const baseUrl = `http://localhost:${agent.port}`;
+        const cachedId = this.sessionIds.get(agent.id) ?? agent.sessionId;
+
+        if (cachedId) {
+            try {
+                const res = await fetch(`${baseUrl}/session/${cachedId}`, {
+                    signal: AbortSignal.timeout(5000),
+                });
+                if (res.ok) {
+                    this.sessionIds.set(agent.id, cachedId);
+                    return cachedId;
+                }
+            } catch { /* fall through */ }
+            console.log(`[PersistentAgent] Session ${cachedId} for agent "${agent.name}" is gone, creating a new one`);
+        }
+
+        const sessionId = await this.createSession(agent);
+        this.sessionIds.set(agent.id, sessionId);
+        this.agentDb.setSessionId(agent.id, sessionId);
+        console.log(`[PersistentAgent] Created session ${sessionId} for agent "${agent.name}"`);
+        return sessionId;
+    }
+
+    /** Create a new OpenCode session on the agent's server. Returns the new session ID. */
+    private async createSession(agent: PersistentAgent): Promise<string> {
+        const baseUrl = `http://localhost:${agent.port}`;
+
+        let modelConfig: { providerID: string; modelID: string } | undefined;
+        if (agent.model) {
+            const parts = agent.model.split("/");
+            if (parts.length === 2) {
+                modelConfig = { providerID: parts[0], modelID: parts[1] };
+            }
+        }
+
+        const createRes = await fetch(`${baseUrl}/session`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                title: `tg-${agent.name}`,
+                system: agent.role || undefined,
+                model: modelConfig,
+                permission: [
+                    { permission: "command", pattern: "*", action: "allow" },
+                    { permission: "file",    pattern: "*", action: "allow" },
+                    { permission: "network", pattern: "*", action: "allow" },
+                    { permission: "browser", pattern: "*", action: "allow" },
+                ],
+            }),
+            signal: AbortSignal.timeout(10000),
+        });
+
+        if (!createRes.ok) {
+            throw new Error(`Create session failed: ${createRes.status} ${await createRes.text()}`);
+        }
+
+        const sess = await createRes.json() as any;
+        return sess.id as string;
     }
 
     stopAgent(agentId: string): void {
@@ -206,22 +287,17 @@ export class PersistentAgentService {
         return this.processes.has(agentId);
     }
 
-    // ─── SSE stream per agent ────────────────────────────────────────────────
+    // ─── SSE stream per agent ─────────────────────────────────────────────────
 
     private startSseStream(agent: PersistentAgent): void {
-        // Avoid duplicate streams
         if (this.sseControllers.has(agent.id)) return;
 
         const abort = new AbortController();
         this.sseControllers.set(agent.id, abort);
 
-        // Run in background — no await
         this.runSseLoop(agent, abort).catch(err =>
             console.error(`[PersistentAgent] SSE loop error for agent ${agent.name}:`, err)
         );
-
-        // Start heartbeat timer
-        this.startHeartbeat(agent);
     }
 
     private stopSseStream(agentId: string): void {
@@ -238,7 +314,6 @@ export class PersistentAgentService {
         const client = createOpencodeClient({ baseUrl });
         let retryDelay = 3000;
 
-        // Recover any questions that were pending before this SSE connection
         await this.recoverPendingQuestions(agent);
 
         while (!abort.signal.aborted) {
@@ -249,12 +324,26 @@ export class PersistentAgentService {
                 for await (const event of events.stream) {
                     if (abort.signal.aborted) break;
 
-                    if ((event as any).type === "question.asked" && this.onQuestion) {
-                        const req = (event as any).properties;
-                        console.log(`[PersistentAgent] question.asked for agent "${agent.name}": ${req.id}`);
-                        this.onQuestion(agent.id, req).catch(err =>
+                    const type = (event as any).type;
+                    const props = (event as any).properties;
+
+                    // ── question.asked → forward to bot ───────────────────
+                    if (type === "question.asked" && this.onQuestion) {
+                        console.log(`[PersistentAgent] question.asked for agent "${agent.name}": ${props.id}`);
+                        this.onQuestion(agent.id, props).catch(err =>
                             console.error(`[PersistentAgent] onQuestion callback error:`, err)
                         );
+                    }
+
+                    // ── session.idle → resolve in-flight prompt ───────────
+                    if (type === "session.idle") {
+                        const idleSessionId: string = props?.sessionID ?? props?.id ?? "";
+                        const mySessionId = this.sessionIds.get(agent.id);
+
+                        if (idleSessionId && mySessionId && idleSessionId === mySessionId) {
+                            console.log(`[PersistentAgent] session.idle for agent "${agent.name}" session ${idleSessionId}`);
+                            await this.resolvePromptFromIdle(agent, idleSessionId);
+                        }
                     }
                 }
             } catch (err) {
@@ -262,21 +351,58 @@ export class PersistentAgentService {
                 console.warn(`[PersistentAgent] SSE stream for agent "${agent.name}" disconnected, retrying in ${retryDelay}ms`);
                 await new Promise(r => setTimeout(r, retryDelay));
                 retryDelay = Math.min(retryDelay * 2, 30000);
-
-                // Recover pending questions after each reconnect
                 await this.recoverPendingQuestions(agent);
             }
         }
     }
 
+    /**
+     * Called when session.idle arrives via SSE.
+     * Fetches the last assistant message and resolves the pending Promise.
+     */
+    private async resolvePromptFromIdle(agent: PersistentAgent, sessionId: string): Promise<void> {
+        const pending = this.pendingPrompts.get(agent.id);
+        if (!pending || pending.sessionId !== sessionId) return;
+
+        // Stop heartbeat — response arrived
+        this.stopHeartbeat(agent.id);
+        clearTimeout(pending.timeoutHandle);
+        this.pendingPrompts.delete(agent.id);
+
+        try {
+            const msgRes = await fetch(
+                `http://localhost:${agent.port}/session/${sessionId}/message`,
+                { signal: AbortSignal.timeout(10000) }
+            );
+            if (!msgRes.ok) {
+                pending.resolve({ output: `❌ Failed to fetch messages: ${msgRes.status}`, sessionId });
+                return;
+            }
+
+            const messages: any[] = await msgRes.json();
+            const lastAssistant = [...messages]
+                .reverse()
+                .find((m: any) => m.role === "assistant" || m.info?.role === "assistant");
+
+            if (!lastAssistant) {
+                pending.resolve({ output: "(sin respuesta del agente)", sessionId });
+                return;
+            }
+
+            const parts: any[] = lastAssistant.parts || [];
+            const text = parts
+                .filter((p: any) => p.type === "text" && p.text)
+                .map((p: any) => p.text as string)
+                .join("");
+
+            pending.resolve({ output: text.trim() || "(sin salida)", sessionId });
+        } catch (err) {
+            pending.resolve({ output: `❌ Failed to read agent response: ${err}`, sessionId });
+        }
+    }
+
     // ─── Question recovery ────────────────────────────────────────────────────
 
-    /**
-     * Queries GET /question?directory=<workdir> on the agent's server to find
-     * any questions that were asked while the bot was offline (their SSE event
-     * was never received).  For each unanswered question we fire onQuestion
-     * exactly as if the SSE event had just arrived.
-     */
     private async recoverPendingQuestions(agent: PersistentAgent): Promise<void> {
         if (!this.onQuestion) return;
 
@@ -291,18 +417,16 @@ export class PersistentAgentService {
 
             console.log(`[PersistentAgent] Recovering ${questions.length} pending question(s) for agent "${agent.name}"`);
             for (const q of questions) {
-                // Each item in the array IS the QuestionRequest (has .id, .questions[])
                 this.onQuestion(agent.id, q).catch(err =>
                     console.error(`[PersistentAgent] recoverPendingQuestions callback error:`, err)
                 );
             }
         } catch (err) {
-            // Non-fatal — server may not have pending questions or endpoint may not exist
             console.debug(`[PersistentAgent] recoverPendingQuestions for "${agent.name}": ${err}`);
         }
     }
 
-    // ─── Heartbeat ───────────────────────────────────────────────────────────
+    // ─── Heartbeat (safeguard only) ───────────────────────────────────────────
 
     private startHeartbeat(agent: PersistentAgent): void {
         if (this.heartbeatTimers.has(agent.id)) return;
@@ -311,9 +435,7 @@ export class PersistentAgentService {
             await this.fireHeartbeat(agent);
         }, HEARTBEAT_INTERVAL_MS);
 
-        // Allow the Node process to exit even if the timer is still running
         if (timer.unref) timer.unref();
-
         this.heartbeatTimers.set(agent.id, timer);
     }
 
@@ -323,112 +445,52 @@ export class PersistentAgentService {
             clearInterval(timer);
             this.heartbeatTimers.delete(agentId);
         }
-        this.lastMsgCounts.delete(agentId);
     }
 
     private async fireHeartbeat(agent: PersistentAgent): Promise<void> {
         if (!this.onHeartbeat) return;
 
+        const pending = this.pendingPrompts.get(agent.id);
+        if (!pending) {
+            // No in-flight prompt — nothing to report, stop the timer
+            this.stopHeartbeat(agent.id);
+            return;
+        }
+
+        const minutesRunning = (Date.now() - pending.startedAt) / 60000;
+        const status: HeartbeatSummary["status"] =
+            minutesRunning >= STUCK_THRESHOLD_MIN ? "stuck" : "working";
+
+        // Best-effort: grab the last assistant snippet for context
+        let lastAction = "";
         try {
-            const summary = await this.buildHeartbeatSummary(agent);
-            await this.onHeartbeat(agent.id, summary);
+            const baseUrl = `http://localhost:${agent.port}`;
+            const msgRes = await fetch(`${baseUrl}/session/${pending.sessionId}/message`, {
+                signal: AbortSignal.timeout(5000),
+            });
+            if (msgRes.ok) {
+                const messages: any[] = await msgRes.json();
+                const assistantMsgs = messages.filter((m: any) => m.role === "assistant");
+                if (assistantMsgs.length > 0) {
+                    const lastMsg = assistantMsgs[assistantMsgs.length - 1];
+                    const parts: any[] = lastMsg.parts ?? [];
+                    const textPart = [...parts].reverse().find((p: any) => p.type === "text" && p.text);
+                    if (textPart) {
+                        lastAction = (textPart.text as string).replace(/\s+/g, " ").trim().slice(0, 100);
+                    }
+                }
+            }
+        } catch { /* best-effort */ }
+
+        try {
+            await this.onHeartbeat(agent.id, {
+                status,
+                minutesRunning: Math.floor(minutesRunning),
+                lastAction,
+            });
         } catch (err) {
             console.error(`[PersistentAgent] heartbeat error for "${agent.name}":`, err);
         }
-    }
-
-    private async buildHeartbeatSummary(agent: PersistentAgent): Promise<HeartbeatSummary> {
-        const baseUrl = `http://localhost:${agent.port}`;
-        const EMPTY: HeartbeatSummary = { status: "idle", msgCount: 0, lastAction: "", minutesRunning: 0, recentActions: [] };
-
-        let msgCount = 0;
-        let lastAction = "";
-        let minutesRunning = 0;
-        let status: HeartbeatSummary["status"] = "idle";
-        const recentActions: string[] = [];
-
-        try {
-            const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
-            if (!sessRes.ok) return EMPTY;
-
-            const sessions: any[] = await sessRes.json();
-            if (sessions.length === 0) return EMPTY;
-
-            // Only consider sessions created by this bot (title starts with "tg-").
-            // Ignores interactive/subagent sessions that happen to run on the same server.
-            const botSessions = sessions.filter((s: any) => (s.title ?? "").startsWith("tg-"));
-            if (botSessions.length === 0) return EMPTY;
-
-            // Pick most recently updated bot session
-            const session = botSessions.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))[0];
-
-            // Fetch messages for this session
-            const msgRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
-                signal: AbortSignal.timeout(5000),
-            });
-            if (!msgRes.ok) return EMPTY;
-
-            const messages: any[] = await msgRes.json();
-            msgCount = messages.length;
-
-            // Extract assistant text parts
-            const assistantMsgs = messages.filter((m: any) => m.role === "assistant");
-
-            // Last action: last 100 chars of the most recent assistant text
-            if (assistantMsgs.length > 0) {
-                const lastMsg = assistantMsgs[assistantMsgs.length - 1];
-                const parts: any[] = lastMsg.parts ?? [];
-                const textPart = [...parts].reverse().find((p: any) => p.type === "text" && p.text);
-                if (textPart) {
-                    lastAction = (textPart.text as string).replace(/\s+/g, " ").trim().slice(0, 100);
-                }
-            }
-
-            // Recent actions: last 5 unique assistant text snippets (up to 300 chars each)
-            // Used to build a rich completion summary
-            const seen = new Set<string>();
-            for (let i = assistantMsgs.length - 1; i >= 0 && recentActions.length < 5; i--) {
-                const parts: any[] = assistantMsgs[i].parts ?? [];
-                const textPart = [...parts].reverse().find((p: any) => p.type === "text" && p.text);
-                if (!textPart) continue;
-                const snippet = (textPart.text as string).replace(/\s+/g, " ").trim().slice(0, 300);
-                if (snippet && !seen.has(snippet)) {
-                    seen.add(snippet);
-                    recentActions.unshift(snippet);
-                }
-            }
-
-            // Compute minutesRunning from first message timestamp
-            if (messages.length > 0 && messages[0].time?.created) {
-                minutesRunning = Math.floor((Date.now() - messages[0].time.created) / 60000);
-            }
-
-            // Check if there's a running step (no step-finish in the last assistant msg)
-            const lastAsst = assistantMsgs[assistantMsgs.length - 1];
-            const hasRunningStep = lastAsst &&
-                !(lastAsst.parts ?? []).some((p: any) => p.type === "step-finish");
-
-            if (hasRunningStep) {
-                // Check stuck: message count hasn't changed for > STUCK_THRESHOLD_MIN
-                const prev = this.lastMsgCounts.get(agent.id);
-                if (prev && prev.count === msgCount) {
-                    const silentMin = (Date.now() - prev.since) / 60000;
-                    status = silentMin >= STUCK_THRESHOLD_MIN ? "stuck" : "working";
-                } else {
-                    this.lastMsgCounts.set(agent.id, { count: msgCount, since: Date.now() });
-                    status = "working";
-                }
-            } else {
-                // No running step — agent is idle
-                this.lastMsgCounts.delete(agent.id);
-                status = "idle";
-            }
-        } catch {
-            // Server unreachable
-            status = "idle";
-        }
-
-        return { status, msgCount, lastAction, minutesRunning, recentActions };
     }
 
     // ─── Reply to a question ──────────────────────────────────────────────────
@@ -453,8 +515,11 @@ export class PersistentAgentService {
 
     /**
      * Send a prompt to a persistent agent's opencode server.
-     * Uses the REST API directly (same as the main OpenCodeService).
-     * Attaches the agent's role as a system-context prefix.
+     *
+     * Fire-and-forget: the prompt is sent via /prompt/async and this method
+     * returns a Promise that is resolved by the SSE loop when session.idle
+     * arrives for this agent's session. The heartbeat timer is started as a
+     * safeguard in case session.idle never arrives.
      */
     async sendPrompt(agent: PersistentAgent, userText: string): Promise<AgentSendResult> {
         const baseUrl = `http://localhost:${agent.port}`;
@@ -468,77 +533,73 @@ export class PersistentAgentService {
             }
         }
 
-        // Build full prompt with role context
-        const roleContext = agent.role
-            ? `<agent_role>\n${agent.role}\n</agent_role>\n\n`
-            : "";
-        const fullPrompt = `${roleContext}${userText}`;
-
-        // Create a session on this agent's server
+        // Get or create the long-lived session for this agent
         let sessionId: string;
         try {
-            const createRes = await fetch(`${baseUrl}/session`, {
+            sessionId = await this.ensureSession(agent);
+        } catch (err) {
+            return { output: `❌ Failed to get/create session for agent: ${err}` };
+        }
+
+        // Build model config
+        let modelConfig: { providerID: string; modelID: string } | undefined;
+        if (agent.model) {
+            const parts = agent.model.split("/");
+            if (parts.length === 2) {
+                modelConfig = { providerID: parts[0], modelID: parts[1] };
+            }
+        }
+
+        // Register the pending promise BEFORE sending the prompt so the SSE
+        // loop cannot race and resolve before we're listening.
+        const result = await new Promise<AgentSendResult>((resolve, reject) => {
+            const timeoutHandle = setTimeout(() => {
+                if (this.pendingPrompts.get(agent.id)?.sessionId === sessionId) {
+                    this.pendingPrompts.delete(agent.id);
+                    this.stopHeartbeat(agent.id);
+                    resolve({ output: "⏱️ Timeout: el agente no respondió en 10 minutos.", sessionId });
+                }
+            }, PROMPT_TIMEOUT_MS);
+
+            if (timeoutHandle.unref) timeoutHandle.unref();
+
+            this.pendingPrompts.set(agent.id, {
+                sessionId,
+                resolve,
+                reject,
+                startedAt: Date.now(),
+                timeoutHandle,
+            });
+
+            // Send prompt async (fire and forget) — response comes via SSE session.idle
+            fetch(`${baseUrl}/session/${sessionId}/prompt/async`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    title: `tg-${Date.now()}`,
-                    permission: [
-                        { permission: "command", pattern: "*", action: "allow" },
-                        { permission: "file",    pattern: "*", action: "allow" },
-                        { permission: "network", pattern: "*", action: "allow" },
-                        { permission: "browser", pattern: "*", action: "allow" },
-                    ],
+                    parts: [{ type: "text", text: userText }],
+                    agent: "build",
+                    model: modelConfig,
                 }),
                 signal: AbortSignal.timeout(10000),
-            });
-            if (!createRes.ok) throw new Error(`Create session failed: ${createRes.status}`);
-            const sess = await createRes.json() as any;
-            sessionId = sess.id;
-        } catch (err) {
-            return { output: `❌ Failed to create session on agent server: ${err}` };
-        }
-
-        // Send prompt synchronously (blocking until done) using /session/:id/prompt
-        // We use opencode run --attach so we leverage its built-in output parsing
-        const cmd = await findOpencodeCmd();
-        const workdir = resolveDir(agent.workdir);
-
-        return new Promise((resolve) => {
-            const args = [
-                "run",
-                "--attach", baseUrl,
-                "--session", sessionId,
-                "--dir", workdir,
-                "--model", agent.model,
-                fullPrompt,
-            ];
-
-            const child = spawn(cmd, args, {
-                cwd: workdir,
-                stdio: ["ignore", "pipe", "pipe"],
-                env: { ...process.env },
-            });
-
-            const lines: string[] = [];
-            const handleData = (buf: Buffer) => {
-                const cleaned = stripAnsi(buf.toString("utf8"));
-                for (const line of cleaned.split("\n")) {
-                    const t = line.trim();
-                    if (!t || t.startsWith(">")) continue;
-                    lines.push(t);
+            }).then(res => {
+                if (!res.ok) {
+                    clearTimeout(timeoutHandle);
+                    this.pendingPrompts.delete(agent.id);
+                    this.stopHeartbeat(agent.id);
+                    resolve({ output: `❌ Failed to send prompt: HTTP ${res.status}`, sessionId });
+                } else {
+                    // Prompt accepted — start the heartbeat safeguard
+                    this.startHeartbeat(agent);
                 }
-            };
-
-            child.stdout.on("data", handleData);
-            child.stderr.on("data", handleData);
-
-            child.on("close", () => {
-                resolve({ output: lines.join("\n").trim() || "(sin salida)", sessionId });
-            });
-            child.on("error", (err) => {
-                resolve({ output: `❌ opencode run error: ${err.message}`, sessionId });
+            }).catch(err => {
+                clearTimeout(timeoutHandle);
+                this.pendingPrompts.delete(agent.id);
+                this.stopHeartbeat(agent.id);
+                resolve({ output: `❌ Failed to send prompt to agent: ${err}`, sessionId });
             });
         });
+
+        return result;
     }
 
     // ─── Active agent switching (sticky) ─────────────────────────────────────
@@ -547,7 +608,6 @@ export class PersistentAgentService {
         this.activeAgentByUser.set(userId, agentId);
     }
 
-    /** Returns null if no subagent is active (→ use main OpenCode session) */
     getActiveAgentId(userId: number): string | null {
         return this.activeAgentByUser.get(userId) ?? null;
     }
@@ -556,13 +616,40 @@ export class PersistentAgentService {
         this.activeAgentByUser.delete(userId);
     }
 
-    // ─── Startup restore ──────────────────────────────────────────────────────
+    /** Returns the current OpenCode sessionId for an agent (from in-memory cache) */
+    getSessionId(agentId: string): string | undefined {
+        return this.sessionIds.get(agentId);
+    }
 
     /**
-     * Call this on bot startup to bring all persisted agents back online.
-     * Returns a list of agents that failed to start, so the caller can notify
-     * the user via Telegram.
+     * Override the active session ID for an agent (in-memory + DB).
+     * Pass an empty string to clear it (next prompt will create a fresh session).
      */
+    setSessionId(agentId: string, sessionId: string): void {
+        if (sessionId) {
+            this.sessionIds.set(agentId, sessionId);
+            this.agentDb.setSessionId(agentId, sessionId);
+        } else {
+            this.sessionIds.delete(agentId);
+            this.agentDb.setSessionId(agentId, "");
+        }
+    }
+
+    /**
+     * Create a new OpenCode session for the given agent and return its ID.
+     * Does NOT set it as active — caller decides.
+     */
+    async createNewSession(agent: PersistentAgent): Promise<string> {
+        const running = await this.isServerRunning(agent.port);
+        if (!running) {
+            const started = await this.startAgent(agent);
+            if (!started.success) throw new Error(`Agent server not running: ${started.message}`);
+        }
+        return this.createSession(agent);
+    }
+
+    // ─── Startup restore ──────────────────────────────────────────────────────
+
     async restoreAll(agents: PersistentAgent[]): Promise<PersistentAgent[]> {
         const failed: PersistentAgent[] = [];
         for (const agent of agents) {

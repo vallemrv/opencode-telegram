@@ -23,6 +23,12 @@ OPENCODE_SERVER_URL=http://localhost:4096
 # Default model to use when no model is selected (provider/model-id)
 OPENCODE_DEFAULT_MODEL=github-copilot/claude-sonnet-4.6
 
+# ─── Workspace ───────────────────────────────────────────────────────────────
+# Root directory where new projects are created when you type a plain name in /new.
+# Supports ~ expansion. Created automatically if it doesn't exist.
+# Default: ~/proyectos
+WORKSPACE_DIR=~/proyectos
+
 # ─── Gitea ───────────────────────────────────────────────────────────────────
 # URL of your Gitea instance
 # Example: http://192.168.1.100:3000
@@ -31,10 +37,9 @@ GITEA_URL=
 # Gitea personal access token (Settings → Applications → Access Tokens)
 GITEA_TOKEN=
 
-# Local directory where git repos are stored.
-# The bot will create this directory if it doesn't exist.
-# Supports ~ expansion.  Default: ~/proyectos/gitea-projects
-GITEA_DEFAULT_WORKDIR=~/proyectos/gitea-projects
+# ─── GitHub ──────────────────────────────────────────────────────────────────
+# GitHub personal access token (for repo creation and credential injection)
+GITHUB_TOKEN=
 
 # ─── Background Agent (/run command) ────────────────────────────────────────
 # Default model for background opencode run tasks (provider/model-id)
@@ -45,6 +50,8 @@ BACKGROUND_MODEL=github-copilot/claude-sonnet-4.6
 # Supports ~ expansion. If empty, /run always asks the user.
 BACKGROUND_WORKDIR=
 
+# Maximum number of simultaneous agents (soft limit — bot warns but does not block)
+MAX_AGENTS=5
 
 # Auto-delete timeout for confirmation messages in milliseconds (0 = disable)
 MESSAGE_DELETE_TIMEOUT=10000
