@@ -893,29 +893,38 @@ export class OpenCodeBot {
         );
         await ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => {});
 
-        const result = await this.persistentAgentService.sendPrompt(agent, prompt);
-
+        const chatId = ctx.chat!.id;
+        const msgId = statusMsg.message_id;
         const header = `🤖 <b>${escapeHtml(agent.name)}</b>\n\n`;
-        const body = result.output || "(sin salida)";
-        const MAX = 3800;
 
-        if (body.length <= MAX) {
+        // Fire-and-forget: do NOT await so other commands are not blocked.
+        this.persistentAgentService.sendPrompt(agent, prompt).then(async (result) => {
+            const body = result.output || "(sin salida)";
+            const MAX = 3800;
+            if (body.length <= MAX) {
+                await ctx.api.editMessageText(
+                    chatId, msgId,
+                    `${header}${formatAsHtml(body)}`,
+                    { parse_mode: "HTML" }
+                ).catch(async () => {
+                    await ctx.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
+                });
+            } else {
+                await ctx.api.deleteMessage(chatId, msgId).catch(() => {});
+                const buf = Buffer.from(body, "utf8");
+                await ctx.api.sendDocument(
+                    chatId,
+                    new InputFile(buf, `${agent.name}-respuesta.md`),
+                    { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
+                );
+            }
+        }).catch(async (err) => {
             await ctx.api.editMessageText(
-                statusMsg.chat.id,
-                statusMsg.message_id,
-                `${header}${formatAsHtml(body)}`,
+                chatId, msgId,
+                `❌ <b>${escapeHtml(agent.name)}</b> — error: ${escapeHtml(String(err))}`,
                 { parse_mode: "HTML" }
-            ).catch(async () => {
-                await ctx.reply(`${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
-            });
-        } else {
-            await ctx.api.deleteMessage(statusMsg.chat.id, statusMsg.message_id).catch(() => {});
-            const buf = Buffer.from(body, "utf8");
-            await ctx.replyWithDocument(new InputFile(buf, `${agent.name}-respuesta.md`), {
-                caption: `${header}(resultado adjunto)`,
-                parse_mode: "HTML",
-            });
-        }
+            ).catch(() => {});
+        });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1018,12 +1027,22 @@ export class OpenCodeBot {
         // Auto-rename the session with the first prompt if it still has the default tg-* title
         this.autoRenameSessionIfNeeded(agent, prompt).catch(() => {});
 
-        const result = await this.persistentAgentService.sendPrompt(agent, prompt);
-
-        // Use the heartbeat message (may have been edited by ticks) as the target for the result
-        const hb = this.heartbeatMessages.get(agent.id);
-        this.heartbeatMessages.delete(agent.id);
-        await this.editOrSendResult(ctx.chat!.id, hb?.msgId ?? statusMsg.message_id, agent, result);
+        // Fire-and-forget: do NOT await — return control to grammY immediately so other
+        // commands (/agents, /esc, etc.) are not blocked while the agent is processing.
+        const chatId = ctx.chat!.id;
+        const placeholderMsgId = statusMsg.message_id;
+        this.persistentAgentService.sendPrompt(agent, prompt).then(async (result) => {
+            const hb = this.heartbeatMessages.get(agent.id);
+            this.heartbeatMessages.delete(agent.id);
+            await this.editOrSendResult(chatId, hb?.msgId ?? placeholderMsgId, agent, result);
+        }).catch(async (err) => {
+            this.heartbeatMessages.delete(agent.id);
+            await this.bot!.api.editMessageText(
+                chatId, placeholderMsgId,
+                `❌ <b>${escapeHtml(agent.name)}</b> — error inesperado: ${escapeHtml(String(err))}`,
+                { parse_mode: "HTML" }
+            ).catch(() => {});
+        });
     }
 
     /**
@@ -1670,22 +1689,33 @@ export class OpenCodeBot {
         const shortKey = randomUUID().slice(0, 8);
         this.pendingAgentQuestions.set(shortKey, { agentId, port: agent.port, req });
 
+        // Build message text: show question + each option with its description
+        const firstQ = req.questions?.[0];
+        const questionText = firstQ?.question || "¿Qué prefieres?";
+
+        let optionsText = "";
         const keyboard = new InlineKeyboard();
-        if (req.questions && Array.isArray(req.questions)) {
-            for (const q of req.questions) {
-                if (q.options) {
-                    for (const opt of q.options) {
-                        keyboard.text(opt, `agq:${shortKey}:${opt}`).row();
-                    }
-                }
-            }
+
+        if (firstQ?.options && Array.isArray(firstQ.options)) {
+            firstQ.options.forEach((opt: any, idx: number) => {
+                // opt can be a string or { label, description }
+                const label = typeof opt === "string" ? opt : (opt.label ?? String(opt));
+                const desc  = typeof opt === "object" && opt.description ? opt.description : "";
+                // Use numeric index in callback_data to avoid byte-limit issues with long labels
+                keyboard.text(label, `agq:${shortKey}:${idx}`).row();
+                optionsText += `\n${idx + 1}. <b>${escapeHtml(label)}</b>`;
+                if (desc) optionsText += `\n   <i>${escapeHtml(desc)}</i>`;
+            });
         }
-        keyboard.text("❌ Rechazar", `agq:${shortKey}:__reject__`);
+
+        keyboard.text("❌ Rechazar", `agq:${shortKey}:r`);
 
         try {
             await bot.api.sendMessage(
                 agent.userId,
-                `❓ <b>${escapeHtml(agent.name)}</b> tiene una pregunta:\n\n${escapeHtml(req.questions?.[0]?.question || "Ver opciones")}`,
+                `❓ <b>${escapeHtml(agent.name)}</b> tiene una pregunta:\n\n` +
+                `${escapeHtml(questionText)}` +
+                (optionsText ? `\n${optionsText}` : ""),
                 { parse_mode: "HTML", reply_markup: keyboard }
             );
         } catch (err) {
@@ -1695,10 +1725,11 @@ export class OpenCodeBot {
 
     private async handleAgentQuestionCallback(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
-        const data = ctx.callbackQuery!.data; // agq:SHORTKEY:ANSWER
-        const parts = data.replace("agq:", "").split(":");
-        const shortKey = parts[0];
-        const answer = parts.slice(1).join(":");
+        const data = ctx.callbackQuery!.data; // agq:SHORTKEY:IDX or agq:SHORTKEY:r
+        const match = data.match(/^agq:([^:]+):(.+)$/);
+        if (!match) return;
+        const shortKey = match[1];
+        const answerKey = match[2];
 
         const pending = this.pendingAgentQuestions.get(shortKey);
         if (!pending) {
@@ -1707,12 +1738,17 @@ export class OpenCodeBot {
         }
         this.pendingAgentQuestions.delete(shortKey);
 
-        if (answer === "__reject__") {
+        if (answerKey === "r") {
             await this.persistentAgentService.rejectQuestion(pending.port, pending.req.id);
             await ctx.editMessageText("❌ Rechazado.").catch(() => {});
         } else {
-            await this.persistentAgentService.replyQuestion(pending.port, pending.req.id, [[answer]]);
-            await ctx.editMessageText(`✅ Respondido: <b>${escapeHtml(answer)}</b>`, { parse_mode: "HTML" }).catch(() => {});
+            // answerKey is the numeric index into options
+            const idx = parseInt(answerKey, 10);
+            const firstQ = pending.req.questions?.[0];
+            const opt = firstQ?.options?.[idx];
+            const label = typeof opt === "string" ? opt : (opt?.label ?? String(opt ?? answerKey));
+            await this.persistentAgentService.replyQuestion(pending.port, pending.req.id, [[label]]);
+            await ctx.editMessageText(`✅ Respondido: <b>${escapeHtml(label)}</b>`, { parse_mode: "HTML" }).catch(() => {});
         }
     }
 
