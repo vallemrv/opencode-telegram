@@ -23,6 +23,7 @@ import { ConfigService } from "../../services/config.service.js";
 import { AgentDbService } from "../../services/agent-db.service.js";
 import type { PersistentAgent } from "../../services/agent-db.service.js";
 import { PersistentAgentService, pickPort, resolveDir } from "../../services/persistent-agent.service.js";
+import type { AgentSendResult } from "../../services/persistent-agent.service.js";
 import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
 import { MessageUtils } from "../../utils/message.utils.js";
 import { ErrorUtils } from "../../utils/error.utils.js";
@@ -977,6 +978,22 @@ export class OpenCodeBot {
     }
 
     private async sendPromptToAgent(ctx: Context, agent: PersistentAgent, prompt: string): Promise<void> {
+        // If the agent is already processing a prompt, enqueue and notify the user
+        if (this.persistentAgentService.isBusy(agent.id)) {
+            this.persistentAgentService.enqueue(agent.id, {
+                prompt,
+                onResult: async (result) => {
+                    await this.sendAgentResult(ctx.chat!.id, agent, result);
+                },
+            });
+            const qLen = this.persistentAgentService.queueLength(agent.id);
+            await ctx.reply(
+                `📥 <b>${escapeHtml(agent.name)}</b> está ocupado — prompt en cola (${qLen} pendiente${qLen !== 1 ? "s" : ""}).`,
+                { parse_mode: "HTML" }
+            );
+            return;
+        }
+
         // Send a placeholder so the user knows the agent is processing
         const statusMsg = await ctx.reply(
             `⏳ <b>${escapeHtml(agent.name)}</b> procesando…`,
@@ -989,27 +1006,65 @@ export class OpenCodeBot {
 
         const result = await this.persistentAgentService.sendPrompt(agent, prompt);
 
+        await this.editOrSendResult(ctx.chat!.id, statusMsg.message_id, agent, result);
+    }
+
+    /**
+     * Shared helper: edit a placeholder message with the agent result, or send a new one if edit fails.
+     * Used for immediate prompts (has a placeholder msgId to edit).
+     */
+    private async editOrSendResult(
+        chatId: number,
+        msgId: number,
+        agent: PersistentAgent,
+        result: AgentSendResult,
+    ): Promise<void> {
         const header = `🤖 <b>${escapeHtml(agent.name)}</b>\n\n`;
         const body = result.output || "(sin salida)";
         const MAX = 3800;
 
         if (body.length <= MAX) {
-            await ctx.api.editMessageText(
-                statusMsg.chat.id,
-                statusMsg.message_id,
+            await this.bot!.api.editMessageText(
+                chatId,
+                msgId,
                 `${header}${formatAsHtml(body)}`,
                 { parse_mode: "HTML" }
             ).catch(async () => {
-                // If edit fails (e.g. message too old), fall back to a new message
-                await ctx.reply(`${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
+                await this.bot!.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
             });
         } else {
-            await ctx.api.deleteMessage(statusMsg.chat.id, statusMsg.message_id).catch(() => {});
+            await this.bot!.api.deleteMessage(chatId, msgId).catch(() => {});
             const buf = Buffer.from(body, "utf8");
-            await ctx.replyWithDocument(new InputFile(buf, `${agent.name}-respuesta.md`), {
-                caption: `${header}(resultado adjunto)`,
-                parse_mode: "HTML",
-            });
+            await this.bot!.api.sendDocument(
+                chatId,
+                new InputFile(buf, `${agent.name}-respuesta.md`),
+                { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
+            );
+        }
+    }
+
+    /**
+     * Used by the queue's onResult callback — sends the result as a new message
+     * (no placeholder to edit since it was queued).
+     */
+    private async sendAgentResult(
+        chatId: number,
+        agent: PersistentAgent,
+        result: AgentSendResult,
+    ): Promise<void> {
+        const header = `🤖 <b>${escapeHtml(agent.name)}</b>\n\n`;
+        const body = result.output || "(sin salida)";
+        const MAX = 3800;
+
+        if (body.length <= MAX) {
+            await this.bot!.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" }).catch(() => {});
+        } else {
+            const buf = Buffer.from(body, "utf8");
+            await this.bot!.api.sendDocument(
+                chatId,
+                new InputFile(buf, `${agent.name}-respuesta.md`),
+                { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
+            ).catch(() => {});
         }
     }
 

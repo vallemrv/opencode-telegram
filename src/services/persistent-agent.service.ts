@@ -30,6 +30,13 @@ export interface AgentSendResult {
     sessionId?: string;
 }
 
+/** A queued prompt waiting to be sent once the agent becomes idle */
+export interface QueuedPrompt {
+    prompt: string;
+    /** Called with the result when the queued prompt finishes executing */
+    onResult: (result: AgentSendResult) => Promise<void>;
+}
+
 /** Called by OpenCodeBot when the agent has a pending question for the user */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type OnQuestionCallback = (agentId: string, req: any) => Promise<void>;
@@ -123,6 +130,12 @@ export class PersistentAgentService {
      * Resolved by the SSE loop when session.idle arrives for that agent's sessionId.
      */
     private pendingPrompts: Map<string, PendingPrompt> = new Map();
+
+    /**
+     * Per-agent FIFO queue of prompts waiting to be sent once the agent becomes idle.
+     * Each entry carries the raw text and a callback to notify the user with the result.
+     */
+    private promptQueues: Map<string, QueuedPrompt[]> = new Map();
 
     /**
      * In-memory cache of agentId → OpenCode sessionId.
@@ -399,6 +412,11 @@ export class PersistentAgentService {
         } catch (err) {
             pending.resolve({ output: `❌ Failed to read agent response: ${err}`, sessionId });
         }
+
+        // Once the current prompt is resolved, drain the next item from the queue (if any)
+        this.drainQueue(agent).catch(err =>
+            console.error(`[PersistentAgent] drainQueue error for "${agent.name}":`, err)
+        );
     }
 
     // ─── Question recovery ────────────────────────────────────────────────────
@@ -600,6 +618,46 @@ export class PersistentAgentService {
         });
 
         return result;
+    }
+
+    // ─── Prompt queue (per agent) ─────────────────────────────────────────────
+
+    /** Returns true if the agent currently has an in-flight prompt */
+    isBusy(agentId: string): boolean {
+        return this.pendingPrompts.has(agentId);
+    }
+
+    /** How many prompts are waiting in the queue for this agent (not counting the in-flight one) */
+    queueLength(agentId: string): number {
+        return this.promptQueues.get(agentId)?.length ?? 0;
+    }
+
+    /**
+     * Add a prompt to the agent's queue.
+     * `onResult` will be called with the AgentSendResult once the prompt executes.
+     */
+    enqueue(agentId: string, item: QueuedPrompt): void {
+        const q = this.promptQueues.get(agentId) ?? [];
+        q.push(item);
+        this.promptQueues.set(agentId, q);
+    }
+
+    /**
+     * Dequeue and execute the next queued prompt for the given agent (if any).
+     * Called automatically after session.idle resolves the current in-flight prompt.
+     */
+    private async drainQueue(agent: PersistentAgent): Promise<void> {
+        const q = this.promptQueues.get(agent.id);
+        if (!q || q.length === 0) return;
+
+        const next = q.shift()!;
+        this.promptQueues.set(agent.id, q);
+
+        // Execute it as a normal sendPrompt, then fire the callback
+        const result = await this.sendPrompt(agent, next.prompt);
+        next.onResult(result).catch(err =>
+            console.error(`[PersistentAgent] Queue onResult callback error for "${agent.name}":`, err)
+        );
     }
 
     // ─── Active agent switching (sticky) ─────────────────────────────────────
