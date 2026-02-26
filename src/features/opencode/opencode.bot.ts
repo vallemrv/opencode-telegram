@@ -23,7 +23,7 @@ import { ConfigService } from "../../services/config.service.js";
 import { AgentDbService } from "../../services/agent-db.service.js";
 import type { PersistentAgent } from "../../services/agent-db.service.js";
 import { PersistentAgentService, pickPort, resolveDir } from "../../services/persistent-agent.service.js";
-import type { AgentSendResult } from "../../services/persistent-agent.service.js";
+import type { AgentSendResult, HeartbeatSummary } from "../../services/persistent-agent.service.js";
 import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
 import { MessageUtils } from "../../utils/message.utils.js";
 import { ErrorUtils } from "../../utils/error.utils.js";
@@ -151,6 +151,17 @@ export class OpenCodeBot {
     /** Agent question callbacks keyed by shortKey */
     private pendingAgentQuestions: Map<string, { agentId: string; port: number; req: any }> = new Map();
 
+    /** Heartbeat message per agent: { chatId, msgId } — edited each tick, deleted when prompt resolves */
+    private heartbeatMessages: Map<string, { chatId: number; msgId: number }> = new Map();
+
+    /**
+     * Short-key → { agentId, sessionId } index for session keyboard buttons.
+     * Telegram limits callback_data to 64 bytes; UUIDs alone exceed that limit,
+     * so we store full IDs here and pass only the short key in the button data.
+     */
+    private sessIndex: Map<string, { agentId: string; sessionId: string }> = new Map();
+    private sessIndexCounter = 0;
+
     constructor(configService: ConfigService) {
         this.configService = configService;
         this.agentDb = new AgentDbService();
@@ -216,10 +227,10 @@ export class OpenCodeBot {
 
         bot.callbackQuery(/^agq:/,          AccessControlMiddleware.requireAccess, this.handleAgentQuestionCallback.bind(this));
 
-        bot.callbackQuery(/^sess:activate:/, AccessControlMiddleware.requireAccess, this.handleSessionActivate.bind(this));
-        bot.callbackQuery(/^sess:new:/,      AccessControlMiddleware.requireAccess, this.handleSessionNew.bind(this));
-        bot.callbackQuery(/^sess:delall:/,   AccessControlMiddleware.requireAccess, this.handleSessionDeleteAll.bind(this));
-        bot.callbackQuery(/^sess:del:/,      AccessControlMiddleware.requireAccess, this.handleSessionDelete.bind(this));
+        bot.callbackQuery(/^sa:/,   AccessControlMiddleware.requireAccess, this.handleSessionActivate.bind(this));
+        bot.callbackQuery(/^sn:/,   AccessControlMiddleware.requireAccess, this.handleSessionNew.bind(this));
+        bot.callbackQuery(/^sd:/,   AccessControlMiddleware.requireAccess, this.handleSessionDeleteAll.bind(this));
+        bot.callbackQuery(/^sx:/,   AccessControlMiddleware.requireAccess, this.handleSessionDelete.bind(this));
 
         // ─── ESC keyboard button ─────────────────────────────────────────────
         bot.hears("⏹️ ESC", AccessControlMiddleware.requireAccess, this.handleEsc.bind(this));
@@ -1001,12 +1012,18 @@ export class OpenCodeBot {
         );
         await ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => {});
 
+        // Register placeholder as the heartbeat anchor so heartbeat ticks edit it
+        this.heartbeatMessages.set(agent.id, { chatId: ctx.chat!.id, msgId: statusMsg.message_id });
+
         // Auto-rename the session with the first prompt if it still has the default tg-* title
         this.autoRenameSessionIfNeeded(agent, prompt).catch(() => {});
 
         const result = await this.persistentAgentService.sendPrompt(agent, prompt);
 
-        await this.editOrSendResult(ctx.chat!.id, statusMsg.message_id, agent, result);
+        // Use the heartbeat message (may have been edited by ticks) as the target for the result
+        const hb = this.heartbeatMessages.get(agent.id);
+        this.heartbeatMessages.delete(agent.id);
+        await this.editOrSendResult(ctx.chat!.id, hb?.msgId ?? statusMsg.message_id, agent, result);
     }
 
     /**
@@ -1075,6 +1092,26 @@ export class OpenCodeBot {
     private async handleEsc(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
         if (!userId) return;
+
+        // Cancel any in-flight prompt for the user's active or last-used agent
+        const busyAgentId = this.persistentAgentService.getActiveAgentId(userId)
+            ?? this.agentDb.getLastUsed(userId)?.id;
+        if (busyAgentId && this.persistentAgentService.isBusy(busyAgentId)) {
+            const agent = this.agentDb.getById(busyAgentId);
+            this.persistentAgentService.cancelPendingPrompt(busyAgentId);
+            const hb = this.heartbeatMessages.get(busyAgentId);
+            this.heartbeatMessages.delete(busyAgentId);
+            if (hb) {
+                await this.bot!.api.editMessageText(
+                    hb.chatId, hb.msgId,
+                    `❌ <b>${escapeHtml(agent?.name ?? busyAgentId)}</b> cancelado.`,
+                    { parse_mode: "HTML" }
+                ).catch(() => {});
+            } else {
+                await ctx.reply(`❌ <b>${escapeHtml(agent?.name ?? busyAgentId)}</b> cancelado.`, { parse_mode: "HTML" });
+            }
+            return;
+        }
 
         // Cancel /new wizard
         if (this.newWizard.has(userId)) {
@@ -1230,23 +1267,37 @@ export class OpenCodeBot {
         // Sort newest first
         sessions.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0));
 
+        // Build a fresh index for this render — old entries cleared to avoid unbounded growth
+        // We key by agent so multiple agents don't collide
+        const prefix = `s${this.sessIndexCounter++}`;
+        const newKey = `sn:${prefix}`;    // new session
+        const daKey  = `sd:${prefix}`;    // delete-all
+        this.sessIndex.set(newKey, { agentId: agent.id, sessionId: "" });
+        this.sessIndex.set(daKey,  { agentId: agent.id, sessionId: "" });
+
         const keyboard = new InlineKeyboard();
 
         if (sessions.length === 0) {
-            keyboard.text("➕ Nueva sesión", `sess:new:${agent.id}`);
+            keyboard.text("➕ Nueva sesión", newKey);
         } else {
-            for (const s of sessions) {
+            for (let i = 0; i < sessions.length; i++) {
+                const s = sessions[i];
+                const actKey = `sa:${prefix}:${i}`;
+                const delKey = `sx:${prefix}:${i}`;
+                this.sessIndex.set(actKey, { agentId: agent.id, sessionId: s.id });
+                this.sessIndex.set(delKey, { agentId: agent.id, sessionId: s.id });
+
                 const isCurrent = s.id === currentSessionId;
                 const title = (s.title || s.id.slice(0, 8)).slice(0, 28);
                 const label = isCurrent ? `🟢 ${title}` : title;
                 keyboard
-                    .text(label,   `sess:activate:${agent.id}:${s.id}`)
-                    .text("🗑️",   `sess:del:${agent.id}:${s.id}`)
+                    .text(label,   actKey)
+                    .text("🗑️",   delKey)
                     .row();
             }
             keyboard
-                .text("➕ Nueva sesión",  `sess:new:${agent.id}`).row()
-                .text("🗑️ Borrar todas", `sess:delall:${agent.id}`);
+                .text("➕ Nueva sesión",  newKey).row()
+                .text("🗑️ Borrar todas", daKey);
         }
 
         const header =
@@ -1279,11 +1330,11 @@ export class OpenCodeBot {
 
     private async handleSessionActivate(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
-        // sess:activate:AGENTID:SESSIONID
-        const raw = ctx.callbackQuery!.data.replace("sess:activate:", "");
-        const colonIdx = raw.indexOf(":");
-        const agentId  = raw.slice(0, colonIdx);
-        const sessId   = raw.slice(colonIdx + 1);
+        // sa:PREFIX:INDEX — look up agentId + sessionId from sessIndex
+        const key = ctx.callbackQuery!.data;
+        const entry = this.sessIndex.get(key);
+        if (!entry) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
+        const { agentId, sessionId: sessId } = entry;
 
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {}); return; }
@@ -1307,7 +1358,12 @@ export class OpenCodeBot {
 
     private async handleSessionNew(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
-        const agentId = ctx.callbackQuery!.data.replace("sess:new:", "");
+        // sn:PREFIX — look up agentId from sessIndex
+        const key = ctx.callbackQuery!.data;
+        const entry = this.sessIndex.get(key);
+        if (!entry) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
+        const { agentId } = entry;
+
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {}); return; }
 
@@ -1323,11 +1379,11 @@ export class OpenCodeBot {
 
     private async handleSessionDelete(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
-        // sess:del:AGENTID:SESSIONID
-        const raw = ctx.callbackQuery!.data.replace("sess:del:", "");
-        const colonIdx = raw.indexOf(":");
-        const agentId  = raw.slice(0, colonIdx);
-        const sessId   = raw.slice(colonIdx + 1);
+        // sx:PREFIX:INDEX — look up agentId + sessionId from sessIndex
+        const key = ctx.callbackQuery!.data;
+        const entry = this.sessIndex.get(key);
+        if (!entry) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
+        const { agentId, sessionId: sessId } = entry;
 
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {}); return; }
@@ -1354,7 +1410,12 @@ export class OpenCodeBot {
 
     private async handleSessionDeleteAll(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
-        const agentId = ctx.callbackQuery!.data.replace("sess:delall:", "");
+        // sd:PREFIX — look up agentId from sessIndex
+        const key = ctx.callbackQuery!.data;
+        const entry = this.sessIndex.get(key);
+        if (!entry) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
+        const { agentId } = entry;
+
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {}); return; }
 
@@ -1655,35 +1716,30 @@ export class OpenCodeBot {
         }
     }
 
-    private async handleAgentHeartbeat(agentId: string, summary: any): Promise<void> {
+    private async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<void> {
         const bot = this.bot;
         if (!bot) return;
 
         const agent = this.agentDb.getById(agentId);
         if (!agent) return;
 
-        // "working" → periodic keep-alive notification (every HEARTBEAT_INTERVAL_MS)
-        if (summary.status === "working") {
-            const snippet = summary.lastAction ? `\n\nÚltima actividad: <i>${escapeHtml(summary.lastAction)}</i>` : "";
-            try {
-                await bot.api.sendMessage(
-                    agent.userId,
-                    `⏳ <b>${escapeHtml(agent.name)}</b> sigue trabajando (${summary.minutesRunning} min)…${snippet}`,
-                    { parse_mode: "HTML" }
-                );
-            } catch { /* ignore */ }
-        }
+        // Build rich heartbeat text
+        const toolLine = summary.lastToolName ? `\n🔧 <code>${escapeHtml(summary.lastToolName)}</code>` : "";
+        const textLine = summary.lastText ? `\n💬 <i>${escapeHtml(summary.lastText.slice(0, 120))}</i>` : "";
+        const filesEdited = summary.filesModified;
+        const statsLine = `\n📊 ${summary.messageCount} mensajes · ${filesEdited} archivo${filesEdited !== 1 ? "s" : ""} editado${filesEdited !== 1 ? "s" : ""}`;
+        const text = `⏳ <b>${escapeHtml(agent.name)}</b> — trabajando (${summary.minutesRunning} min)${toolLine}${textLine}${statsLine}`;
 
-        // "stuck" → warn the user the agent may be blocked
-        if (summary.status === "stuck") {
-            const snippet = summary.lastAction ? `\n\nÚltima acción: <i>${escapeHtml(summary.lastAction)}</i>` : "";
-            try {
-                await bot.api.sendMessage(
-                    agent.userId,
-                    `⚠️ <b>${escapeHtml(agent.name)}</b> parece bloqueado (${summary.minutesRunning} min sin respuesta).${snippet}`,
-                    { parse_mode: "HTML" }
-                );
-            } catch { /* ignore */ }
+        const existing = this.heartbeatMessages.get(agentId);
+        if (existing) {
+            // Subsequent ticks: edit the same message
+            await bot.api.editMessageText(existing.chatId, existing.msgId, text, { parse_mode: "HTML" }).catch(() => {});
+        } else {
+            // First tick: send a new message and register it as the heartbeat anchor
+            const msg = await bot.api.sendMessage(agent.userId, text, { parse_mode: "HTML" }).catch(() => null);
+            if (msg) {
+                this.heartbeatMessages.set(agentId, { chatId: agent.userId, msgId: msg.message_id });
+            }
         }
     }
 

@@ -179,7 +179,6 @@ export class SessionDbService {
         this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
     }
 
-    // Load active sessions on boot (used by opencode.service.ts on restore array)
     getAllActiveSessions(): DbSession[] {
         const stmt = this.db.prepare('SELECT * FROM sessions WHERE is_active = 1');
         const rows = stmt.all() as any[];

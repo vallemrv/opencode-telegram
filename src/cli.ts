@@ -234,10 +234,9 @@ function startBot() {
     });
 
     child.on('exit', (code) => {
-        if (code !== 0) {
-            console.error(`\n❌ TelegramCoder exited with code ${code}`);
-            process.exit(code || 1);
-        }
+        // Always propagate the exit code so systemd can restart the process.
+        // A clean exit (code 0) is used by /restart — systemd must see it to restart.
+        process.exit(code ?? 0);
     });
 
     child.on('error', (err) => {

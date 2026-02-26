@@ -18,14 +18,9 @@ export class ConfigService {
     // Message Configuration
     private readonly messageDeleteTimeout: number;
 
-    // Background Agent Configuration
-    private readonly backgroundModel: string;
-    private readonly backgroundWorkdir: string;
-
     // Gitea Configuration
     private readonly giteaUrl: string;
     private readonly giteaToken: string;
-    private readonly giteaDefaultWorkdir: string;
 
     // Agent Configuration
     private readonly maxAgents: number;
@@ -69,14 +64,9 @@ export class ConfigService {
         // Load message configuration
         this.messageDeleteTimeout = parseInt(process.env.MESSAGE_DELETE_TIMEOUT || '10000', 10);
 
-        // Load background agent configuration
-        this.backgroundModel = process.env.BACKGROUND_MODEL || process.env.OPENCODE_DEFAULT_MODEL || 'github-copilot/claude-sonnet-4.6';
-        this.backgroundWorkdir = process.env.BACKGROUND_WORKDIR || '';
-
         // Load Gitea configuration
         this.giteaUrl = process.env.GITEA_URL || '';
         this.giteaToken = process.env.GITEA_TOKEN || '';
-        this.giteaDefaultWorkdir = process.env.GITEA_DEFAULT_WORKDIR || '~/proyectos/gitea-projects';
 
         // Load agent configuration
         this.maxAgents = parseInt(process.env.MAX_AGENTS || '5', 10);
@@ -117,15 +107,6 @@ export class ConfigService {
         return this.messageDeleteTimeout;
     }
 
-    // Background Agent Configuration Getters
-    getBackgroundModel(): string {
-        return this.backgroundModel;
-    }
-
-    getBackgroundWorkdir(): string {
-        return this.backgroundWorkdir;
-    }
-
     // Gitea Configuration Getters
     getGiteaUrl(): string {
         return this.giteaUrl;
@@ -133,10 +114,6 @@ export class ConfigService {
 
     getGiteaToken(): string {
         return this.giteaToken;
-    }
-
-    getGiteaDefaultWorkdir(): string {
-        return this.giteaDefaultWorkdir;
     }
 
     isGiteaConfigured(): boolean {

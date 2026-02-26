@@ -10,11 +10,11 @@
  *      Promise with the last assistant message text.
  *   3. OpenCodeBot receives the resolved text and sends it to Telegram.
  *
- * Heartbeat (safeguard only):
+ * Heartbeat:
  *   - Fires every HEARTBEAT_INTERVAL_MS while an agent has an in-flight prompt.
- *   - If session.idle has NOT been received within STUCK_THRESHOLD_MIN minutes
- *     since the prompt was sent, it notifies the user that the agent may be stuck.
- *   - Resets when session.idle arrives (pendingPromises entry is cleared).
+ *   - Edits the same Telegram message each tick with live progress info.
+ *   - Stops when session.idle arrives or the user sends /esc.
+ *   - There is NO hard timeout — the user cancels explicitly with /esc.
  */
 
 import { spawn, ChildProcess } from "child_process";
@@ -43,12 +43,16 @@ export type OnQuestionCallback = (agentId: string, req: any) => Promise<void>;
 
 /** Summary sent to the bot on each heartbeat tick */
 export interface HeartbeatSummary {
-    /** "working" → still running; "stuck" → no idle received in STUCK_THRESHOLD_MIN */
-    status: "working" | "stuck";
     /** Minutes elapsed since the prompt was sent */
     minutesRunning: number;
-    /** Last 100 chars of the most recent assistant text (best-effort snapshot) */
-    lastAction: string;
+    /** Name of the last tool called (e.g. "edit", "bash", "read") — best-effort */
+    lastToolName: string;
+    /** Last snippet of assistant text (up to 120 chars) — best-effort */
+    lastText: string;
+    /** Total number of messages in the session so far */
+    messageCount: number;
+    /** Number of file-modifying tool calls (edit / write / patch) seen so far */
+    filesModified: number;
 }
 
 /** Called by OpenCodeBot on each heartbeat tick (only while a prompt is in-flight) */
@@ -73,10 +77,10 @@ export function pickPort(usedPorts: number[]): number {
 
 async function findOpencodeCmd(): Promise<string> {
     const candidates = [
-        path.join(process.cwd(), "node_modules", ".bin", "opencode"),
-        path.join(process.env.HOME || "", ".opencode", "bin", "opencode"),
         "/usr/bin/opencode",
         "/usr/local/bin/opencode",
+        path.join(process.env.HOME || "", ".opencode", "bin", "opencode"),
+        path.join(process.cwd(), "node_modules", ".bin", "opencode"),
     ];
     for (const p of candidates) {
         try { await access(p, constants.X_OK); return p; } catch { /* next */ }
@@ -92,18 +96,14 @@ async function findOpencodeCmd(): Promise<string> {
 /** Heartbeat interval while a prompt is in-flight */
 const HEARTBEAT_INTERVAL_MS = 3 * 60 * 1000;
 
-/** Minutes without session.idle before considering an agent stuck */
-const STUCK_THRESHOLD_MIN = 10;
-
-/** Max time sendPrompt will wait for session.idle before timing out */
-const PROMPT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+/** File-modifying tool names recognised for the filesModified counter */
+const FILE_WRITE_TOOLS = new Set(["edit", "write", "patch", "multiedit"]);
 
 interface PendingPrompt {
     sessionId: string;
     resolve: (result: AgentSendResult) => void;
     reject: (err: Error) => void;
     startedAt: number;
-    timeoutHandle: NodeJS.Timeout;
 }
 
 export class PersistentAgentService {
@@ -182,6 +182,17 @@ export class PersistentAgentService {
             env: { ...process.env },
         });
 
+        child.on("error", (err) => {
+            console.error(`[PersistentAgent] Failed to spawn opencode for "${agent.name}":`, err.message);
+            this.processes.delete(agent.id);
+            this.stopSseStream(agent.id);
+            const pending = this.pendingPrompts.get(agent.id);
+            if (pending) {
+                this.pendingPrompts.delete(agent.id);
+                pending.reject(err);
+            }
+        });
+
         child.on("exit", (code) => {
             console.log(`[PersistentAgent] Agent "${agent.name}" (port ${agent.port}) exited with code ${code}`);
             this.processes.delete(agent.id);
@@ -189,7 +200,6 @@ export class PersistentAgentService {
             // Reject any in-flight prompt
             const pending = this.pendingPrompts.get(agent.id);
             if (pending) {
-                clearTimeout(pending.timeoutHandle);
                 this.pendingPrompts.delete(agent.id);
                 pending.reject(new Error(`Agent server exited with code ${code}`));
             }
@@ -328,6 +338,7 @@ export class PersistentAgentService {
         let retryDelay = 3000;
 
         await this.recoverPendingQuestions(agent);
+        await this.recoverPendingPrompt(agent);
 
         while (!abort.signal.aborted) {
             try {
@@ -365,6 +376,7 @@ export class PersistentAgentService {
                 await new Promise(r => setTimeout(r, retryDelay));
                 retryDelay = Math.min(retryDelay * 2, 30000);
                 await this.recoverPendingQuestions(agent);
+                await this.recoverPendingPrompt(agent);
             }
         }
     }
@@ -379,7 +391,6 @@ export class PersistentAgentService {
 
         // Stop heartbeat — response arrived
         this.stopHeartbeat(agent.id);
-        clearTimeout(pending.timeoutHandle);
         this.pendingPrompts.delete(agent.id);
 
         try {
@@ -444,6 +455,37 @@ export class PersistentAgentService {
         }
     }
 
+    /**
+     * Called on SSE connect/reconnect. If there is a pending in-flight prompt
+     * for this agent and the session is already idle in opencode (i.e. the
+     * session.idle event was missed while we were disconnected), resolve it
+     * immediately instead of waiting forever.
+     */
+    private async recoverPendingPrompt(agent: PersistentAgent): Promise<void> {
+        const pending = this.pendingPrompts.get(agent.id);
+        if (!pending) return; // nothing in flight
+
+        const sessionId = pending.sessionId;
+        if (!sessionId) return;
+
+        try {
+            const res = await fetch(
+                `http://localhost:${agent.port}/session/${sessionId}`,
+                { signal: AbortSignal.timeout(5000) }
+            );
+            if (!res.ok) return;
+
+            const session: any = await res.json();
+            // opencode reports the session as idle when it is not actively running a prompt
+            if (session?.status === "idle" || session?.info?.status === "idle") {
+                console.log(`[PersistentAgent] recoverPendingPrompt: session ${sessionId} is already idle for agent "${agent.name}" — resolving now`);
+                await this.resolvePromptFromIdle(agent, sessionId);
+            }
+        } catch (err) {
+            console.debug(`[PersistentAgent] recoverPendingPrompt for "${agent.name}": ${err}`);
+        }
+    }
+
     // ─── Heartbeat (safeguard only) ───────────────────────────────────────────
 
     private startHeartbeat(agent: PersistentAgent): void {
@@ -470,17 +512,18 @@ export class PersistentAgentService {
 
         const pending = this.pendingPrompts.get(agent.id);
         if (!pending) {
-            // No in-flight prompt — nothing to report, stop the timer
             this.stopHeartbeat(agent.id);
             return;
         }
 
         const minutesRunning = (Date.now() - pending.startedAt) / 60000;
-        const status: HeartbeatSummary["status"] =
-            minutesRunning >= STUCK_THRESHOLD_MIN ? "stuck" : "working";
 
-        // Best-effort: grab the last assistant snippet for context
-        let lastAction = "";
+        // Best-effort: fetch messages and extract rich info
+        let lastToolName = "";
+        let lastText = "";
+        let messageCount = 0;
+        let filesModified = 0;
+
         try {
             const baseUrl = `http://localhost:${agent.port}`;
             const msgRes = await fetch(`${baseUrl}/session/${pending.sessionId}/message`, {
@@ -488,13 +531,18 @@ export class PersistentAgentService {
             });
             if (msgRes.ok) {
                 const messages: any[] = await msgRes.json();
-                const assistantMsgs = messages.filter((m: any) => m.role === "assistant");
-                if (assistantMsgs.length > 0) {
-                    const lastMsg = assistantMsgs[assistantMsgs.length - 1];
-                    const parts: any[] = lastMsg.parts ?? [];
-                    const textPart = [...parts].reverse().find((p: any) => p.type === "text" && p.text);
-                    if (textPart) {
-                        lastAction = (textPart.text as string).replace(/\s+/g, " ").trim().slice(0, 100);
+                messageCount = messages.length;
+
+                for (const msg of messages) {
+                    for (const part of (msg.parts ?? [])) {
+                        if (part.type === "tool-invocation") {
+                            const toolName: string = (part.toolName ?? part.name ?? "").toLowerCase();
+                            if (toolName) lastToolName = toolName;
+                            if (FILE_WRITE_TOOLS.has(toolName)) filesModified++;
+                        }
+                        if (part.type === "text" && part.text) {
+                            lastText = (part.text as string).replace(/\s+/g, " ").trim().slice(0, 120);
+                        }
                     }
                 }
             }
@@ -502,9 +550,11 @@ export class PersistentAgentService {
 
         try {
             await this.onHeartbeat(agent.id, {
-                status,
                 minutesRunning: Math.floor(minutesRunning),
-                lastAction,
+                lastToolName,
+                lastText,
+                messageCount,
+                filesModified,
             });
         } catch (err) {
             console.error(`[PersistentAgent] heartbeat error for "${agent.name}":`, err);
@@ -534,7 +584,7 @@ export class PersistentAgentService {
     /**
      * Send a prompt to a persistent agent's opencode server.
      *
-     * Fire-and-forget: the prompt is sent via /prompt/async and this method
+     * Fire-and-forget: the prompt is sent via /prompt_async and this method
      * returns a Promise that is resolved by the SSE loop when session.idle
      * arrives for this agent's session. The heartbeat timer is started as a
      * safeguard in case session.idle never arrives.
@@ -570,27 +620,17 @@ export class PersistentAgentService {
 
         // Register the pending promise BEFORE sending the prompt so the SSE
         // loop cannot race and resolve before we're listening.
+        // There is NO hard timeout — the user cancels explicitly with /esc.
         const result = await new Promise<AgentSendResult>((resolve, reject) => {
-            const timeoutHandle = setTimeout(() => {
-                if (this.pendingPrompts.get(agent.id)?.sessionId === sessionId) {
-                    this.pendingPrompts.delete(agent.id);
-                    this.stopHeartbeat(agent.id);
-                    resolve({ output: "⏱️ Timeout: el agente no respondió en 10 minutos.", sessionId });
-                }
-            }, PROMPT_TIMEOUT_MS);
-
-            if (timeoutHandle.unref) timeoutHandle.unref();
-
             this.pendingPrompts.set(agent.id, {
                 sessionId,
                 resolve,
                 reject,
                 startedAt: Date.now(),
-                timeoutHandle,
             });
 
             // Send prompt async (fire and forget) — response comes via SSE session.idle
-            fetch(`${baseUrl}/session/${sessionId}/prompt/async`, {
+            fetch(`${baseUrl}/session/${sessionId}/prompt_async`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -601,16 +641,14 @@ export class PersistentAgentService {
                 signal: AbortSignal.timeout(10000),
             }).then(res => {
                 if (!res.ok) {
-                    clearTimeout(timeoutHandle);
                     this.pendingPrompts.delete(agent.id);
                     this.stopHeartbeat(agent.id);
                     resolve({ output: `❌ Failed to send prompt: HTTP ${res.status}`, sessionId });
                 } else {
-                    // Prompt accepted — start the heartbeat safeguard
+                    // Prompt accepted — start the heartbeat
                     this.startHeartbeat(agent);
                 }
             }).catch(err => {
-                clearTimeout(timeoutHandle);
                 this.pendingPrompts.delete(agent.id);
                 this.stopHeartbeat(agent.id);
                 resolve({ output: `❌ Failed to send prompt to agent: ${err}`, sessionId });
@@ -625,6 +663,22 @@ export class PersistentAgentService {
     /** Returns true if the agent currently has an in-flight prompt */
     isBusy(agentId: string): boolean {
         return this.pendingPrompts.has(agentId);
+    }
+
+    /**
+     * Cancel the in-flight prompt for an agent (called by /esc).
+     * Resolves the pending promise with a cancellation message and stops the heartbeat.
+     * Queued prompts are also cleared.
+     */
+    cancelPendingPrompt(agentId: string): void {
+        const pending = this.pendingPrompts.get(agentId);
+        if (pending) {
+            this.pendingPrompts.delete(agentId);
+            this.stopHeartbeat(agentId);
+            pending.resolve({ output: "❌ Cancelado por el usuario.", sessionId: pending.sessionId });
+        }
+        // Also clear the queue so nothing drains after cancellation
+        this.promptQueues.delete(agentId);
     }
 
     /** How many prompts are waiting in the queue for this agent (not counting the in-flight one) */
