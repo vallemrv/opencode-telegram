@@ -75,7 +75,7 @@ export function pickPort(usedPorts: number[]): number {
     throw new Error("No available ports in range 15000-16000");
 }
 
-async function findOpencodeCmd(): Promise<string> {
+export async function findOpencodeCmd(): Promise<string> {
     const candidates = [
         "/usr/bin/opencode",
         "/usr/local/bin/opencode",

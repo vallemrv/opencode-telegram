@@ -22,7 +22,7 @@ import { Bot, Context, InputFile, InlineKeyboard } from "grammy";
 import { ConfigService } from "../../services/config.service.js";
 import { AgentDbService } from "../../services/agent-db.service.js";
 import type { PersistentAgent } from "../../services/agent-db.service.js";
-import { PersistentAgentService, pickPort, resolveDir } from "../../services/persistent-agent.service.js";
+import { PersistentAgentService, pickPort, resolveDir, findOpencodeCmd } from "../../services/persistent-agent.service.js";
 import type { AgentSendResult, HeartbeatSummary } from "../../services/persistent-agent.service.js";
 import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
 import { MessageUtils } from "../../utils/message.utils.js";
@@ -163,6 +163,16 @@ export class OpenCodeBot {
     /** Short-key → model full name for callback buttons */
     private modelIndex: Map<string, string> = new Map();
     private modelIndexCounter = 0;
+    private static readonly MAX_CALLBACK_DATA = 64;
+
+    private makeShortKey(prefix: string): string {
+        if (this.modelIndexCounter > 999999) this.modelIndexCounter = 0;
+        const key = `${prefix}${this.modelIndexCounter++}`;
+        if (key.length > OpenCodeBot.MAX_CALLBACK_DATA) {
+            console.warn(`[OpenCodeBot] callback_data too long: ${key}`);
+        }
+        return key;
+    }
 
     /** Agent question callbacks keyed by shortKey */
     private pendingAgentQuestions: Map<string, { agentId: string; port: number; req: any }> = new Map();
@@ -1184,7 +1194,8 @@ export class OpenCodeBot {
     // ─────────────────────────────────────────────────────────────────────────
     private async getAvailableModels(): Promise<Record<string, string[]>> {
         try {
-            const output = execSync("opencode models 2>/dev/null", { encoding: "utf-8" });
+            const opencodeCmd = await findOpencodeCmd();
+            const output = execSync(`"${opencodeCmd}" models 2>/dev/null`, { encoding: "utf-8" });
             const modelsByProvider: Record<string, string[]> = {};
             
             for (const line of output.trim().split("\n")) {
@@ -1200,7 +1211,7 @@ export class OpenCodeBot {
             }
             return modelsByProvider;
         } catch (error) {
-            console.error("Error fetching models:", error);
+            console.error("Error fetching models from opencode:", error);
             return {};
         }
     }
@@ -1238,7 +1249,7 @@ export class OpenCodeBot {
 
         const keyboard = new InlineKeyboard();
         for (const agent of agents) {
-            const shortKey = `mdl_ag_${this.modelIndexCounter++}`;
+            const shortKey = this.makeShortKey("mdl_ag_");
             this.modelIndex.set(shortKey, agent.id);
             keyboard.text(agent.name, shortKey).row();
         }
@@ -1257,7 +1268,7 @@ export class OpenCodeBot {
 
         const keyboard = new InlineKeyboard();
         for (const provider of providers) {
-            const shortKey = `mdl_pr_${this.modelIndexCounter++}`;
+            const shortKey = this.makeShortKey("mdl_pr_");
             this.modelIndex.set(shortKey, provider);
             keyboard.text(provider, shortKey).row();
         }
@@ -1296,7 +1307,7 @@ export class OpenCodeBot {
             const keyboard = new InlineKeyboard();
             for (const model of models) {
                 const modelName = model.split("/")[1];
-                const shortKey = `mdl_mo_${this.modelIndexCounter++}`;
+                const shortKey = this.makeShortKey("mdl_mo_");
                 this.modelIndex.set(shortKey, model);
                 keyboard.text(modelName, shortKey).row();
             }
@@ -1316,7 +1327,7 @@ export class OpenCodeBot {
 
             const keyboard = new InlineKeyboard();
             for (const provider of state.providers) {
-                const shortKey = `mdl_pr_${this.modelIndexCounter++}`;
+                const shortKey = this.makeShortKey("mdl_pr_");
                 this.modelIndex.set(shortKey, provider);
                 keyboard.text(provider, shortKey).row();
             }
