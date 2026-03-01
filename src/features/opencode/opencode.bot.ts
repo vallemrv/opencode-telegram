@@ -33,6 +33,7 @@ import * as nodePath from "path";
 import * as os from "os";
 import { randomUUID } from "crypto";
 import { execSync } from "child_process";
+import { TranscriptionService } from "../../services/transcription.service.js";
 
 // ─── Wizard state ─────────────────────────────────────────────────────────────
 
@@ -144,6 +145,7 @@ export class OpenCodeBot {
     private configService: ConfigService;
     private agentDb: AgentDbService;
     private persistentAgentService: PersistentAgentService;
+    private transcriptionService: TranscriptionService;
     private bot?: Bot;
 
     /** Wizard state per user for /new multi-step flow */
@@ -180,6 +182,7 @@ export class OpenCodeBot {
         this.configService = configService;
         this.agentDb = new AgentDbService();
         this.persistentAgentService = new PersistentAgentService(this.agentDb);
+        this.transcriptionService = new TranscriptionService();
     }
 
     registerHandlers(bot: Bot): void {
@@ -1883,6 +1886,7 @@ export class OpenCodeBot {
 
             let fileId: string | undefined;
             let fileName: string | undefined;
+            let isAudio = false;
 
             if (message.document) {
                 fileId = message.document.file_id;
@@ -1896,9 +1900,11 @@ export class OpenCodeBot {
             } else if (message.audio) {
                 fileId = message.audio.file_id;
                 fileName = message.audio.file_name || `audio_${Date.now()}.mp3`;
+                isAudio = true;
             } else if (message.voice) {
                 fileId = message.voice.file_id;
                 fileName = `voice_${Date.now()}.ogg`;
+                isAudio = true;
             }
 
             if (!fileId || !fileName) { await ctx.reply("❌ Tipo de archivo no soportado."); return; }
@@ -1916,6 +1922,60 @@ export class OpenCodeBot {
             const savePath = nodePath.join(saveDir, fileName);
             const buffer = Buffer.from(await response.arrayBuffer());
             fs.writeFileSync(savePath, buffer);
+
+            if (isAudio && this.transcriptionService.isConfigured()) {
+                const userId = ctx.from?.id;
+                if (!userId) return;
+
+                const statusMsg = await ctx.reply("🎙️ Transcribiendo audio...");
+
+                const result = await this.transcriptionService.transcribeAudio(savePath);
+
+                if (!result.success) {
+                    await ctx.api.editMessageText(
+                        ctx.chat!.id, statusMsg.message_id,
+                        `❌ Error de transcripción: ${escapeHtml(result.error || "desconocido")}`,
+                        { parse_mode: "HTML" }
+                    );
+                    return;
+                }
+
+                await ctx.api.deleteMessage(ctx.chat!.id, statusMsg.message_id).catch(() => {});
+
+                const transcription = result.text?.trim();
+                if (!transcription) {
+                    await ctx.reply("ℹ️ El audio está vacío o no se pudo transcribir.");
+                    return;
+                }
+
+                await ctx.reply(
+                    `📝 <b>Transcripción:</b>\n\n${escapeHtml(transcription)}`,
+                    { parse_mode: "HTML" }
+                );
+
+                const activeId = this.persistentAgentService.getActiveAgentId(userId)
+                    ?? this.agentDb.getLastUsed(userId)?.id;
+
+                if (activeId) {
+                    const agent = this.agentDb.getById(activeId);
+                    if (agent) {
+                        await this.sendPromptToAgent(ctx, agent, `[Audio transcrito]\n\n${transcription}`);
+                        return;
+                    }
+                }
+
+                await ctx.reply("ℹ️ Transcripción lista. Usa /agents para activar un agente.");
+                return;
+            }
+
+            if (isAudio && !this.transcriptionService.isConfigured()) {
+                await ctx.reply(
+                    `⚠️ Audio recibido pero <code>GEMINI_API_KEY</code> no está configurado.\n` +
+                    `Archivo guardado en: <code>${savePath}</code>`,
+                    { parse_mode: "HTML" }
+                );
+                return;
+            }
 
             const confirmMsg = await ctx.reply(
                 `✅ <b>Archivo guardado</b>\n\n<code>${savePath}</code>`,
