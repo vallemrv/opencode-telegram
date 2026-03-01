@@ -47,6 +47,13 @@ interface NewAgentWizard {
     model: string;       // always the default — user changes it with /models later
 }
 
+interface ModelSelectionState {
+    agentId: string;
+    modelsCache: Record<string, string[]>;
+    providers: string[];
+    currentProvider?: string;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function resolveHome(p: string): string {
@@ -148,6 +155,13 @@ export class OpenCodeBot {
     /** Pending /rename state: userId → agentId (waiting for user to type the new session name) */
     private renameWizard: Map<number, string> = new Map();
 
+    /** Model selection state: userId → { agentId, modelsCache, providers, currentProvider? } */
+    private modelSelection: Map<number, ModelSelectionState> = new Map();
+
+    /** Short-key → model full name for callback buttons */
+    private modelIndex: Map<string, string> = new Map();
+    private modelIndexCounter = 0;
+
     /** Agent question callbacks keyed by shortKey */
     private pendingAgentQuestions: Map<string, { agentId: string; port: number; req: any }> = new Map();
 
@@ -221,9 +235,7 @@ export class OpenCodeBot {
         bot.callbackQuery(/^run:agent:/,    AccessControlMiddleware.requireAccess, this.handleRunAgentSelected.bind(this));
         bot.callbackQuery(/^run:cancel$/,   AccessControlMiddleware.requireAccess, this.handleRunCancel.bind(this));
 
-        bot.callbackQuery(/^provider:/,     AccessControlMiddleware.requireAccess, this.handleProviderSelection.bind(this));
-        bot.callbackQuery(/^model:/,        AccessControlMiddleware.requireAccess, this.handleModelSelection.bind(this));
-        bot.callbackQuery("back:providers", AccessControlMiddleware.requireAccess, this.handleBackToProviders.bind(this));
+        bot.callbackQuery(/^mdl_/,         AccessControlMiddleware.requireAccess, this.handleModelCallback.bind(this));
 
         bot.callbackQuery(/^agq:/,          AccessControlMiddleware.requireAccess, this.handleAgentQuestionCallback.bind(this));
 
@@ -1167,6 +1179,29 @@ export class OpenCodeBot {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    private async getAvailableModels(): Promise<Record<string, string[]>> {
+        try {
+            const output = execSync("opencode models 2>/dev/null", { encoding: "utf-8" });
+            const modelsByProvider: Record<string, string[]> = {};
+            
+            for (const line of output.trim().split("\n")) {
+                const trimmed = line.trim();
+                if (trimmed && trimmed.includes("/")) {
+                    const [provider, ...modelParts] = trimmed.split("/");
+                    const model = modelParts.join("/");
+                    if (!modelsByProvider[provider]) {
+                        modelsByProvider[provider] = [];
+                    }
+                    modelsByProvider[provider].push(`${provider}/${model}`);
+                }
+            }
+            return modelsByProvider;
+        } catch (error) {
+            console.error("Error fetching models:", error);
+            return {};
+        }
+    }
+
     // /models — cambiar modelo del agente activo
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1178,88 +1213,149 @@ export class OpenCodeBot {
             ?? this.agentDb.getLastUsed(userId)?.id;
 
         if (!activeId) {
-            await ctx.reply("ℹ️ No hay agente activo. Activa uno con /agents.");
+            await this.showAgentPickerForModels(ctx);
             return;
         }
 
         const agent = this.agentDb.getById(activeId);
         if (!agent) { await ctx.reply("❌ Agente no encontrado."); return; }
 
-        const providers: Record<string, string[]> = {
-            "opencode": ["opencode/glm-5-free"],
-            "github-copilot": ["github-copilot/claude-sonnet-4.6", "github-copilot/gpt-4o", "github-copilot/o3-mini"],
-            "google": ["google/gemini-2.0-flash", "google/gemini-2.0-pro"],
-            "anthropic": ["anthropic/claude-3-5-sonnet", "anthropic/claude-3-7-sonnet"],
-            "openai": ["openai/gpt-4o", "openai/o3-mini"],
-            "xai": ["xai/grok-3", "xai/grok-3-mini"],
-        };
+        await this.showProviderPicker(ctx, agent.id, agent.model);
+    }
+
+    private async showAgentPickerForModels(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const agents = this.agentDb.getByUser(userId);
+        if (agents.length === 0) {
+            await ctx.reply("ℹ️ No tienes agentes. Crea uno con /new.");
+            return;
+        }
 
         const keyboard = new InlineKeyboard();
-        for (const provider of Object.keys(providers)) {
-            keyboard.text(provider, `provider:${provider}:${activeId}`).row();
+        for (const agent of agents) {
+            const shortKey = `mdl_ag_${this.modelIndexCounter++}`;
+            this.modelIndex.set(shortKey, agent.id);
+            keyboard.text(agent.name, shortKey).row();
+        }
+
+        await ctx.reply("Selecciona un agente para cambiar su modelo:", { reply_markup: keyboard });
+    }
+
+    private async showProviderPicker(ctx: Context, agentId: string, currentModel: string): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const modelsCache = await this.getAvailableModels();
+        const providers = Object.keys(modelsCache).sort();
+
+        this.modelSelection.set(userId, { agentId, modelsCache, providers });
+
+        const keyboard = new InlineKeyboard();
+        for (const provider of providers) {
+            const shortKey = `mdl_pr_${this.modelIndexCounter++}`;
+            this.modelIndex.set(shortKey, provider);
+            keyboard.text(provider, shortKey).row();
         }
 
         await ctx.reply(
-            `🧠 <b>Modelo actual:</b> <code>${escapeHtml(agent.model)}</code>\n\nElige proveedor:`,
+            `🧠 <b>Modelo actual:</b> <code>${escapeHtml(currentModel)}</code>\n\nElige proveedor:`,
             { parse_mode: "HTML", reply_markup: keyboard }
         );
+    }
+
+    private async handleModelCallback(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const data = ctx.callbackQuery?.data;
+        if (!data || !data.startsWith("mdl_")) return;
+
+        await ctx.answerCallbackQuery();
+
+        if (data.startsWith("mdl_ag_")) {
+            const agentId = this.modelIndex.get(data);
+            if (!agentId) { await ctx.editMessageText("❌ Sesión expirada."); return; }
+            const agent = this.agentDb.getById(agentId);
+            if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
+            await this.showProviderPicker(ctx, agent.id, agent.model);
+            return;
+        }
+
+        if (data.startsWith("mdl_pr_")) {
+            const provider = this.modelIndex.get(data);
+            if (!provider) { await ctx.editMessageText("❌ Sesión expirada."); return; }
+            const state = this.modelSelection.get(userId);
+            if (!state) { await ctx.editMessageText("❌ Sesión expirada. Usa /models."); return; }
+
+            const models = state.modelsCache[provider] || [];
+            const keyboard = new InlineKeyboard();
+            for (const model of models) {
+                const modelName = model.split("/")[1];
+                const shortKey = `mdl_mo_${this.modelIndexCounter++}`;
+                this.modelIndex.set(shortKey, model);
+                keyboard.text(modelName, shortKey).row();
+            }
+            keyboard.text("← Volver", "mdl_back");
+
+            state.currentProvider = provider;
+            await ctx.editMessageText(
+                `🧠 <b>${provider}</b> — elige modelo:`,
+                { parse_mode: "HTML", reply_markup: keyboard }
+            );
+            return;
+        }
+
+        if (data === "mdl_back") {
+            const state = this.modelSelection.get(userId);
+            if (!state) { await ctx.editMessageText("❌ Sesión expirada. Usa /models."); return; }
+
+            const keyboard = new InlineKeyboard();
+            for (const provider of state.providers) {
+                const shortKey = `mdl_pr_${this.modelIndexCounter++}`;
+                this.modelIndex.set(shortKey, provider);
+                keyboard.text(provider, shortKey).row();
+            }
+
+            const agent = this.agentDb.getById(state.agentId);
+            await ctx.editMessageText(
+                `🧠 <b>Modelo actual:</b> <code>${escapeHtml(agent?.model || "desconocido")}</code>\n\nElige proveedor:`,
+                { parse_mode: "HTML", reply_markup: keyboard }
+            );
+            return;
+        }
+
+        if (data.startsWith("mdl_mo_")) {
+            const model = this.modelIndex.get(data);
+            if (!model) { await ctx.editMessageText("❌ Sesión expirada."); return; }
+            const state = this.modelSelection.get(userId);
+            if (!state) { await ctx.editMessageText("❌ Sesión expirada. Usa /models."); return; }
+
+            const agent = this.agentDb.getById(state.agentId);
+            if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
+
+            this.agentDb.updateModel(state.agentId, model);
+            this.modelSelection.delete(userId);
+
+            await ctx.editMessageText(
+                `✅ Modelo de <b>${escapeHtml(agent.name)}</b> cambiado a <code>${escapeHtml(model)}</code>`,
+                { parse_mode: "HTML" }
+            );
+            return;
+        }
     }
 
     private async handleProviderSelection(ctx: Context): Promise<void> {
-        await ctx.answerCallbackQuery();
-        const parts = ctx.callbackQuery!.data.replace("provider:", "").split(":");
-        const provider = parts[0];
-        const agentId = parts.slice(1).join(":");
-
-        const modelsByProvider: Record<string, string[]> = {
-            "opencode": ["opencode/glm-5-free"],
-            "github-copilot": ["github-copilot/claude-sonnet-4.6", "github-copilot/gpt-4o", "github-copilot/o3-mini"],
-            "google": ["google/gemini-2.0-flash", "google/gemini-2.0-pro"],
-            "anthropic": ["anthropic/claude-3-5-sonnet", "anthropic/claude-3-7-sonnet"],
-            "openai": ["openai/gpt-4o", "openai/o3-mini"],
-            "xai": ["xai/grok-3", "xai/grok-3-mini"],
-        };
-
-        const models = modelsByProvider[provider] || [];
-        const keyboard = new InlineKeyboard();
-        for (const model of models) {
-            const modelName = model.split("/")[1];
-            keyboard.text(modelName, `model:${model}:${agentId}`).row();
-        }
-        keyboard.text("← Volver", `back:providers`);
-
-        await ctx.editMessageText(
-            `🧠 <b>${provider}</b> — elige modelo:`,
-            { parse_mode: "HTML", reply_markup: keyboard }
-        );
+        await this.handleModelCallback(ctx);
     }
 
     private async handleBackToProviders(ctx: Context): Promise<void> {
-        await ctx.answerCallbackQuery();
-        await ctx.deleteMessage().catch(() => {});
-        await this.handleModels(ctx);
-    }
-
-    private async handleModelSelection(ctx: Context): Promise<void> {
-        await ctx.answerCallbackQuery();
-        const parts = ctx.callbackQuery!.data.replace("model:", "").split(":");
-        const model = parts.slice(0, 2).join("/");
-        const agentId = parts.slice(2).join(":");
-
-        const agent = this.agentDb.getById(agentId);
-        if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
-
-        this.agentDb.updateModel(agentId, model);
-
-        await ctx.editMessageText(
-            `✅ Modelo de <b>${escapeHtml(agent.name)}</b> cambiado a <code>${escapeHtml(model)}</code>`,
-            { parse_mode: "HTML" }
-        );
+        await this.handleModelCallback(ctx);
     }
 
     private async handleAgentModelSelect(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
-        // Reuse provider flow but scoped to agent
         await this.handleModels(ctx);
     }
 
