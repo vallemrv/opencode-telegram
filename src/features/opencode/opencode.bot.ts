@@ -23,8 +23,7 @@ import { ConfigService } from "../../services/config.service.js";
 import { AgentDbService } from "../../services/agent-db.service.js";
 import type { PersistentAgent } from "../../services/agent-db.service.js";
 import { PersistentAgentService, pickPort, resolveDir, findOpencodeCmd } from "../../services/persistent-agent.service.js";
-import type { AgentSendResult, HeartbeatSummary } from "../../services/persistent-agent.service.js";
-import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
+import type { AgentSendResult, HeartbeatSummary } from "../../services/persistent-agent.service.js";import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
 import { MessageUtils } from "../../utils/message.utils.js";
 import { ErrorUtils } from "../../utils/error.utils.js";
 import { formatAsHtml, escapeHtml } from "./event-handlers/utils.js";
@@ -200,6 +199,7 @@ export class OpenCodeBot {
 
         // Register persistent agent callbacks
         this.persistentAgentService.setOnQuestionCallback(this.handleAgentQuestion.bind(this));
+        this.persistentAgentService.setOnSessionErrorCallback(this.handleAgentSessionError.bind(this));
         this.persistentAgentService.setOnHeartbeatCallback(this.handleAgentHeartbeat.bind(this));
 
         // Restore all agents on startup
@@ -1785,6 +1785,36 @@ export class OpenCodeBot {
     // ─────────────────────────────────────────────────────────────────────────
     // Agent questions (heartbeat / question callbacks)
     // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Called by PersistentAgentService when the model/opencode reports session.error.
+     * The in-flight prompt has already been resolved with the error message.
+     * This handler fires an extra notification only when there was NO pending prompt
+     * (i.e. the error was spontaneous / background), so the user always knows.
+     */
+    private async handleAgentSessionError(agentId: string, errorMessage: string): Promise<void> {
+        const bot = this.bot;
+        if (!bot) return;
+
+        const agent = this.agentDb.getById(agentId);
+        if (!agent) return;
+
+        // If there was a pending heartbeat message we already resolved it with the error.
+        // Only send a separate notification if there is no heartbeat message registered
+        // (meaning the error arrived outside of a user-initiated prompt).
+        const hb = this.heartbeatMessages.get(agentId);
+        if (hb) return; // already handled via sendPrompt resolution path
+
+        try {
+            await bot.api.sendMessage(
+                agent.userId,
+                `⚠️ <b>${escapeHtml(agent.name)}</b> — error del modelo:\n\n<code>${escapeHtml(errorMessage)}</code>`,
+                { parse_mode: "HTML" }
+            );
+        } catch (err) {
+            console.error("[OpenCodeBot] Failed to send session error notification:", err);
+        }
+    }
 
     private async handleAgentQuestion(agentId: string, req: any): Promise<void> {
         const bot = this.bot;

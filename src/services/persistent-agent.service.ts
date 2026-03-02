@@ -41,6 +41,9 @@ export interface QueuedPrompt {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type OnQuestionCallback = (agentId: string, req: any) => Promise<void>;
 
+/** Called by OpenCodeBot when the model/session reports an error */
+export type OnSessionErrorCallback = (agentId: string, errorMessage: string) => Promise<void>;
+
 /** Summary sent to the bot on each heartbeat tick */
 export interface HeartbeatSummary {
     /** Minutes elapsed since the prompt was sent */
@@ -53,6 +56,8 @@ export interface HeartbeatSummary {
     messageCount: number;
     /** Number of file-modifying tool calls (edit / write / patch) seen so far */
     filesModified: number;
+    /** True if approaching hard timeout (80% of TIMEOUT_MS) */
+    isNearTimeout?: boolean;
 }
 
 /** Called by OpenCodeBot on each heartbeat tick (only while a prompt is in-flight) */
@@ -119,6 +124,9 @@ export class PersistentAgentService {
     /** Callback registered by OpenCodeBot to handle pending questions */
     private onQuestion?: OnQuestionCallback;
 
+    /** Callback registered by OpenCodeBot to handle session errors from the model */
+    private onSessionError?: OnSessionErrorCallback;
+
     /** Callback registered by OpenCodeBot to handle heartbeat ticks */
     private onHeartbeat?: OnHeartbeatCallback;
 
@@ -148,6 +156,11 @@ export class PersistentAgentService {
     /** Register the question callback (called once at startup by OpenCodeBot) */
     setOnQuestionCallback(cb: OnQuestionCallback): void {
         this.onQuestion = cb;
+    }
+
+    /** Register the session error callback (called once at startup by OpenCodeBot) */
+    setOnSessionErrorCallback(cb: OnSessionErrorCallback): void {
+        this.onSessionError = cb;
     }
 
     /** Register the heartbeat callback (called once at startup by OpenCodeBot) */
@@ -359,6 +372,40 @@ export class PersistentAgentService {
                         );
                     }
 
+                    // ── session.error → notify bot and resolve pending ─────
+                    if (type === "session.error") {
+                        const errorSessionId: string = props?.sessionID ?? props?.id ?? "";
+                        const mySessionId = this.sessionIds.get(agent.id);
+                        const errorMessage: string =
+                            props?.error?.message ?? props?.message ?? props?.error ?? "Error desconocido del modelo";
+
+                        console.error(`[PersistentAgent] session.error for agent "${agent.name}": ${errorMessage}`);
+
+                        if (errorSessionId && mySessionId && errorSessionId === mySessionId) {
+                            // Stop heartbeat and resolve in-flight prompt with the error
+                            const pending = this.pendingPrompts.get(agent.id);
+                            if (pending) {
+                                this.stopHeartbeat(agent.id);
+                                this.pendingPrompts.delete(agent.id);
+                                pending.resolve({
+                                    output: `❌ Error del modelo: ${errorMessage}`,
+                                    sessionId: errorSessionId,
+                                });
+                                // Drain queue after error so queued prompts are not lost
+                                this.drainQueue(agent).catch(err =>
+                                    console.error(`[PersistentAgent] drainQueue error after session.error for "${agent.name}":`, err)
+                                );
+                            }
+                        }
+
+                        // Always notify the bot so the user knows even if there was no pending prompt
+                        if (this.onSessionError) {
+                            this.onSessionError(agent.id, errorMessage).catch(err =>
+                                console.error(`[PersistentAgent] onSessionError callback error:`, err)
+                            );
+                        }
+                    }
+
                     // ── session.idle → resolve in-flight prompt ───────────
                     if (type === "session.idle") {
                         const idleSessionId: string = props?.sessionID ?? props?.id ?? "";
@@ -399,7 +446,7 @@ export class PersistentAgentService {
                 { signal: AbortSignal.timeout(10000) }
             );
             if (!msgRes.ok) {
-                pending.resolve({ output: `❌ Failed to fetch messages: ${msgRes.status}`, sessionId });
+                pending.resolve({ output: `❌ Error al leer mensajes: HTTP ${msgRes.status}`, sessionId });
                 return;
             }
 
@@ -409,7 +456,7 @@ export class PersistentAgentService {
                 .find((m: any) => m.role === "assistant" || m.info?.role === "assistant");
 
             if (!lastAssistant) {
-                pending.resolve({ output: "(sin respuesta del agente)", sessionId });
+                pending.resolve({ output: "⚠️ Sin respuesta del asistente", sessionId });
                 return;
             }
 
@@ -419,9 +466,23 @@ export class PersistentAgentService {
                 .map((p: any) => p.text as string)
                 .join("");
 
-            pending.resolve({ output: text.trim() || "(sin salida)", sessionId });
+            // Diferenciar entre:
+            // - Respuesta vacía genuina (se ejecutó todo pero no escribió nada)
+            // - Error de lectura
+            const trimmed = text.trim();
+            if (!trimmed) {
+                // Verificar si hubo llamadas a herramientas (indica que trabajó)
+                const hasTools = parts.some((p: any) => p.type === "tool-invocation");
+                if (hasTools) {
+                    pending.resolve({ output: "✅ Completado (ejecutó herramientas pero no generó texto)", sessionId });
+                } else {
+                    pending.resolve({ output: "⚠️ Sin salida (ejecución vacía)", sessionId });
+                }
+            } else {
+                pending.resolve({ output: trimmed, sessionId });
+            }
         } catch (err) {
-            pending.resolve({ output: `❌ Failed to read agent response: ${err}`, sessionId });
+            pending.resolve({ output: `❌ Error al leer respuesta: ${err}`, sessionId });
         }
 
         // Once the current prompt is resolved, drain the next item from the queue (if any)
