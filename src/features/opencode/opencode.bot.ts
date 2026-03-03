@@ -913,7 +913,7 @@ export class OpenCodeBot {
 
     private async executeRunPrompt(ctx: Context, agent: PersistentAgent, prompt: string): Promise<void> {
         const statusMsg = await ctx.reply(
-            `🤖 <b>${escapeHtml(agent.name)}</b> procesando…`,
+            `🤖 <b>${escapeHtml(agent.name)}</b> [${escapeHtml(agent.model)}] procesando…`,
             { parse_mode: "HTML" }
         );
         await ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => {});
@@ -1041,7 +1041,7 @@ export class OpenCodeBot {
 
         // Send a placeholder so the user knows the agent is processing
         const statusMsg = await ctx.reply(
-            `⏳ <b>${escapeHtml(agent.name)}</b> procesando…`,
+            `⏳ <b>${escapeHtml(agent.name)}</b> [${escapeHtml(agent.model)}] procesando…`,
             { parse_mode: "HTML" }
         );
         await ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => {});
