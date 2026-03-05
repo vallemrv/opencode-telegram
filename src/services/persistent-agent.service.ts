@@ -377,11 +377,22 @@ export class PersistentAgentService {
                         const errorSessionId: string = props?.sessionID ?? props?.id ?? "";
                         const mySessionId = this.sessionIds.get(agent.id);
                         const errorMessage: string =
-                            props?.error?.message ?? props?.message ?? props?.error ?? "Error desconocido del modelo";
+                            props?.error?.message ?? props?.message ??
+                            (typeof props?.error === "string" ? props.error : null) ??
+                            "Error desconocido del modelo";
 
-                        console.error(`[PersistentAgent] session.error for agent "${agent.name}": ${errorMessage}`);
+                        // Log the full raw event so we can see what opencode is actually sending
+                        console.error(`[PersistentAgent] session.error for agent "${agent.name}": ${errorMessage} | raw: ${JSON.stringify(props)}`);
+                        console.error(`[PersistentAgent] session.error sessionId match: event="${errorSessionId}" mine="${mySessionId}"`);
 
-                        if (errorSessionId && mySessionId && errorSessionId === mySessionId) {
+                        // Resolve pending prompt if the session matches — OR if there is no
+                        // session info in the error event (some opencode versions omit it)
+                        const sessionMatches =
+                            !errorSessionId ||                           // no session in event → assume ours
+                            !mySessionId ||
+                            errorSessionId === mySessionId;
+
+                        if (sessionMatches) {
                             // Stop heartbeat and resolve in-flight prompt with the error
                             const pending = this.pendingPrompts.get(agent.id);
                             if (pending) {
@@ -389,7 +400,7 @@ export class PersistentAgentService {
                                 this.pendingPrompts.delete(agent.id);
                                 pending.resolve({
                                     output: `❌ Error del modelo: ${errorMessage}`,
-                                    sessionId: errorSessionId,
+                                    sessionId: errorSessionId || mySessionId || "",
                                 });
                                 // Drain queue after error so queued prompts are not lost
                                 this.drainQueue(agent).catch(err =>
@@ -682,6 +693,8 @@ export class PersistentAgentService {
         // Register the pending promise BEFORE sending the prompt so the SSE
         // loop cannot race and resolve before we're listening.
         // There is NO hard timeout — the user cancels explicitly with /esc.
+        console.log(`[PersistentAgent] sendPrompt → agent="${agent.name}" session="${sessionId}" text="${userText.slice(0, 80)}${userText.length > 80 ? "…" : ""}"`);
+
         const result = await new Promise<AgentSendResult>((resolve, reject) => {
             this.pendingPrompts.set(agent.id, {
                 sessionId,
@@ -704,14 +717,17 @@ export class PersistentAgentService {
                 if (!res.ok) {
                     this.pendingPrompts.delete(agent.id);
                     this.stopHeartbeat(agent.id);
+                    console.error(`[PersistentAgent] prompt_async HTTP error ${res.status} for agent "${agent.name}"`);
                     resolve({ output: `❌ Failed to send prompt: HTTP ${res.status}`, sessionId });
                 } else {
                     // Prompt accepted — start the heartbeat
+                    console.log(`[PersistentAgent] prompt accepted by opencode for agent "${agent.name}", starting heartbeat`);
                     this.startHeartbeat(agent);
                 }
             }).catch(err => {
                 this.pendingPrompts.delete(agent.id);
                 this.stopHeartbeat(agent.id);
+                console.error(`[PersistentAgent] prompt_async fetch error for agent "${agent.name}":`, err);
                 resolve({ output: `❌ Failed to send prompt to agent: ${err}`, sessionId });
             });
         });

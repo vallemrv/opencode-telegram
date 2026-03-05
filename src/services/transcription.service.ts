@@ -8,6 +8,24 @@ export interface TranscriptionResult {
     error?: string;
 }
 
+/** Ordered list of models to try. First available wins.
+ *  Configurable via GEMINI_MODELS env var (comma-separated).
+ *  Defaults: gemini-2.5-flash, gemini-3-flash-preview, gemini-2.5-flash-lite
+ */
+const DEFAULT_GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash-lite",
+];
+
+function getGeminiModels(): string[] {
+    const env = process.env.GEMINI_MODELS?.trim();
+    if (env) {
+        return env.split(",").map(m => m.trim()).filter(Boolean);
+    }
+    return DEFAULT_GEMINI_MODELS;
+}
+
 export class TranscriptionService {
     private apiKey: string | null = null;
 
@@ -28,51 +46,71 @@ export class TranscriptionService {
             return { success: false, error: "Archivo de audio no encontrado" };
         }
 
-        try {
-            const audioBuffer = fs.readFileSync(audioPath);
-            const base64Audio = audioBuffer.toString("base64");
-            
-            const mimeType = this.getMimeType(audioPath);
-            
-            const response = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${this.apiKey}`,
-                {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        contents: [{
-                            parts: [
-                                { text: "Transcribe el siguiente audio. Responde SOLO con la transcripción, sin comentarios adicionales ni formato." },
-                                {
-                                    inline_data: {
-                                        mime_type: mimeType,
-                                        data: base64Audio
+        const audioBuffer = fs.readFileSync(audioPath);
+        const base64Audio = audioBuffer.toString("base64");
+        const mimeType = this.getMimeType(audioPath);
+
+        let lastError = "Sin modelos disponibles";
+
+        for (const model of getGeminiModels()) {
+            try {
+                console.log(`[Transcription] Trying model ${model}…`);
+                const response = await fetch(
+                    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.apiKey}`,
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            contents: [{
+                                parts: [
+                                    { text: "Transcribe el siguiente audio. Responde SOLO con la transcripción, sin comentarios adicionales ni formato." },
+                                    {
+                                        inline_data: {
+                                            mime_type: mimeType,
+                                            data: base64Audio
+                                        }
                                     }
-                                }
-                            ]
-                        }]
-                    }),
-                    signal: AbortSignal.timeout(120000)
+                                ]
+                            }]
+                        }),
+                        signal: AbortSignal.timeout(120000)
+                    }
+                );
+
+                if (response.status === 503 || response.status === 429) {
+                    const errorText = await response.text();
+                    lastError = `${model}: HTTP ${response.status} (saturado, probando siguiente)`;
+                    console.warn(`[Transcription] ${lastError}`);
+                    continue; // try next model
                 }
-            );
 
-            if (!response.ok) {
-                const errorText = await response.text();
-                return { success: false, error: `Error API Gemini: ${response.status} - ${errorText}` };
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    lastError = `${model}: HTTP ${response.status} - ${errorText}`;
+                    console.warn(`[Transcription] ${lastError}`);
+                    continue;
+                }
+
+                const data: any = await response.json();
+                const transcription = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                if (!transcription) {
+                    lastError = `${model}: respuesta vacía del modelo`;
+                    console.warn(`[Transcription] ${lastError}`);
+                    continue;
+                }
+
+                console.log(`[Transcription] Success with model ${model}`);
+                return { success: true, text: transcription.trim() };
+
+            } catch (error) {
+                lastError = `${model}: ${error}`;
+                console.warn(`[Transcription] ${lastError}`);
+                continue;
             }
-
-            const data: any = await response.json();
-            
-            const transcription = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-            
-            if (!transcription) {
-                return { success: false, error: "No se obtuvo transcripción del modelo" };
-            }
-
-            return { success: true, text: transcription.trim() };
-        } catch (error) {
-            return { success: false, error: `Error de transcripción: ${error}` };
         }
+
+        return { success: false, error: `Error de transcripción: ${lastError}` };
     }
 
     private getMimeType(filePath: string): string {
