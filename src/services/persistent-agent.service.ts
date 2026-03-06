@@ -307,6 +307,38 @@ export class PersistentAgentService {
         this.processes.delete(agentId);
     }
 
+    /**
+     * Park an agent: stop its process (like stopAgent) but mark it as 'stopped'
+     * in the DB so it is not counted against MAX_AGENTS and won't be restarted.
+     * Any in-flight prompt is cancelled first.
+     */
+    parkAgent(agentId: string): void {
+        // Cancel any in-flight prompt
+        const pending = this.pendingPrompts.get(agentId);
+        if (pending) {
+            this.pendingPrompts.delete(agentId);
+            this.stopHeartbeat(agentId);
+            pending.resolve({ output: "⏸️ Agente aparcado por el usuario.", sessionId: pending.sessionId });
+        }
+        // Clear the prompt queue
+        this.promptQueues.delete(agentId);
+        // Stop the process
+        this.stopAgent(agentId);
+        // Mark in DB
+        this.agentDb.setStatus(agentId, "stopped");
+    }
+
+    /**
+     * Unpark a previously stopped agent: start its process and mark it 'running'.
+     */
+    async unparkAgent(agent: PersistentAgent): Promise<{ success: boolean; message: string }> {
+        const result = await this.startAgent(agent);
+        if (result.success) {
+            this.agentDb.setStatus(agent.id, "running");
+        }
+        return result;
+    }
+
     async isServerRunning(port: number): Promise<boolean> {
         try {
             const res = await fetch(`http://localhost:${port}`, {
@@ -842,6 +874,11 @@ export class PersistentAgentService {
     async restoreAll(agents: PersistentAgent[]): Promise<PersistentAgent[]> {
         const failed: PersistentAgent[] = [];
         for (const agent of agents) {
+            // Parked agents are intentionally stopped — skip them
+            if (agent.status === "stopped") {
+                console.log(`[PersistentAgent] Skipping parked agent "${agent.name}" (status=stopped)`);
+                continue;
+            }
             console.log(`[PersistentAgent] Restoring agent "${agent.name}" on port ${agent.port}…`);
             const result = await this.startAgent(agent);
             console.log(`[PersistentAgent] → ${result.message}`);

@@ -17,6 +17,8 @@ export interface PersistentAgent {
     model: string;        // provider/model
     port: number;         // Fixed port for its opencode serve process
     sessionId?: string;   // Long-lived OpenCode session UUID (persisted across restarts)
+    /** 'running' (default) or 'stopped' (parked — process not started, not counted in MAX_AGENTS) */
+    status: "running" | "stopped";
     createdAt: string;
 }
 
@@ -44,12 +46,19 @@ export class AgentDbService {
                 model       TEXT NOT NULL,
                 port        INTEGER NOT NULL UNIQUE,
                 session_id  TEXT,
+                status      TEXT NOT NULL DEFAULT 'running',
                 created_at  DATETIME NOT NULL
             )
         `);
         // Migrate existing databases that don't have the session_id column yet
         try {
             this.db.exec(`ALTER TABLE persistent_agents ADD COLUMN session_id TEXT`);
+        } catch {
+            // Column already exists — ignore
+        }
+        // Migrate existing databases that don't have the status column yet
+        try {
+            this.db.exec(`ALTER TABLE persistent_agents ADD COLUMN status TEXT NOT NULL DEFAULT 'running'`);
         } catch {
             // Column already exists — ignore
         }
@@ -65,15 +74,16 @@ export class AgentDbService {
 
     save(agent: PersistentAgent): void {
         this.db.prepare(`
-            INSERT INTO persistent_agents (id, user_id, name, role, workdir, model, port, session_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO persistent_agents (id, user_id, name, role, workdir, model, port, session_id, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 role = excluded.role,
                 workdir = excluded.workdir,
                 model = excluded.model,
                 port = excluded.port,
-                session_id = excluded.session_id
+                session_id = excluded.session_id,
+                status = excluded.status
         `).run(
             agent.id,
             agent.userId,
@@ -83,6 +93,7 @@ export class AgentDbService {
             agent.model,
             agent.port,
             agent.sessionId ?? null,
+            agent.status ?? "running",
             agent.createdAt,
         );
     }
@@ -136,6 +147,18 @@ export class AgentDbService {
         this.db.prepare('UPDATE persistent_agents SET session_id = NULL WHERE id = ?').run(agentId);
     }
 
+    /** Set the running status of an agent ('running' | 'stopped') */
+    setStatus(agentId: string, status: "running" | "stopped"): void {
+        this.db.prepare('UPDATE persistent_agents SET status = ? WHERE id = ?').run(status, agentId);
+    }
+
+    /** Returns agents that are currently in 'running' status for a user */
+    getRunningByUser(userId: number): PersistentAgent[] {
+        return (this.db.prepare(
+            "SELECT * FROM persistent_agents WHERE user_id = ? AND status = 'running' ORDER BY created_at ASC"
+        ).all(userId) as any[]).map(this.mapRow);
+    }
+
     /** Returns all ports already in use by persistent agents */
     usedPorts(): number[] {
         return (this.db.prepare('SELECT port FROM persistent_agents').all() as any[]).map(r => r.port);
@@ -172,6 +195,7 @@ export class AgentDbService {
             model: row.model,
             port: row.port,
             sessionId: row.session_id ?? undefined,
+            status: (row.status === "stopped" ? "stopped" : "running") as "running" | "stopped",
             createdAt: row.created_at,
         };
     }

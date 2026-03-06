@@ -244,6 +244,8 @@ export class OpenCodeBot {
         bot.callbackQuery(/^agent:delcancel$/,  AccessControlMiddleware.requireAccess, this.handleAgentDeleteCancel.bind(this));
         bot.callbackQuery(/^agent:model:/,    AccessControlMiddleware.requireAccess, this.handleAgentModelSelect.bind(this));
         bot.callbackQuery("agent:new",        AccessControlMiddleware.requireAccess, this.handleAgentNew.bind(this));
+        bot.callbackQuery(/^agent:park:/,     AccessControlMiddleware.requireAccess, this.handleAgentPark.bind(this));
+        bot.callbackQuery(/^agent:unpark:/,   AccessControlMiddleware.requireAccess, this.handleAgentUnpark.bind(this));
 
         bot.callbackQuery(/^run:agent:/,    AccessControlMiddleware.requireAccess, this.handleRunAgentSelected.bind(this));
         bot.callbackQuery(/^run:cancel$/,   AccessControlMiddleware.requireAccess, this.handleRunCancel.bind(this));
@@ -322,7 +324,8 @@ export class OpenCodeBot {
             `1. <code>/new mi-proyecto</code> → wizard → agente listo\n` +
             `2. Escribe tus mensajes directamente\n` +
             `3. <code>/esc</code> para volver a la sesión principal\n\n` +
-            `<b>Límite:</b> ${maxAgents} agentes simultáneos (MAX_AGENTS en .env)`,
+            `<b>Límite:</b> ${maxAgents} agentes activos (MAX_AGENTS en .env)\n` +
+            `Los agentes aparcados (⏹️ en /agents) no cuentan para el límite.`,
             { parse_mode: "HTML" }
         );
     }
@@ -337,11 +340,13 @@ export class OpenCodeBot {
 
         const maxAgents = this.configService.getMaxAgents();
         const existing = this.agentDb.getByUser(userId);
-        if (existing.length >= maxAgents) {
+        // Only running agents count against the limit — stopped/parked ones don't
+        const runningCount = existing.filter(a => a.status === "running").length;
+        if (runningCount >= maxAgents) {
             // Soft warning — do not block
             await ctx.reply(
-                `⚠️ Tienes ${existing.length} agentes (límite recomendado: ${maxAgents}).\n\n` +
-                `Puedes crear uno más, pero considera borrar alguno con /agents si ya no lo usas.`
+                `⚠️ Tienes ${runningCount} agentes activos (límite recomendado: ${maxAgents}).\n\n` +
+                `Puedes crear uno más, o aparcar alguno con ⏹️ en /agents para liberar espacio.`
             );
         }
 
@@ -590,6 +595,7 @@ export class OpenCodeBot {
                 workdir,
                 model: wizard.model,
                 port,
+                status: "running",
                 createdAt: new Date().toISOString(),
             };
             this.agentDb.save(agent);
@@ -678,17 +684,32 @@ export class OpenCodeBot {
         if (!userId) return;
 
         const agents = this.agentDb.getByUser(userId);
+        const runningAgents = agents.filter(a => a.status === "running");
         const activeId = this.persistentAgentService.getActiveAgentId(userId);
         const keyboard = new InlineKeyboard();
 
         for (const agent of agents) {
+            const isStopped = agent.status === "stopped";
             const isActive = agent.id === activeId;
-            const label = isActive ? `✅ ${agent.name}` : agent.name;
-            keyboard
-                .text(label, `agent:activate:${agent.id}`)
-                .text("💬", `run:agent:${agent.id}`)
-                .text("🗑️", `agent:del:${agent.id}`)
-                .row();
+            const label = isStopped
+                ? `⏸️ ${agent.name}`
+                : isActive ? `✅ ${agent.name}` : agent.name;
+
+            if (isStopped) {
+                // Parked agent: show resume button instead of activate/prompt
+                keyboard
+                    .text(label, `agent:activate:${agent.id}`)
+                    .text("▶️", `agent:unpark:${agent.id}`)
+                    .text("🗑️", `agent:del:${agent.id}`)
+                    .row();
+            } else {
+                keyboard
+                    .text(label, `agent:activate:${agent.id}`)
+                    .text("💬", `run:agent:${agent.id}`)
+                    .text("⏹️", `agent:park:${agent.id}`)
+                    .text("🗑️", `agent:del:${agent.id}`)
+                    .row();
+            }
         }
 
         // Always show "➕ Nuevo agente" at the bottom
@@ -700,10 +721,12 @@ export class OpenCodeBot {
                 ? `\n\n⚪ Aún no tienes agentes.`
                 : `\n\n⚪ Ningún agente activo.`;
 
+        const maxAgents = this.configService.getMaxAgents();
         const header = agents.length === 0
             ? `🤖 <b>Tus agentes</b>\n\nNo tienes agentes todavía.`
-            : `🤖 <b>Tus agentes (${agents.length}/${this.configService.getMaxAgents()})</b>\n\n` +
-              `Toca el nombre para activar (sticky), 💬 para prompt puntual, 🗑️ para borrar.`;
+            : `🤖 <b>Tus agentes (${runningAgents.length}/${maxAgents} activos, ${agents.length} total)</b>\n\n` +
+              `Toca el nombre para activar (sticky), 💬 prompt, ⏹️ aparcar, ▶️ reanudar, 🗑️ borrar.\n` +
+              `Los agentes aparcados (⏸️) no cuentan para el límite de ${maxAgents}.`;
 
         await ctx.reply(
             header + activeInfo,
@@ -812,6 +835,64 @@ export class OpenCodeBot {
 
     private async handleAgentDeleteCancel(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
+        await ctx.deleteMessage().catch(() => {});
+        await this.handleAgents(ctx);
+    }
+
+    /** Park (stop) an agent without deleting it — it won't count against MAX_AGENTS */
+    private async handleAgentPark(ctx: Context): Promise<void> {
+        await ctx.answerCallbackQuery();
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const agentId = ctx.callbackQuery!.data.replace("agent:park:", "");
+        const agent = this.agentDb.getById(agentId);
+        if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
+
+        if (agent.status === "stopped") {
+            await ctx.answerCallbackQuery({ text: `⏸️ ${agent.name} ya estaba aparcado.` });
+            return;
+        }
+
+        // Deactivate if it was the active sticky agent
+        if (this.persistentAgentService.getActiveAgentId(userId) === agentId) {
+            this.persistentAgentService.clearActiveAgent(userId);
+        }
+
+        this.persistentAgentService.parkAgent(agentId);
+
+        await ctx.answerCallbackQuery({ text: `⏸️ ${agent.name} aparcado.` });
+        await ctx.deleteMessage().catch(() => {});
+        await this.handleAgents(ctx);
+    }
+
+    /** Unpark (resume) a stopped agent */
+    private async handleAgentUnpark(ctx: Context): Promise<void> {
+        await ctx.answerCallbackQuery();
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const agentId = ctx.callbackQuery!.data.replace("agent:unpark:", "");
+        const agent = this.agentDb.getById(agentId);
+        if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
+
+        if (agent.status === "running") {
+            await ctx.answerCallbackQuery({ text: `▶️ ${agent.name} ya estaba activo.` });
+            return;
+        }
+
+        const statusMsg = await ctx.reply(`▶️ Arrancando <b>${escapeHtml(agent.name)}</b>…`, { parse_mode: "HTML" });
+
+        const result = await this.persistentAgentService.unparkAgent(agent);
+
+        await ctx.api.deleteMessage(statusMsg.chat.id, statusMsg.message_id).catch(() => {});
+
+        if (result.success) {
+            await ctx.reply(`✅ <b>${escapeHtml(agent.name)}</b> reanudado.`, { parse_mode: "HTML" });
+        } else {
+            await ctx.reply(`❌ No se pudo arrancar <b>${escapeHtml(agent.name)}</b>: ${result.message}`, { parse_mode: "HTML" });
+        }
+
         await ctx.deleteMessage().catch(() => {});
         await this.handleAgents(ctx);
     }
@@ -989,6 +1070,16 @@ export class OpenCodeBot {
             this.persistentAgentService.clearActiveAgent(userId);
             this.agentDb.clearLastUsed(userId);
             await ctx.reply("❌ El agente activo ya no existe. Usa /new o /agents.");
+            return;
+        }
+
+        // Guard: parked agents can't receive prompts
+        if (agent.status === "stopped") {
+            await ctx.reply(
+                `⏸️ El agente <b>${escapeHtml(agent.name)}</b> está aparcado.\n\n` +
+                `Reanúdalo con ▶️ en /agents antes de enviarle mensajes.`,
+                { parse_mode: "HTML" }
+            );
             return;
         }
 
