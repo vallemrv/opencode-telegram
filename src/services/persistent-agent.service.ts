@@ -17,7 +17,7 @@
  *   - There is NO hard timeout — the user cancels explicitly with /esc.
  */
 
-import { spawn, ChildProcess } from "child_process";
+import { spawn, ChildProcess, execSync } from "child_process";
 import { access, constants } from "fs/promises";
 import * as path from "path";
 import * as os from "os";
