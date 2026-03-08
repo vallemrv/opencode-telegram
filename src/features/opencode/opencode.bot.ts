@@ -905,9 +905,10 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        const agents = this.agentDb.getByUser(userId);
+        const allAgents = this.agentDb.getByUser(userId);
+        const agents = allAgents.filter(a => a.status !== "stopped");
         if (agents.length === 0) {
-            await ctx.reply("ℹ️ No tienes agentes. Crea uno con /new.");
+            await ctx.reply("ℹ️ No tienes agentes activos. Crea uno con /new o reanuda un agente aparcado con /agents.");
             return;
         }
 
@@ -933,7 +934,8 @@ export class OpenCodeBot {
     private async showRunPicker(ctx: Context, prompt: string): Promise<void> {
         const userId = ctx.from?.id;
         if (!userId) return;
-        const agents = this.agentDb.getByUser(userId);
+        const allAgents = this.agentDb.getByUser(userId);
+        const agents = allAgents.filter(a => a.status !== "stopped");
         const keyboard = new InlineKeyboard();
         for (const agent of agents) {
             keyboard.text(`🤖 ${agent.name}`, `run:agent:${agent.id}`).row();
@@ -955,7 +957,8 @@ export class OpenCodeBot {
         const text = ctx.message?.text?.trim() || "";
         if (!text) return;
 
-        const agents = this.agentDb.getByUser(userId);
+        const allAgents = this.agentDb.getByUser(userId);
+        const agents = allAgents.filter(a => a.status !== "stopped");
         this.runWizard.delete(userId);
 
         if (agents.length === 1) {
