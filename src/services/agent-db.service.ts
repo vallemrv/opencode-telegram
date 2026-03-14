@@ -20,6 +20,8 @@ export interface PersistentAgent {
     /** 'running' (default) or 'stopped' (parked — process not started, not counted in MAX_AGENTS) */
     status: "running" | "stopped";
     createdAt: string;
+    host?: string;        // Host/IP del nodo (default: localhost)
+    isRemote?: boolean;   // Indica si es agente remoto (default: false)
 }
 
 const DB_PATH = path.join(
@@ -47,7 +49,9 @@ export class AgentDbService {
                 port        INTEGER NOT NULL UNIQUE,
                 session_id  TEXT,
                 status      TEXT NOT NULL DEFAULT 'running',
-                created_at  DATETIME NOT NULL
+                created_at  DATETIME NOT NULL,
+                host        TEXT DEFAULT 'localhost',
+                is_remote   INTEGER DEFAULT 0
             )
         `);
         // Migrate existing databases that don't have the session_id column yet
@@ -59,6 +63,18 @@ export class AgentDbService {
         // Migrate existing databases that don't have the status column yet
         try {
             this.db.exec(`ALTER TABLE persistent_agents ADD COLUMN status TEXT NOT NULL DEFAULT 'running'`);
+        } catch {
+            // Column already exists — ignore
+        }
+        // Migrate existing databases that don't have the host column yet
+        try {
+            this.db.exec(`ALTER TABLE persistent_agents ADD COLUMN host TEXT DEFAULT 'localhost'`);
+        } catch {
+            // Column already exists — ignore
+        }
+        // Migrate existing databases that don't have the is_remote column yet
+        try {
+            this.db.exec(`ALTER TABLE persistent_agents ADD COLUMN is_remote INTEGER DEFAULT 0`);
         } catch {
             // Column already exists — ignore
         }
@@ -74,8 +90,8 @@ export class AgentDbService {
 
     save(agent: PersistentAgent): void {
         this.db.prepare(`
-            INSERT INTO persistent_agents (id, user_id, name, role, workdir, model, port, session_id, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO persistent_agents (id, user_id, name, role, workdir, model, port, session_id, status, created_at, host, is_remote)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 role = excluded.role,
@@ -83,7 +99,9 @@ export class AgentDbService {
                 model = excluded.model,
                 port = excluded.port,
                 session_id = excluded.session_id,
-                status = excluded.status
+                status = excluded.status,
+                host = excluded.host,
+                is_remote = excluded.is_remote
         `).run(
             agent.id,
             agent.userId,
@@ -95,6 +113,8 @@ export class AgentDbService {
             agent.sessionId ?? null,
             agent.status ?? "running",
             agent.createdAt,
+            agent.host ?? 'localhost',
+            agent.isRemote ? 1 : 0,
         );
     }
 
@@ -164,6 +184,30 @@ export class AgentDbService {
         return (this.db.prepare('SELECT port FROM persistent_agents').all() as any[]).map(r => r.port);
     }
 
+    /** Returns all agents from a specific host */
+    getByHost(host: string): PersistentAgent[] {
+        return (this.db.prepare('SELECT * FROM persistent_agents WHERE host = ? ORDER BY created_at ASC').all(host) as any[])
+            .map(this.mapRow);
+    }
+
+    /** Returns only remote agents */
+    getRemoteAgents(): PersistentAgent[] {
+        return (this.db.prepare('SELECT * FROM persistent_agents WHERE is_remote = 1 ORDER BY created_at ASC').all() as any[])
+            .map(this.mapRow);
+    }
+
+    /** Save a remote agent discovered from another host */
+    saveRemoteAgent(agent: Omit<PersistentAgent, 'userId'>, host: string): void {
+        // Create a temporary agent with default userId (will be set when added locally)
+        const remoteAgent: PersistentAgent = {
+            ...agent,
+            userId: 0, // Will be updated when user adds this remote agent
+            host,
+            isRemote: true
+        };
+        this.save(remoteAgent);
+    }
+
     /** Persist the last-used agent for a user */
     setLastUsed(userId: number, agentId: string): void {
         this.db.prepare(`
@@ -197,6 +241,8 @@ export class AgentDbService {
             sessionId: row.session_id ?? undefined,
             status: (row.status === "stopped" ? "stopped" : "running") as "running" | "stopped",
             createdAt: row.created_at,
+            host: row.host ?? 'localhost',
+            isRemote: !!row.is_remote,
         };
     }
 }

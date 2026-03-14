@@ -159,6 +159,9 @@ export class OpenCodeBot {
     /** Model selection state: userId → { agentId, modelsCache, providers, currentProvider? } */
     private modelSelection: Map<number, ModelSelectionState> = new Map();
 
+    /** Pending /run state for remote agents: userId → { host, port } */
+    private remoteRunWizard: Map<number, { host: string; port: number }> = new Map();
+
     /** Short-key → model full name for callback buttons */
     private modelIndex: Map<string, string> = new Map();
     private modelIndexCounter = 0;
@@ -221,7 +224,7 @@ export class OpenCodeBot {
         bot.command("start", AccessControlMiddleware.requireAccess, this.handleStart.bind(this));
         bot.command("help",  AccessControlMiddleware.requireAccess, this.handleStart.bind(this));
         bot.command("new",     AccessControlMiddleware.requireAccess, this.handleNew.bind(this));
-        bot.command("agents",  AccessControlMiddleware.requireAccess, this.handleAgents.bind(this));
+        bot.command("agents",  AccessControlMiddleware.requireAccess, (ctx) => this.handleAgentsWithIp(ctx));
         bot.command("run",     AccessControlMiddleware.requireAccess, this.handleRun.bind(this));
         bot.command("models",  AccessControlMiddleware.requireAccess, this.handleModels.bind(this));
         bot.command("esc",     AccessControlMiddleware.requireAccess, this.handleEsc.bind(this));
@@ -246,6 +249,10 @@ export class OpenCodeBot {
         bot.callbackQuery("agent:new",        AccessControlMiddleware.requireAccess, this.handleAgentNew.bind(this));
         bot.callbackQuery(/^agent:park:/,     AccessControlMiddleware.requireAccess, this.handleAgentPark.bind(this));
         bot.callbackQuery(/^agent:unpark:/,   AccessControlMiddleware.requireAccess, this.handleAgentUnpark.bind(this));
+        
+        // Remote agent callbacks
+        bot.callbackQuery(/^remote:select:/,  AccessControlMiddleware.requireAccess, this.handleRemoteAgentSelect.bind(this));
+        bot.callbackQuery(/^remote:run:/,     AccessControlMiddleware.requireAccess, this.handleRemoteRun.bind(this));
 
         bot.callbackQuery(/^run:agent:/,    AccessControlMiddleware.requireAccess, this.handleRunAgentSelected.bind(this));
         bot.callbackQuery(/^run:cancel$/,   AccessControlMiddleware.requireAccess, this.handleRunCancel.bind(this));
@@ -269,6 +276,11 @@ export class OpenCodeBot {
             const userId = ctx.from?.id;
             if (!userId) return;
 
+            // Check for remote run wizard first
+            if (this.remoteRunWizard.has(userId)) {
+                await this.handleRemoteRunPrompt(ctx);
+                return;
+            }
             // /new wizard intercept
             if (this.newWizard.has(userId)) {
                 await this.handleNewWizardText(ctx);
@@ -732,6 +744,79 @@ export class OpenCodeBot {
             header + activeInfo,
             { parse_mode: "HTML", reply_markup: keyboard }
         );
+    }
+
+    /** Handle /agents command with optional IP argument */
+    private async handleAgentsWithIp(ctx: Context): Promise<void> {
+        const args = ctx.message?.text?.split(/\s+/).slice(1) || [];
+        const ip = args[0]?.trim();
+
+        if (ip) {
+            // If IP is provided, discover remote agents
+            await this.handleRemoteAgents(ctx, ip);
+        } else {
+            // Otherwise, show local agents (existing behavior)
+            await this.handleAgents(ctx);
+        }
+    }
+
+    /** Discover and display agents from a remote host */
+    private async handleRemoteAgents(ctx: Context, host: string): Promise<void> {
+        try {
+            // Validate IP format
+            const ipRegex = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9](\.[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])*)$/;
+            if (!ipRegex.test(host)) {
+                await ctx.reply(`❌ Formato de IP/host inválido: ${host}`);
+                return;
+            }
+
+            const discoveryPort = parseInt(process.env.DISCOVERY_PORT || '17000', 10);
+            const url = `http://${host}:${discoveryPort}/discovery`;
+
+            // Fetch agents from remote host
+            const response = await fetch(url, { 
+                signal: AbortSignal.timeout(5000) 
+            });
+
+            if (!response.ok) {
+                await ctx.reply(`❌ No se pudo conectar al nodo remoto: ${host}:${discoveryPort} (HTTP ${response.status})`);
+                return;
+            }
+
+            const data = await response.json() as any;
+            const agents = data.agents || [];
+
+            if (agents.length === 0) {
+                await ctx.reply(`📭 Nodo ${host} no tiene agentes disponibles.`);
+                return;
+            }
+
+            // Prepare keyboard with remote agents
+            const keyboard = new InlineKeyboard();
+            for (const agent of agents) {
+                const projectName = agent.project || 'unknown';
+                const statusEmoji = agent.status === 'running' ? '🟢' : '🔴';
+                
+                // Add buttons for each remote agent
+                keyboard
+                    .text(`${statusEmoji} ${projectName}`, `remote:select:${host}:${agent.port}`)
+                    .text("💬", `remote:run:${host}:${agent.port}`)
+                    .row();
+            }
+
+            await ctx.reply(
+                `📍 Agentes remotos en ${host}:\n\n` +
+                `${agents.length} agente${agents.length !== 1 ? 's' : ''} encontrado${agents.length !== 1 ? 's' : ''}.\n` +
+                `Toca 💬 para usar un agente remoto.`,
+                { 
+                    parse_mode: "HTML", 
+                    reply_markup: keyboard 
+                }
+            );
+        } catch (error: any) {
+            console.error('[OpenCodeBot] Error discovering remote agents:', error);
+            await ctx.reply(`❌ Error al descubrir agentes en ${host}: ${error.message || error}`);
+        }
     }
 
     /** Triggered by the "➕ Nuevo agente" button in /agents — starts the /new wizard inline */
@@ -1970,7 +2055,12 @@ export class OpenCodeBot {
         this.pendingAgentQuestions.delete(shortKey);
 
         if (answerKey === "r") {
-            await this.persistentAgentService.rejectQuestion(pending.port, pending.req.id);
+            const agent = this.agentDb.getById(pending.agentId);
+            if (!agent) {
+                await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {});
+                return;
+            }
+            await this.persistentAgentService.rejectQuestion(agent, pending.req.id);
             await ctx.editMessageText("❌ Rechazado.").catch(() => {});
         } else {
             // answerKey is the numeric index into options
@@ -1978,7 +2068,12 @@ export class OpenCodeBot {
             const firstQ = pending.req.questions?.[0];
             const opt = firstQ?.options?.[idx];
             const label = typeof opt === "string" ? opt : (opt?.label ?? String(opt ?? answerKey));
-            await this.persistentAgentService.replyQuestion(pending.port, pending.req.id, [[label]]);
+            const agent = this.agentDb.getById(pending.agentId);
+            if (!agent) {
+                await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {});
+                return;
+            }
+            await this.persistentAgentService.replyQuestion(agent, pending.req.id, [[label]]);
             await ctx.editMessageText(`✅ Respondido: <b>${escapeHtml(label)}</b>`, { parse_mode: "HTML" }).catch(() => {});
         }
     }
@@ -2120,6 +2215,182 @@ export class OpenCodeBot {
             await MessageUtils.scheduleMessageDeletion(ctx, confirmMsg.message_id, this.configService.getMessageDeleteTimeout());
         } catch (error) {
             await ctx.reply(ErrorUtils.createErrorMessage("guardar archivo", error));
+        }
+    }
+    
+    /** Handle selecting a remote agent */
+    private async handleRemoteAgentSelect(ctx: Context): Promise<void> {
+        await ctx.answerCallbackQuery();
+        // Parse callback data: remote:select:host:port
+        const parts = ctx.callbackQuery!.data.split(':');
+        if (parts.length < 4) {
+            await ctx.editMessageText("❌ Datos inválidos para agente remoto.");
+            return;
+        }
+        
+        const host = parts[2];
+        const port = parseInt(parts[3], 10);
+        
+        await ctx.editMessageText(`📍 Has seleccionado el agente remoto en ${host}:${port}\n\nPuedes usar /run para enviar comandos.`);
+    }
+    
+    /** Handle running a command on a remote agent */
+    private async handleRemoteRun(ctx: Context): Promise<void> {
+        await ctx.answerCallbackQuery();
+        // Parse callback data: remote:run:host:port
+        const parts = ctx.callbackQuery!.data.split(':');
+        if (parts.length < 4) {
+            await ctx.editMessageText("❌ Datos inválidos para agente remoto.");
+            return;
+        }
+        
+        const host = parts[2];
+        const port = parseInt(parts[3], 10);
+        
+        // Store in wizard for the user to provide the prompt
+        const userId = ctx.from?.id;
+        if (!userId) return;
+        
+        this.remoteRunWizard.set(userId, { host, port });
+        
+        await ctx.editMessageText(`💬 Escribe el prompt para el agente remoto ${host}:${port}\n\n/escribe el mensaje o /esc para cancelar.`);
+    }
+    
+    /** Handle prompt text for remote agent */
+    private async handleRemoteRunPrompt(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+        
+        const remoteRunData = this.remoteRunWizard.get(userId);
+        if (!remoteRunData) {
+            await ctx.reply("❌ No hay operación remota en curso.");
+            return;
+        }
+        
+        const { host, port } = remoteRunData;
+        const prompt = ctx.message?.text?.trim() || "";
+        
+        if (!prompt) {
+            await ctx.reply("❌ El prompt no puede estar vacío.");
+            return;
+        }
+        
+        // Remove the wizard entry
+        this.remoteRunWizard.delete(userId);
+        
+        // Show a placeholder message
+        const placeholder = await ctx.reply(`🚀 Enviando a ${host}:${port}...`);
+        
+        try {
+            // Send the prompt to the remote OpenCode server
+            const response = await fetch(`http://${host}:${port}/session`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    title: `remote-${Date.now()}`,
+                    system: "You are a helpful AI assistant.",
+                    model: null,
+                    permission: [
+                        { permission: "command", pattern: "*", action: "allow" },
+                        { permission: "file",    pattern: "*", action: "allow" },
+                        { permission: "network", pattern: "*", action: "allow" },
+                        { permission: "browser", pattern: "*", action: "allow" },
+                    ],
+                }),
+                signal: AbortSignal.timeout(10000),
+            });
+            
+            if (!response.ok) {
+                throw new Error(`Create session failed: ${response.status} ${await response.text()}`);
+            }
+            
+            const sessionData = await response.json();
+            const sessionId = sessionData.id;
+            
+            // Send the prompt to the session
+            const promptResponse = await fetch(`http://${host}:${port}/session/${sessionId}/prompt_async`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    parts: [{ type: "text", text: prompt }],
+                    agent: "build",
+                    model: null,
+                }),
+                signal: AbortSignal.timeout(10000),
+            });
+            
+            if (!promptResponse.ok) {
+                throw new Error(`Send prompt failed: ${promptResponse.status} ${await promptResponse.text()}`);
+            }
+            
+            // Poll for the result
+            let attempts = 0;
+            const maxAttempts = 30; // 30 attempts * 2 seconds = 60 seconds max
+            
+            while (attempts < maxAttempts) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                const sessionStatus = await fetch(`http://${host}:${port}/session/${sessionId}`, {
+                    signal: AbortSignal.timeout(5000),
+                });
+                
+                if (!sessionStatus.ok) {
+                    throw new Error(`Check session failed: ${sessionStatus.status}`);
+                }
+                
+                const sessionInfo = await sessionStatus.json();
+                const isIdle = sessionInfo?.status === "idle" || sessionInfo?.info?.status === "idle";
+                
+                if (isIdle) {
+                    // Get the result
+                    const msgResponse = await fetch(`http://${host}:${port}/session/${sessionId}/message`, {
+                        signal: AbortSignal.timeout(10000),
+                    });
+                    
+                    if (!msgResponse.ok) {
+                        throw new Error(`Get messages failed: ${msgResponse.status} ${await msgResponse.text()}`);
+                    }
+                    
+                    const messages: any[] = await msgResponse.json();
+                    const lastAssistant = [...messages]
+                        .reverse()
+                        .find((m: any) => m.role === "assistant" || m.info?.role === "assistant");
+
+                    let resultText = "✅ Prompt enviado exitosamente.";
+                    if (lastAssistant) {
+                        const parts: any[] = lastAssistant.parts || [];
+                        const text = parts
+                            .filter((p: any) => p.type === "text" && p.text)
+                            .map((p: any) => p.text as string)
+                            .join("");
+                        
+                        if (text.trim()) {
+                            resultText = text.trim();
+                        }
+                    }
+                    
+                    // Update the message with the result
+                    const MAX_LENGTH = 3800;
+                    if (resultText.length <= MAX_LENGTH) {
+                        await ctx.editMessageText(`📍 Resultado de ${host}:${port}\n\n${formatAsHtml(resultText)}`, 
+                            { parse_mode: "HTML" }).catch(() => {});
+                    } else {
+                        // Send as document if too long
+                        const truncated = resultText.substring(0, MAX_LENGTH) + "\n\n...(truncated)";
+                        await ctx.editMessageText(`📍 Resultado de ${host}:${port}\n\n${formatAsHtml(truncated)}`, 
+                            { parse_mode: "HTML" }).catch(() => {});
+                    }
+                    return;
+                }
+                
+                attempts++;
+            }
+            
+            throw new Error("Timeout: La operación no completó dentro del tiempo límite");
+            
+        } catch (error: any) {
+            console.error('[OpenCodeBot] Error sending remote prompt:', error);
+            await ctx.editMessageText(`❌ Error en ${host}:${port}: ${error.message || error}`);
         }
     }
 }

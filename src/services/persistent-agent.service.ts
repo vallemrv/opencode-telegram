@@ -175,7 +175,7 @@ export class PersistentAgentService {
             return { success: true, message: "already running" };
         }
 
-        if (await this.isServerRunning(agent.port)) {
+            if (await this.isServerRunning(agent)) {
             await this.ensureSession(agent);
             this.startSseStream(agent);
             return { success: true, message: "already running (external)" };
@@ -184,10 +184,11 @@ export class PersistentAgentService {
         const cmd = await findOpencodeCmd();
         const workdir = resolveDir(agent.workdir);
 
+        const hostname = process.env.OPENCODE_BIND_HOST || "0.0.0.0";
         const child = spawn(cmd, [
             "serve",
             "--port", String(agent.port),
-            "--hostname", "localhost",
+            "--hostname", hostname,
         ], {
             cwd: workdir,
             detached: false,
@@ -223,7 +224,7 @@ export class PersistentAgentService {
         // Wait up to 20s for it to be ready
         const deadline = Date.now() + 20000;
         while (Date.now() < deadline) {
-            if (await this.isServerRunning(agent.port)) {
+        if (await this.isServerRunning(agent)) {
                 await this.ensureSession(agent);
                 this.startSseStream(agent);
                 return { success: true, message: `opencode serve ready on :${agent.port}` };
@@ -263,7 +264,8 @@ export class PersistentAgentService {
 
     /** Create a new OpenCode session on the agent's server. Returns the new session ID. */
     private async createSession(agent: PersistentAgent): Promise<string> {
-        const baseUrl = `http://localhost:${agent.port}`;
+        const host = agent.host || 'localhost';
+        const baseUrl = `http://${host}:${agent.port}`;
 
         let modelConfig: { providerID: string; modelID: string } | undefined;
         if (agent.model) {
@@ -339,9 +341,22 @@ export class PersistentAgentService {
         return result;
     }
 
-    async isServerRunning(port: number): Promise<boolean> {
+    async isServerRunning(agentOrPort: PersistentAgent | number): Promise<boolean> {
+        let host: string, port: number;
+        
+        if (typeof agentOrPort === 'number') {
+            // Legacy call with just port
+            host = 'localhost';
+            port = agentOrPort;
+        } else {
+            // New call with agent object
+            const agent = agentOrPort;
+            host = agent.host || 'localhost';
+            port = agent.port;
+        }
+        
         try {
-            const res = await fetch(`http://localhost:${port}`, {
+            const res = await fetch(`http://${host}:${port}`, {
                 method: "HEAD",
                 signal: AbortSignal.timeout(3000),
             });
@@ -378,7 +393,8 @@ export class PersistentAgentService {
     }
 
     private async runSseLoop(agent: PersistentAgent, abort: AbortController): Promise<void> {
-        const baseUrl = `http://localhost:${agent.port}`;
+        const host = agent.host || 'localhost';
+        const baseUrl = `http://${host}:${agent.port}`;
         const client = createOpencodeClient({ baseUrl });
         let retryDelay = 3000;
 
@@ -484,8 +500,9 @@ export class PersistentAgentService {
         this.pendingPrompts.delete(agent.id);
 
         try {
+            const host = agent.host || 'localhost';
             const msgRes = await fetch(
-                `http://localhost:${agent.port}/session/${sessionId}/message`,
+                `http://${host}:${agent.port}/session/${sessionId}/message`,
                 { signal: AbortSignal.timeout(10000) }
             );
             if (!msgRes.ok) {
@@ -540,8 +557,9 @@ export class PersistentAgentService {
         if (!this.onQuestion) return;
 
         try {
+            const host = agent.host || 'localhost';
             const workdir = resolveDir(agent.workdir);
-            const url = `http://localhost:${agent.port}/question?directory=${encodeURIComponent(workdir)}`;
+            const url = `http://${host}:${agent.port}/question?directory=${encodeURIComponent(workdir)}`;
             const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
             if (!res.ok) return;
 
@@ -573,8 +591,9 @@ export class PersistentAgentService {
         if (!sessionId) return;
 
         try {
+            const host = agent.host || 'localhost';
             const res = await fetch(
-                `http://localhost:${agent.port}/session/${sessionId}`,
+                `http://${host}:${agent.port}/session/${sessionId}`,
                 { signal: AbortSignal.timeout(5000) }
             );
             if (!res.ok) return;
@@ -629,7 +648,8 @@ export class PersistentAgentService {
         let filesModified = 0;
 
         try {
-            const baseUrl = `http://localhost:${agent.port}`;
+        const host = agent.host || 'localhost';
+        const baseUrl = `http://${host}:${agent.port}`;
             const msgRes = await fetch(`${baseUrl}/session/${pending.sessionId}/message`, {
                 signal: AbortSignal.timeout(5000),
             });
@@ -667,8 +687,21 @@ export class PersistentAgentService {
 
     // ─── Reply to a question ──────────────────────────────────────────────────
 
-    async replyQuestion(port: number, requestId: string, answers: string[][]): Promise<void> {
-        await fetch(`http://localhost:${port}/question/${requestId}/reply`, {
+    async replyQuestion(agentOrPort: PersistentAgent | number, requestId: string, answers: string[][]): Promise<void> {
+        let host: string, port: number;
+        
+        if (typeof agentOrPort === 'number') {
+            // Legacy call with just port
+            host = 'localhost';
+            port = agentOrPort;
+        } else {
+            // New call with agent object
+            const agent = agentOrPort;
+            host = agent.host || 'localhost';
+            port = agent.port;
+        }
+        
+        await fetch(`http://${host}:${port}/question/${requestId}/reply`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ answers }),
@@ -676,8 +709,21 @@ export class PersistentAgentService {
         });
     }
 
-    async rejectQuestion(port: number, requestId: string): Promise<void> {
-        await fetch(`http://localhost:${port}/question/${requestId}/reject`, {
+    async rejectQuestion(agentOrPort: PersistentAgent | number, requestId: string): Promise<void> {
+        let host: string, port: number;
+        
+        if (typeof agentOrPort === 'number') {
+            // Legacy call with just port
+            host = 'localhost';
+            port = agentOrPort;
+        } else {
+            // New call with agent object
+            const agent = agentOrPort;
+            host = agent.host || 'localhost';
+            port = agent.port;
+        }
+        
+        await fetch(`http://${host}:${port}/question/${requestId}/reject`, {
             method: "POST",
             signal: AbortSignal.timeout(10000),
         });
@@ -694,10 +740,11 @@ export class PersistentAgentService {
      * safeguard in case session.idle never arrives.
      */
     async sendPrompt(agent: PersistentAgent, userText: string): Promise<AgentSendResult> {
-        const baseUrl = `http://localhost:${agent.port}`;
+        const host = agent.host || 'localhost';
+        const baseUrl = `http://${host}:${agent.port}`;
 
         // Ensure the server is running
-        const running = await this.isServerRunning(agent.port);
+        const running = await this.isServerRunning(agent);
         if (!running) {
             const started = await this.startAgent(agent);
             if (!started.success) {
@@ -861,7 +908,7 @@ export class PersistentAgentService {
      * Does NOT set it as active — caller decides.
      */
     async createNewSession(agent: PersistentAgent): Promise<string> {
-        const running = await this.isServerRunning(agent.port);
+        const running = await this.isServerRunning(agent);
         if (!running) {
             const started = await this.startAgent(agent);
             if (!started.success) throw new Error(`Agent server not running: ${started.message}`);
