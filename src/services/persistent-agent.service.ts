@@ -35,6 +35,8 @@ export interface QueuedPrompt {
     prompt: string;
     /** Called with the result when the queued prompt finishes executing */
     onResult: (result: AgentSendResult) => Promise<void>;
+    /** Called when the queued prompt starts executing (before sendPrompt) */
+    onDequeue?: () => Promise<void>;
 }
 
 /** Called by OpenCodeBot when the agent has a pending question for the user */
@@ -862,6 +864,13 @@ export class PersistentAgentService {
 
         const next = q.shift()!;
         this.promptQueues.set(agent.id, q);
+
+        // Notify that this queued prompt is now being processed
+        if (next.onDequeue) {
+            await next.onDequeue().catch(err =>
+                console.error(`[PersistentAgent] onDequeue callback error for "${agent.name}":`, err)
+            );
+        }
 
         // Execute it as a normal sendPrompt, then fire the callback
         const result = await this.sendPrompt(agent, next.prompt);

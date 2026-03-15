@@ -182,6 +182,23 @@ export class OpenCodeBot {
     /** Heartbeat message per agent: { chatId, msgId } — edited each tick, deleted when prompt resolves */
     private heartbeatMessages: Map<string, { chatId: number; msgId: number }> = new Map();
 
+    /** Queued prompt messages per agent: { chatId, msgId } — updated when dequeued to "processing" */
+    private queuedMessages: Map<string, Array<{ chatId: number; msgId: number }>> = new Map();
+
+    private addQueuedMessage(agentId: string, msg: { chatId: number; msgId: number }): void {
+        const arr = this.queuedMessages.get(agentId) ?? [];
+        arr.push(msg);
+        this.queuedMessages.set(agentId, arr);
+    }
+
+    private popQueuedMessage(agentId: string): { chatId: number; msgId: number } | null {
+        const arr = this.queuedMessages.get(agentId);
+        if (!arr || arr.length === 0) return null;
+        const msg = arr.shift()!;
+        this.queuedMessages.set(agentId, arr);
+        return msg;
+    }
+
     /**
      * Short-key → { agentId, sessionId } index for session keyboard buttons.
      * Telegram limits callback_data to 64 bytes; UUIDs alone exceed that limit,
@@ -1204,17 +1221,41 @@ export class OpenCodeBot {
     private async sendPromptToAgent(ctx: Context, agent: PersistentAgent, prompt: string): Promise<void> {
         // If the agent is already processing a prompt, enqueue and notify the user
         if (this.persistentAgentService.isBusy(agent.id)) {
-            this.persistentAgentService.enqueue(agent.id, {
-                prompt,
-                onResult: async (result) => {
-                    await this.sendAgentResult(ctx.chat!.id, agent, result);
-                },
-            });
-            const qLen = this.persistentAgentService.queueLength(agent.id);
-            await ctx.reply(
-                `📥 <b>${escapeHtml(agent.name)}</b> está ocupado — prompt en cola (${qLen} pendiente${qLen !== 1 ? "s" : ""}).`,
+            const statusMsg = await ctx.reply(
+                `📥 <b>${escapeHtml(agent.name)}</b> está ocupado — tu mensaje está en cola.`,
                 { parse_mode: "HTML" }
             );
+            this.addQueuedMessage(agent.id, { chatId: ctx.chat!.id, msgId: statusMsg.message_id });
+            const qLen = this.persistentAgentService.queueLength(agent.id);
+            const chatId = ctx.chat!.id;
+            this.persistentAgentService.enqueue(agent.id, {
+                prompt,
+                onDequeue: async () => {
+                    const queued = this.popQueuedMessage(agent.id);
+                    if (queued && this.bot) {
+                        await this.bot.api.editMessageText(
+                            queued.chatId, queued.msgId,
+                            `⏳ <b>${escapeHtml(agent.name)}</b> [${escapeHtml(agent.model)}] procesando…`,
+                            { parse_mode: "HTML" }
+                        ).catch(() => {});
+                        this.heartbeatMessages.set(agent.id, { chatId: queued.chatId, msgId: queued.msgId });
+                        await this.bot.api.sendChatAction(queued.chatId, "typing").catch(() => {});
+                    }
+                },
+                onResult: async (result) => {
+                    const hb = this.heartbeatMessages.get(agent.id);
+                    this.heartbeatMessages.delete(agent.id);
+                    if (hb) {
+                        await this.editOrSendResult(hb.chatId, hb.msgId, agent, result);
+                    } else {
+                        await this.sendAgentResult(chatId, agent, result);
+                    }
+                },
+            });
+            await ctx.editMessageText(
+                `📥 <b>${escapeHtml(agent.name)}</b> está ocupado — prompt en cola (${qLen} pendiente${qLen !== 1 ? "s" : ""}).`,
+                { parse_mode: "HTML" }
+            ).catch(() => {});
             return;
         }
 
