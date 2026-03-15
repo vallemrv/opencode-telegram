@@ -3,10 +3,11 @@
  * 
  * Provides an endpoint to discover OpenCode agents running on this node.
  * Used for multi-node support in opencode-telegram.
+ * Uses native http module to avoid packaging issues with esbuild.
  */
 
-import express from 'express';
-import cors from 'cors';
+import http from 'http';
+import url from 'url';
 import { AgentDbService, PersistentAgent } from './agent-db.service.js';
 
 interface DiscoveryResponse {
@@ -20,57 +21,75 @@ interface DiscoveryResponse {
 }
 
 export class DiscoveryServerService {
-  private app: express.Application;
-  private server: any;
+  private server: http.Server;
   private port: number;
 
   constructor(private agentDb: AgentDbService) {
-    this.app = express();
     this.port = parseInt(process.env.DISCOVERY_PORT || '17000', 10);
     
-    // Enable CORS for cross-origin requests
-    this.app.use(cors());
-    
-    // Parse JSON bodies
-    this.app.use(express.json());
-    
-    // Health check endpoint
-    this.app.get('/', (req, res) => {
-      res.json({ 
-        status: 'ok', 
-        message: 'OpenCode Discovery Server',
-        port: this.port,
-        timestamp: new Date().toISOString()
-      });
-    });
-
-    // Discovery endpoint - returns all agents running on this node
-    this.app.get('/discovery', (req, res) => {
-      try {
-        // Get all agents managed by this node
-        const allAgents = this.agentDb.getAll();
-        
-        // Filter to only agents hosted on localhost (this node)
-        const localAgents = allAgents.filter(agent => 
-          !agent.isRemote && (agent.host === 'localhost' || agent.host === '127.0.0.1' || !agent.host)
-        );
-        
-        const response: DiscoveryResponse = {
-          agents: localAgents.map(agent => ({
-            port: agent.port,
-            workdir: agent.workdir,
-            project: this.extractProjectName(agent.workdir),
-            status: agent.status,
-            sessionId: agent.sessionId
-          }))
-        };
-        
-        res.json(response);
-      } catch (error) {
-        console.error('[DiscoveryServer] Error in /discovery endpoint:', error);
-        res.status(500).json({ error: 'Internal server error' });
+    this.server = http.createServer((req, res) => {
+      const parsedUrl = url.parse(req.url!, true);
+      const pathname = parsedUrl.pathname;
+      
+      // Enable CORS
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      
+      if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+      
+      if (pathname === '/' && req.method === 'GET') {
+        this.handleHealthCheck(req, res);
+      } else if (pathname === '/discovery' && req.method === 'GET') {
+        this.handleDiscovery(req, res);
+      } else {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not found' }));
       }
     });
+  }
+
+  private handleHealthCheck(req: http.IncomingMessage, res: http.ServerResponse): void {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ 
+      status: 'ok', 
+      message: 'OpenCode Discovery Server',
+      port: this.port,
+      timestamp: new Date().toISOString()
+    }));
+  }
+
+  private handleDiscovery(req: http.IncomingMessage, res: http.ServerResponse): void {
+    try {
+      // Get all agents managed by this node
+      const allAgents = this.agentDb.getAll();
+      
+      // Filter to only agents hosted on localhost (this node)
+      const localAgents = allAgents.filter(agent => 
+        !agent.isRemote && (agent.host === 'localhost' || agent.host === '127.0.0.1' || !agent.host)
+      );
+      
+      const response: DiscoveryResponse = {
+        agents: localAgents.map(agent => ({
+          port: agent.port,
+          workdir: agent.workdir,
+          project: this.extractProjectName(agent.workdir),
+          status: agent.status,
+          sessionId: agent.sessionId
+        }))
+      };
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(response));
+    } catch (error) {
+      console.error('[DiscoveryServer] Error in /discovery endpoint:', error);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Internal server error' }));
+    }
   }
 
   private extractProjectName(workdir: string): string {
@@ -81,7 +100,7 @@ export class DiscoveryServerService {
 
   start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.server = this.app.listen(this.port, '0.0.0.0', () => {
+      this.server.listen(this.port, '0.0.0.0', () => {
         console.log(`[DiscoveryServer] Discovery server running on port ${this.port}`);
         resolve();
       });
@@ -97,14 +116,10 @@ export class DiscoveryServerService {
 
   stop(): Promise<void> {
     return new Promise((resolve) => {
-      if (this.server) {
-        this.server.close(() => {
-          console.log('[DiscoveryServer] Discovery server stopped');
-          resolve();
-        });
-      } else {
+      this.server.close(() => {
+        console.log('[DiscoveryServer] Discovery server stopped');
         resolve();
-      }
+      });
     });
   }
 }
