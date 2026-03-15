@@ -4,7 +4,6 @@ import { AgentDbService } from './services/agent-db.service.js';
 import { PersistentAgentService } from './services/persistent-agent.service.js';
 import { OpenCodeBot } from './features/opencode/opencode.bot.js';
 import { AccessControlMiddleware } from './middleware/access-control.middleware.js';
-import { DiscoveryServerService } from './services/discovery-server.service.js';
 import dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -41,7 +40,6 @@ const bot = new Bot(botToken);
 // Initialize services
 const agentDb = new AgentDbService();
 const persistentAgentService = new PersistentAgentService(agentDb);
-const discoveryServer = new DiscoveryServerService(agentDb);
 
 // Set global error handler to prevent crashes
 bot.catch((err) => {
@@ -126,10 +124,6 @@ async function startBot() {
             }
         } catch { /* non-fatal */ }
 
-        // Start the discovery server
-        await discoveryServer.start();
-        console.log('[TelegramCoder] ✅ Discovery server started successfully');
-        
         // Start the bot
         await bot.start();
         console.log('[TelegramCoder] ✅ Bot started successfully');
@@ -152,7 +146,6 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
     try {
         await bot.stop();
-        await discoveryServer.stop();
         console.log('[TelegramCoder] ✅ Shutdown complete');
         process.exit(0);
     } catch (error) {
