@@ -182,22 +182,12 @@ export class OpenCodeBot {
     /** Heartbeat message per agent: { chatId, msgId } — edited each tick, deleted when prompt resolves */
     private heartbeatMessages: Map<string, { chatId: number; msgId: number }> = new Map();
 
-    /** Queued prompt messages per agent: { chatId, msgId } — updated when dequeued to "processing" */
-    private queuedMessages: Map<string, Array<{ chatId: number; msgId: number }>> = new Map();
-
-    private addQueuedMessage(agentId: string, msg: { chatId: number; msgId: number }): void {
-        const arr = this.queuedMessages.get(agentId) ?? [];
-        arr.push(msg);
-        this.queuedMessages.set(agentId, arr);
-    }
-
-    private popQueuedMessage(agentId: string): { chatId: number; msgId: number } | null {
-        const arr = this.queuedMessages.get(agentId);
-        if (!arr || arr.length === 0) return null;
-        const msg = arr.shift()!;
-        this.queuedMessages.set(agentId, arr);
-        return msg;
-    }
+    /**
+     * Single "en cola" status message per agent.
+     * There is only ONE queue-status bubble at a time; it gets deleted and recreated
+     * each time the count changes (new enqueue or dequeue).
+     */
+    private queueStatusMessage: Map<string, { chatId: number; msgId: number }> = new Map();
 
     /**
      * Short-key → { agentId, sessionId } index for session keyboard buttons.
@@ -1221,26 +1211,51 @@ export class OpenCodeBot {
     private async sendPromptToAgent(ctx: Context, agent: PersistentAgent, prompt: string): Promise<void> {
         // If the agent is already processing a prompt, enqueue and notify the user
         if (this.persistentAgentService.isBusy(agent.id)) {
-            const statusMsg = await ctx.reply(
-                `📥 <b>${escapeHtml(agent.name)}</b> está ocupado — tu mensaje está en cola.`,
-                { parse_mode: "HTML" }
-            );
-            this.addQueuedMessage(agent.id, { chatId: ctx.chat!.id, msgId: statusMsg.message_id });
-            const qLen = this.persistentAgentService.queueLength(agent.id);
             const chatId = ctx.chat!.id;
+
+            // Delete the previous queue-status message (if any) and send a fresh one
+            const prevQueueMsg = this.queueStatusMessage.get(agent.id);
+            if (prevQueueMsg && this.bot) {
+                await this.bot.api.deleteMessage(prevQueueMsg.chatId, prevQueueMsg.msgId).catch(() => {});
+            }
+
+            // Enqueue the prompt BEFORE sending the status message so queueLength is accurate
             this.persistentAgentService.enqueue(agent.id, {
                 prompt,
                 onDequeue: async () => {
-                    const queued = this.popQueuedMessage(agent.id);
-                    if (queued && this.bot) {
-                        await this.bot.api.editMessageText(
-                            queued.chatId, queued.msgId,
-                            `⏳ <b>${escapeHtml(agent.name)}</b> [${escapeHtml(agent.model)}] procesando…`,
-                            { parse_mode: "HTML" }
-                        ).catch(() => {});
-                        this.heartbeatMessages.set(agent.id, { chatId: queued.chatId, msgId: queued.msgId });
-                        await this.bot.api.sendChatAction(queued.chatId, "typing").catch(() => {});
+                    if (!this.bot) return;
+
+                    // Delete the shared queue-status bubble
+                    const queueMsg = this.queueStatusMessage.get(agent.id);
+                    if (queueMsg) {
+                        await this.bot.api.deleteMessage(queueMsg.chatId, queueMsg.msgId).catch(() => {});
+                        this.queueStatusMessage.delete(agent.id);
                     }
+
+                    // Send a fresh "procesando" message for this item — becomes the heartbeat anchor
+                    const processingMsg = await this.bot.api.sendMessage(
+                        chatId,
+                        `⏳ <b>${escapeHtml(agent.name)}</b> [${escapeHtml(agent.model)}] procesando…`,
+                        { parse_mode: "HTML" }
+                    ).catch(() => null);
+                    if (processingMsg) {
+                        this.heartbeatMessages.set(agent.id, { chatId, msgId: processingMsg.message_id });
+                    }
+
+                    // If there are still items waiting, show an updated queue-status bubble
+                    const remaining = this.persistentAgentService.queueLength(agent.id);
+                    if (remaining > 0) {
+                        const newQueueMsg = await this.bot.api.sendMessage(
+                            chatId,
+                            `📥 <b>${escapeHtml(agent.name)}</b> — ${remaining} mensaje${remaining !== 1 ? "s" : ""} en cola`,
+                            { parse_mode: "HTML" }
+                        ).catch(() => null);
+                        if (newQueueMsg) {
+                            this.queueStatusMessage.set(agent.id, { chatId, msgId: newQueueMsg.message_id });
+                        }
+                    }
+
+                    await this.bot.api.sendChatAction(chatId, "typing").catch(() => {});
                 },
                 onResult: async (result) => {
                     const hb = this.heartbeatMessages.get(agent.id);
@@ -1252,10 +1267,16 @@ export class OpenCodeBot {
                     }
                 },
             });
-            await ctx.editMessageText(
-                `📥 <b>${escapeHtml(agent.name)}</b> está ocupado — prompt en cola (${qLen} pendiente${qLen !== 1 ? "s" : ""}).`,
+
+            // Now the queue has the item — read the updated count
+            const qLen = this.persistentAgentService.queueLength(agent.id);
+            const statusMsg = await ctx.reply(
+                `📥 <b>${escapeHtml(agent.name)}</b> — ${qLen} mensaje${qLen !== 1 ? "s" : ""} en cola`,
                 { parse_mode: "HTML" }
-            ).catch(() => {});
+            ).catch(() => null);
+            if (statusMsg) {
+                this.queueStatusMessage.set(agent.id, { chatId, msgId: statusMsg.message_id });
+            }
             return;
         }
 

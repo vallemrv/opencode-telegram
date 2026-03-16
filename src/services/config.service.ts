@@ -69,7 +69,7 @@ export class ConfigService {
         this.giteaToken = process.env.GITEA_TOKEN || '';
 
         // Load agent configuration
-        this.maxAgents = parseInt(process.env.MAX_AGENTS || '5', 10);
+        this.maxAgents = parseInt(process.env.MAX_AGENTS || '10', 10);
 
         // Load system environment
         this.homeDirectory = process.env.HOME || '/tmp';

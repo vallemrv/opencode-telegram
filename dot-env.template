@@ -51,7 +51,7 @@ BACKGROUND_MODEL=github-copilot/claude-sonnet-4.6
 BACKGROUND_WORKDIR=
 
 # Maximum number of simultaneous agents (soft limit — bot warns but does not block)
-MAX_AGENTS=5
+MAX_AGENTS=10
 
 # Auto-delete timeout for confirmation messages in milliseconds (0 = disable)
 MESSAGE_DELETE_TIMEOUT=10000
