@@ -43,10 +43,11 @@ type WizardStep = "name" | "git" | "confirm";
 interface NewAgentWizard {
     step: WizardStep;
     name?: string;
-    workdir?: string;    // resolved absolute path
+    workdir?: string;    // resolved absolute path (local) or user-supplied path (remote)
     gitSource?: "gitea" | "github" | "none";
     repoName?: string;
     model: string;       // always the default — user changes it with /models later
+    remoteHost?: string; // set when the wizard runs in remote context
 }
 
 interface ModelSelectionState {
@@ -165,6 +166,18 @@ export class OpenCodeBot {
     private remoteAgentIndex: Map<string, { host: string; port: number; project: string; workdir: string; sessionId?: string; model?: string }> = new Map();
     private remoteAgentIndexCounter = 0;
 
+    /**
+     * Remote context per user (in-memory only, resets on bot restart).
+     * When set, ALL commands operate on that remote node instead of localhost.
+     * null / undefined = local context (default).
+     */
+    private remoteContext: Map<number, string> = new Map();
+
+    /** Returns the remote host for the user, or null if local context. */
+    private getContextHost(userId: number): string | null {
+        return this.remoteContext.get(userId) ?? null;
+    }
+
     /** Short-key → model full name for callback buttons */
     private modelIndex: Map<string, string> = new Map();
     private modelIndexCounter = 0;
@@ -245,6 +258,8 @@ export class OpenCodeBot {
         bot.command("delete",  AccessControlMiddleware.requireAccess, this.handleDelete.bind(this));
         bot.command("deleteall", AccessControlMiddleware.requireAccess, this.handleDeleteAll.bind(this));
         bot.command("restart", AccessControlMiddleware.requireAccess, this.handleRestart.bind(this));
+        bot.command("remoto",  AccessControlMiddleware.requireAccess, this.handleRemoto.bind(this));
+        bot.command("local",   AccessControlMiddleware.requireAccess, this.handleLocal.bind(this));
 
         // ─── Callbacks ───────────────────────────────────────────────────────
         bot.callbackQuery(/^new:source:/,   AccessControlMiddleware.requireAccess, this.handleNewSource.bind(this));
@@ -317,12 +332,17 @@ export class OpenCodeBot {
     // ─────────────────────────────────────────────────────────────────────────
 
     private async handleStart(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
         const isGitea  = !!process.env.GITEA_URL && !!process.env.GITEA_TOKEN;
         const isGithub = !!process.env.GITHUB_TOKEN;
         const maxAgents = this.configService.getMaxAgents();
+        const remoteHost = userId ? this.getContextHost(userId) : null;
+        const contextLine = remoteHost
+            ? `\n📡 <b>Contexto: remoto</b> → <code>${escapeHtml(remoteHost)}</code> (usa /local para volver)\n`
+            : `\n🏠 <b>Contexto: local</b>\n`;
 
         await ctx.reply(
-            `<b>TelegramCoder</b>\n\n` +
+            `<b>TelegramCoder</b>${contextLine}\n` +
             `<b>Comandos:</b>\n` +
             `/new — Crear agente (${isGitea ? "Gitea ✅" : "Gitea ❌"} / ${isGithub ? "GitHub ✅" : "GitHub ❌"} / local)\n` +
             `/agents — Ver y gestionar tus agentes\n` +
@@ -335,7 +355,9 @@ export class OpenCodeBot {
             `/esc — Cancelar / desactivar agente / abortar\n` +
             `/undo — Revertir último cambio\n` +
             `/redo — Restaurar cambio revertido\n` +
-            `/restart — Reiniciar bot y servidores\n\n` +
+            `/restart — Reiniciar bot y servidores\n` +
+            `/remoto &lt;ip&gt; — Cambiar contexto a nodo remoto\n` +
+            `/local — Volver a contexto local\n\n` +
             `<b>Flujo:</b>\n` +
             `1. <code>/new mi-proyecto</code> → wizard → agente listo\n` +
             `2. Escribe tus mensajes directamente\n` +
@@ -354,6 +376,7 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
 
+        const remoteHost = this.getContextHost(userId);
         const maxAgents = this.configService.getMaxAgents();
         const existing = this.agentDb.getByUser(userId);
         // Only running agents count against the limit — stopped/parked ones don't
@@ -369,18 +392,28 @@ export class OpenCodeBot {
         const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "github-copilot/claude-sonnet-4.6";
         const inlineName = ctx.message?.text?.replace(/^\/new\s*/i, "").trim() || "";
 
+        const contextLabel = remoteHost
+            ? `\n📡 <i>Contexto: remoto (<code>${escapeHtml(remoteHost)}</code>)</i>`
+            : "";
+
         if (inlineName) {
             // Name provided inline → resolve path and go straight to git step
-            const wizard: NewAgentWizard = { step: "git", name: inlineName, model: defaultModel };
-            wizard.workdir = this.resolveProjectPath(inlineName);
+            const wizard: NewAgentWizard = {
+                step: "git",
+                name: inlineName,
+                model: defaultModel,
+                remoteHost: remoteHost ?? undefined,
+            };
+            wizard.workdir = remoteHost ? inlineName : this.resolveProjectPath(inlineName);
             this.newWizard.set(userId, wizard);
             await this.sendGitPicker(ctx, wizard);
         } else {
-            this.newWizard.set(userId, { step: "name", model: defaultModel });
+            this.newWizard.set(userId, { step: "name", model: defaultModel, remoteHost: remoteHost ?? undefined });
+            const dirHint = remoteHost
+                ? `<i>· <code>mi-proyecto</code> → workdir en el nodo remoto\n· <code>/ruta/absoluta</code> → ruta en el nodo remoto</i>`
+                : `<i>· <code>mi-proyecto</code> → crea ${escapeHtml(workspaceDir())}/mi-proyecto\n· <code>/ruta/absoluta</code> → usa esa ruta directamente</i>`;
             await ctx.reply(
-                `🆕 <b>Nuevo agente</b>\n\nEscribe el nombre o ruta del proyecto:\n` +
-                `<i>· <code>mi-proyecto</code> → crea ${escapeHtml(workspaceDir())}/mi-proyecto\n` +
-                `· <code>/ruta/absoluta</code> → usa esa ruta directamente</i>`,
+                `🆕 <b>Nuevo agente</b>${contextLabel}\n\nEscribe el nombre o ruta del proyecto:\n${dirHint}`,
                 { parse_mode: "HTML" }
             );
         }
@@ -463,7 +496,8 @@ export class OpenCodeBot {
             case "name": {
                 if (!text) { await ctx.reply("❌ Nombre requerido."); return; }
                 wizard.name = text;
-                wizard.workdir = this.resolveProjectPath(text);
+                // Remote context: keep workdir as-is (path on the remote machine, not local)
+                wizard.workdir = wizard.remoteHost ? text : this.resolveProjectPath(text);
                 wizard.step = "git";
                 await this.sendGitPicker(ctx, wizard);
                 break;
@@ -523,6 +557,83 @@ export class OpenCodeBot {
         const edit = (text: string) =>
             ctx.api.editMessageText(chatId, msgId, text, { parse_mode: "HTML" }).catch(() => {});
 
+        // ── Remote context: agent lives on the remote node ──────────────────
+        if (wizard.remoteHost) {
+            const host = wizard.remoteHost;
+            try {
+                const workdir = wizard.workdir || wizard.name;
+
+                // Ask the remote node to pick a port by checking its discovery endpoint
+                const discoveryPort = parseInt(process.env.DISCOVERY_PORT || '17000', 10);
+                const discRes = await fetch(`http://${host}:${discoveryPort}/discovery`, {
+                    signal: AbortSignal.timeout(5000),
+                });
+                if (!discRes.ok) throw new Error(`Discovery endpoint HTTP ${discRes.status}`);
+                const discData = await discRes.json() as any;
+                const usedRemotePorts: number[] = (discData.agents || []).map((a: any) => a.port);
+                // Also avoid ports already in our local DB (remote agents we know about)
+                const usedLocalPorts = this.agentDb.usedPorts();
+                const port = pickPort([...new Set([...usedRemotePorts, ...usedLocalPorts])]);
+
+                // Ask the remote opencode server to start a new serve instance
+                // We do this by saving the agent locally and calling startAgent, which
+                // will detect the server is not running and... wait, remote servers need
+                // to be spawned on the remote machine. We instead send a request to the
+                // remote discovery server to spawn it.
+                await edit(`⏳ Solicitando al nodo remoto que arranque el servidor en puerto <code>${port}</code>...`);
+
+                const spawnRes = await fetch(`http://${host}:${discoveryPort}/spawn`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ port, workdir }),
+                    signal: AbortSignal.timeout(30000),
+                });
+                if (!spawnRes.ok) {
+                    const errText = await spawnRes.text().catch(() => "");
+                    throw new Error(`Spawn failed: HTTP ${spawnRes.status} ${errText}`);
+                }
+
+                // Save agent in local DB as remote
+                const agent: PersistentAgent = {
+                    id: randomUUID(),
+                    userId,
+                    name: `${wizard.name} (${host})`,
+                    role: "",
+                    workdir,
+                    model: wizard.model,
+                    port,
+                    status: "running",
+                    createdAt: new Date().toISOString(),
+                    host,
+                    isRemote: true,
+                };
+                this.agentDb.save(agent);
+
+                // Connect SSE and activate as sticky
+                const startResult = await this.persistentAgentService.startAgent(agent);
+                if (!startResult.success) {
+                    this.agentDb.delete(agent.id);
+                    await edit(`❌ No se pudo conectar al servidor remoto: ${startResult.message}`);
+                    return;
+                }
+
+                this.persistentAgentService.setActiveAgent(userId, agent.id);
+                this.agentDb.setLastUsed(userId, agent.id);
+
+                await edit(
+                    `✅ <b>Agente "${escapeHtml(agent.name)}" listo</b>\n\n` +
+                    `📡 Nodo: <code>${escapeHtml(host)}:${port}</code>\n` +
+                    `📁 Dir: <code>${escapeHtml(workdir)}</code>\n` +
+                    `🧠 Modelo: <code>${escapeHtml(wizard.model)}</code>\n\n` +
+                    `Ya puedes enviar mensajes directamente.`
+                );
+            } catch (error) {
+                await edit(ErrorUtils.createErrorMessage("crear agente remoto", error));
+            }
+            return;
+        }
+
+        // ── Local context: existing behaviour ───────────────────────────────
         try {
             // 1. Resolve workdir (already resolved during wizard, but ensure it exists)
             const workdir = wizard.workdir || this.resolveProjectPath(wizard.name);
@@ -735,16 +846,18 @@ export class OpenCodeBot {
         );
     }
 
-    /** Handle /agents command with optional IP argument */
+    /** Handle /agents command — respects remote context */
     private async handleAgentsWithIp(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
         const args = ctx.message?.text?.split(/\s+/).slice(1) || [];
-        const ip = args[0]?.trim();
+        const ipArg = args[0]?.trim();
 
-        if (ip) {
-            // If IP is provided, discover remote agents
-            await this.handleRemoteAgents(ctx, ip);
+        // Explicit IP argument always wins; otherwise use remote context if set
+        const host = ipArg || (userId ? this.getContextHost(userId) : null);
+
+        if (host) {
+            await this.handleRemoteAgents(ctx, host);
         } else {
-            // Otherwise, show local agents (existing behavior)
             await this.handleAgents(ctx);
         }
     }
@@ -1906,10 +2019,33 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
 
+        // In remote context: delete local DB entries for that host (don't touch the remote node)
+        const remoteHost = this.getContextHost(userId);
+        if (remoteHost) {
+            const remoteAgents = this.agentDb.getAll().filter(a => a.isRemote && a.host === remoteHost);
+            if (remoteAgents.length === 0) {
+                await ctx.reply(`ℹ️ No hay agentes remotos registrados para <code>${escapeHtml(remoteHost)}</code>.`, { parse_mode: "HTML" });
+                return;
+            }
+            for (const a of remoteAgents) {
+                this.persistentAgentService.stopAgent(a.id);
+                this.agentDb.delete(a.id);
+            }
+            this.persistentAgentService.clearActiveAgent(userId);
+            await ctx.reply(
+                `🗑️ ${remoteAgents.length} agente${remoteAgents.length !== 1 ? 's' : ''} remoto${remoteAgents.length !== 1 ? 's' : ''} eliminado${remoteAgents.length !== 1 ? 's' : ''} del registro local.\n` +
+                `Los procesos en <code>${escapeHtml(remoteHost)}</code> no se han tocado.`,
+                { parse_mode: "HTML" }
+            );
+            return;
+        }
+
+        // Local context: existing behaviour
         const agent = this.getActiveOrLastAgent(userId);
         if (!agent) { await ctx.reply("ℹ️ No hay agente activo. Activa uno con /agents."); return; }
 
-        const baseUrl = `http://localhost:${agent.port}`;
+        const host = agent.host || 'localhost';
+        const baseUrl = `http://${host}:${agent.port}`;
         try {
             const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
             if (sessRes.ok) {
@@ -2330,5 +2466,96 @@ export class OpenCodeBot {
             `Todos tus mensajes van a este agente. Usa /esc para desactivar.`,
             { parse_mode: "HTML" }
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // /remoto <ip> — switch user context to a remote node
+    // /local       — switch back to local context
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private async handleRemoto(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const ip = ctx.message?.text?.replace(/^\/remoto\s*/i, "").trim() || "";
+
+        if (!ip) {
+            const current = this.getContextHost(userId);
+            if (current) {
+                await ctx.reply(
+                    `📡 Contexto actual: <b>remoto</b> → <code>${escapeHtml(current)}</code>\n\n` +
+                    `Usa /local para volver al contexto local.`,
+                    { parse_mode: "HTML" }
+                );
+            } else {
+                await ctx.reply(
+                    `ℹ️ Debes indicar la IP o host del nodo remoto:\n<code>/remoto 192.168.1.10</code>`,
+                    { parse_mode: "HTML" }
+                );
+            }
+            return;
+        }
+
+        // Basic IP/hostname validation
+        const ipRegex = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9](\.[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])*)$/;
+        if (!ipRegex.test(ip)) {
+            await ctx.reply(`❌ Formato de IP/host inválido: <code>${escapeHtml(ip)}</code>`, { parse_mode: "HTML" });
+            return;
+        }
+
+        // Verify the remote node is reachable before switching context
+        const discoveryPort = parseInt(process.env.DISCOVERY_PORT || '17000', 10);
+        try {
+            const res = await fetch(`http://${ip}:${discoveryPort}/discovery`, {
+                signal: AbortSignal.timeout(5000),
+            });
+            if (!res.ok) {
+                await ctx.reply(`❌ El nodo <code>${escapeHtml(ip)}</code> respondió con HTTP ${res.status}.`, { parse_mode: "HTML" });
+                return;
+            }
+            const data = await res.json() as any;
+            const agentCount = (data.agents || []).length;
+
+            // Set context
+            this.remoteContext.set(userId, ip);
+
+            // Clear active agent — the user should pick or create one in the remote context
+            this.persistentAgentService.clearActiveAgent(userId);
+
+            await ctx.reply(
+                `📡 <b>Contexto cambiado a remoto: <code>${escapeHtml(ip)}</code></b>\n\n` +
+                `${agentCount} agente${agentCount !== 1 ? 's' : ''} disponible${agentCount !== 1 ? 's' : ''} en ese nodo.\n\n` +
+                `Ahora todos los comandos operan en ese nodo:\n` +
+                `• /agents — ver agentes remotos\n` +
+                `• /new — crear agente en el nodo remoto\n` +
+                `• /deleteall — borrar registros de agentes remotos\n\n` +
+                `Usa /local para volver al contexto local.`,
+                { parse_mode: "HTML" }
+            );
+        } catch (err: any) {
+            await ctx.reply(
+                `❌ No se pudo conectar al nodo <code>${escapeHtml(ip)}</code>:${discoveryPort}\n${escapeHtml(err.message || String(err))}`,
+                { parse_mode: "HTML" }
+            );
+        }
+    }
+
+    private async handleLocal(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const previous = this.getContextHost(userId);
+        this.remoteContext.delete(userId);
+        this.persistentAgentService.clearActiveAgent(userId);
+
+        if (previous) {
+            await ctx.reply(
+                `🏠 <b>Contexto cambiado a local</b>\n\nYa no estás conectado a <code>${escapeHtml(previous)}</code>.\n` +
+                `Todos los comandos operan en esta máquina.`,
+                { parse_mode: "HTML" }
+            );
+        } else {
+            await ctx.reply(`🏠 Ya estás en contexto local.`);
+        }
     }
 }
