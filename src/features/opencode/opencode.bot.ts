@@ -161,13 +161,9 @@ export class OpenCodeBot {
     /** Model selection state: userId → { agentId, modelsCache, providers, currentProvider? } */
     private modelSelection: Map<number, ModelSelectionState> = new Map();
 
-    /**
-     * Sticky remote agent per user: userId → { host, port }.
-     * Set when the user selects a remote agent via /agents <ip>.
-     * All subsequent plain-text messages are forwarded to that remote agent
-     * until the user runs /esc or selects another agent.
-     */
-    private remoteSticky: Map<number, { host: string; port: number }> = new Map();
+    /** Short-key → remote agent discovery data for callback buttons (avoids 64-byte limit) */
+    private remoteAgentIndex: Map<string, { host: string; port: number; project: string; workdir: string; sessionId?: string; model?: string }> = new Map();
+    private remoteAgentIndexCounter = 0;
 
     /** Short-key → model full name for callback buttons */
     private modelIndex: Map<string, string> = new Map();
@@ -266,7 +262,6 @@ export class OpenCodeBot {
         
         // Remote agent callbacks
         bot.callbackQuery(/^remote:select:/,  AccessControlMiddleware.requireAccess, this.handleRemoteAgentSelect.bind(this));
-        bot.callbackQuery(/^remote:run:/,     AccessControlMiddleware.requireAccess, this.handleRemoteRun.bind(this));
 
         bot.callbackQuery(/^run:agent:/,    AccessControlMiddleware.requireAccess, this.handleRunAgentSelected.bind(this));
         bot.callbackQuery(/^run:cancel$/,   AccessControlMiddleware.requireAccess, this.handleRunCancel.bind(this));
@@ -290,11 +285,6 @@ export class OpenCodeBot {
             const userId = ctx.from?.id;
             if (!userId) return;
 
-            // Check for sticky remote agent first
-            if (this.remoteSticky.has(userId)) {
-                await this.handleRemoteRunPrompt(ctx);
-                return;
-            }
             // /new wizard intercept
             if (this.newWizard.has(userId)) {
                 await this.handleNewWizardText(ctx);
@@ -795,18 +785,27 @@ export class OpenCodeBot {
             for (const agent of agents) {
                 const projectName = agent.project || 'unknown';
                 const statusEmoji = agent.status === 'running' ? '🟢' : '🔴';
-                
-                // Add buttons for each remote agent
+
+                // Store agent data in remoteAgentIndex and use short key in callback
+                const shortKey = String(this.remoteAgentIndexCounter++);
+                this.remoteAgentIndex.set(shortKey, {
+                    host,
+                    port: agent.port,
+                    project: projectName,
+                    workdir: agent.workdir,
+                    sessionId: agent.sessionId,
+                    model: agent.model,
+                });
+
                 keyboard
-                    .text(`${statusEmoji} ${projectName}`, `remote:select:${host}:${agent.port}`)
-                    .text("💬", `remote:run:${host}:${agent.port}`)
+                    .text(`${statusEmoji} ${projectName}`, `remote:select:${shortKey}`)
                     .row();
             }
 
             await ctx.reply(
                 `📍 Agentes remotos en ${host}:\n\n` +
                 `${agents.length} agente${agents.length !== 1 ? 's' : ''} encontrado${agents.length !== 1 ? 's' : ''}.\n` +
-                `Toca 💬 para usar un agente remoto.`,
+                `Toca el nombre para activarlo como agente sticky.`,
                 { 
                     parse_mode: "HTML", 
                     reply_markup: keyboard 
@@ -1416,17 +1415,6 @@ export class OpenCodeBot {
             await ctx.reply(
                 `⏹️ <b>${escapeHtml(agent?.name ?? activeId)}</b> desactivado.\n` +
                 `Los próximos mensajes irán al último agente usado automáticamente.`,
-                { parse_mode: "HTML" }
-            );
-            return;
-        }
-
-        // Deactivate sticky remote agent
-        if (this.remoteSticky.has(userId)) {
-            const { host, port } = this.remoteSticky.get(userId)!;
-            this.remoteSticky.delete(userId);
-            await ctx.reply(
-                `⏹️ Desconectado del agente remoto <b>${host}:${port}</b>.`,
                 { parse_mode: "HTML" }
             );
             return;
@@ -2283,228 +2271,64 @@ export class OpenCodeBot {
         }
     }
     
-    /** Handle selecting a remote agent — sets it as sticky for all subsequent messages */
+    /**
+     * Handle selecting a remote agent.
+     * Registers it in the local DB (with isRemote=true) and activates it as a
+     * normal sticky agent — messages flow through sendPromptToAgent exactly like local.
+     */
     private async handleRemoteAgentSelect(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
-        // Parse callback data: remote:select:host:port
-        const parts = ctx.callbackQuery!.data.split(':');
-        if (parts.length < 4) {
-            await ctx.editMessageText("❌ Datos inválidos para agente remoto.");
-            return;
-        }
-        
-        const host = parts[2];
-        const port = parseInt(parts[3], 10);
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        // Set as sticky — all subsequent plain-text messages go to this remote agent
-        this.remoteSticky.set(userId, { host, port });
+        const key = ctx.callbackQuery!.data.replace("remote:select:", "");
+        const info = this.remoteAgentIndex.get(key);
+        if (!info) {
+            await ctx.editMessageText("❌ Datos del agente remoto no encontrados. Vuelve a hacer /agents <ip>.");
+            return;
+        }
+
+        const { host, port, project, workdir, sessionId, model } = info;
+        const defaultModel = model || process.env.OPENCODE_DEFAULT_MODEL || "github-copilot/claude-sonnet-4.6";
+
+        // Reuse existing DB entry for this host:port, or create a new one
+        const existingAll = this.agentDb.getAll();
+        let agent = existingAll.find(a => a.host === host && a.port === port && a.isRemote);
+
+        if (!agent) {
+            agent = {
+                id: randomUUID(),
+                userId,
+                name: `${project} (${host})`,
+                role: "",
+                workdir: workdir || `/remote/${host}/${project}`,
+                model: defaultModel,
+                port,
+                sessionId,
+                status: "running",
+                createdAt: new Date().toISOString(),
+                host,
+                isRemote: true,
+            };
+            this.agentDb.save(agent);
+        } else {
+            // Update userId and sessionId in case they changed
+            agent = { ...agent, userId, sessionId: sessionId ?? agent.sessionId };
+            this.agentDb.save(agent);
+        }
+
+        // Connect SSE stream (startAgent detects it's already running, just opens SSE)
+        await this.persistentAgentService.startAgent(agent);
+
+        // Activate as sticky — from now on all messages go here via normal handleMessage
+        this.persistentAgentService.setActiveAgent(userId, agent.id);
+        this.agentDb.setLastUsed(userId, agent.id);
 
         await ctx.editMessageText(
-            `📍 <b>Agente remoto activo:</b> ${host}:${port}\n\nTodos tus mensajes se enviarán a este agente. Usa /esc para desconectar.`,
+            `✅ <b>${escapeHtml(agent.name)}</b> activo\n\n` +
+            `📡 ${host}:${port}\n` +
+            `Todos tus mensajes van a este agente. Usa /esc para desactivar.`,
             { parse_mode: "HTML" }
         );
-    }
-    
-    /** Handle running a command on a remote agent */
-    private async handleRemoteRun(ctx: Context): Promise<void> {
-        await ctx.answerCallbackQuery();
-        // Parse callback data: remote:run:host:port
-        const parts = ctx.callbackQuery!.data.split(':');
-        if (parts.length < 4) {
-            await ctx.editMessageText("❌ Datos inválidos para agente remoto.");
-            return;
-        }
-        
-        const host = parts[2];
-        const port = parseInt(parts[3], 10);
-        
-        // Set sticky remote agent for the user
-        const userId = ctx.from?.id;
-        if (!userId) return;
-        
-        this.remoteSticky.set(userId, { host, port });
-        
-        await ctx.editMessageText(`💬 Escribe el prompt para el agente remoto ${host}:${port}\n\n/escribe el mensaje o /esc para cancelar.`);
-    }
-    
-    /** Handle prompt text for remote agent — uses SSE for real-time feedback */
-    private async handleRemoteRunPrompt(ctx: Context): Promise<void> {
-        const userId = ctx.from?.id;
-        if (!userId) return;
-        
-        const remoteRunData = this.remoteSticky.get(userId);
-        if (!remoteRunData) {
-            await ctx.reply("❌ No hay operación remota en curso.");
-            return;
-        }
-        
-        const { host, port } = remoteRunData;
-        const prompt = ctx.message?.text?.trim() || "";
-        
-        if (!prompt) {
-            await ctx.reply("❌ El prompt no puede estar vacío.");
-            return;
-        }
-        
-        // NOTE: remoteSticky is NOT cleared here — the user stays connected to this
-        // remote agent for all subsequent messages until they send /esc.
-        
-        // Show a placeholder message
-        const placeholder = await ctx.reply(`⏳ <b>${host}:${port}</b> procesando…`, { parse_mode: "HTML" });
-        const placeholderMsgId = placeholder.message_id;
-        const chatId = ctx.chat!.id;
-
-        try {
-            const baseUrl = `http://${host}:${port}`;
-
-            // 1. Create or reuse session
-            const sessionRes = await fetch(`${baseUrl}/session`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    title: `remote-${Date.now()}`,
-                    system: "You are a helpful AI assistant.",
-                    model: null,
-                    permission: [
-                        { permission: "command", pattern: "*", action: "allow" },
-                        { permission: "file",    pattern: "*", action: "allow" },
-                        { permission: "network", pattern: "*", action: "allow" },
-                        { permission: "browser", pattern: "*", action: "allow" },
-                    ],
-                }),
-                signal: AbortSignal.timeout(10000),
-            });
-            if (!sessionRes.ok) throw new Error(`Create session: ${sessionRes.status} ${await sessionRes.text()}`);
-            const { id: sessionId } = await sessionRes.json();
-
-            // 2. Send prompt async
-            const promptRes = await fetch(`${baseUrl}/session/${sessionId}/prompt_async`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    parts: [{ type: "text", text: prompt }],
-                    agent: "build",
-                    model: null,
-                }),
-                signal: AbortSignal.timeout(10000),
-            });
-            if (!promptRes.ok) throw new Error(`Send prompt: ${promptRes.status} ${await promptRes.text()}`);
-
-            // 3. Subscribe to SSE and wait for session.idle
-            const client = createOpencodeClient({ baseUrl });
-            const abort = new AbortController();
-            let lastEdit = Date.now();
-
-            const editPlaceholder = async (text: string) => {
-                // Throttle edits to avoid Telegram rate limits (max 1 per second)
-                const now = Date.now();
-                if (now - lastEdit < 1200) return;
-                lastEdit = now;
-                await this.bot?.api.editMessageText(chatId, placeholderMsgId, text, { parse_mode: "HTML" }).catch(() => {});
-            };
-
-            await new Promise<void>(async (resolve, reject) => {
-                // Safety timeout — 10 minutes
-                const timeout = setTimeout(() => {
-                    abort.abort();
-                    reject(new Error("Timeout: sin respuesta en 10 minutos"));
-                }, 10 * 60 * 1000);
-
-                try {
-                    const events = await client.event.subscribe();
-                    for await (const event of events.stream) {
-                        if (abort.signal.aborted) break;
-
-                        const type = (event as any).type;
-                        const props = (event as any).properties;
-
-                        // Show intermediate status feedback
-                        if (type === "session.status") {
-                            const status = props?.status ?? props?.message ?? "";
-                            if (status) {
-                                await editPlaceholder(`⏳ <b>${host}:${port}</b> — ${escapeHtml(String(status))}`);
-                            }
-                        }
-
-                        if (type === "message.part.updated") {
-                            const partType = props?.part?.type ?? props?.type ?? "";
-                            if (partType === "tool-invocation") {
-                                const toolName = props?.part?.toolInvocation?.toolName ?? props?.toolName ?? "";
-                                if (toolName) {
-                                    await editPlaceholder(`⚙️ <b>${host}:${port}</b> — <code>${escapeHtml(String(toolName))}</code>`);
-                                }
-                            }
-                        }
-
-                        // session.error → reject
-                        if (type === "session.error") {
-                            const errSessionId = props?.sessionID ?? props?.id ?? "";
-                            if (!errSessionId || errSessionId === sessionId) {
-                                clearTimeout(timeout);
-                                abort.abort();
-                                reject(new Error(props?.error?.message ?? props?.message ?? "Error del servidor remoto"));
-                                break;
-                            }
-                        }
-
-                        // session.idle → done
-                        if (type === "session.idle") {
-                            const idleSessionId = props?.sessionID ?? props?.id ?? "";
-                            if (!idleSessionId || idleSessionId === sessionId) {
-                                clearTimeout(timeout);
-                                abort.abort();
-                                resolve();
-                                break;
-                            }
-                        }
-                    }
-                } catch (err) {
-                    clearTimeout(timeout);
-                    reject(err);
-                }
-            });
-
-            // 4. Fetch result
-            const msgRes = await fetch(`${baseUrl}/session/${sessionId}/message`, {
-                signal: AbortSignal.timeout(10000),
-            });
-            if (!msgRes.ok) throw new Error(`Get messages: ${msgRes.status}`);
-
-            const messages: any[] = await msgRes.json();
-            const lastAssistant = [...messages]
-                .reverse()
-                .find((m: any) => m.role === "assistant" || m.info?.role === "assistant");
-
-            let resultText = "✅ Completado (sin respuesta de texto).";
-            if (lastAssistant) {
-                const parts: any[] = lastAssistant.parts || [];
-                const text = parts
-                    .filter((p: any) => p.type === "text" && p.text)
-                    .map((p: any) => p.text as string)
-                    .join("").trim();
-                if (text) resultText = text;
-            }
-
-            // 5. Delete placeholder and send result as new message (triggers notification)
-            await this.bot?.api.deleteMessage(chatId, placeholderMsgId).catch(() => {});
-
-            const MAX_LENGTH = 3800;
-            const body = resultText.length <= MAX_LENGTH ? resultText : resultText.substring(0, MAX_LENGTH) + "\n\n…(truncado)";
-            await this.bot?.api.sendMessage(
-                chatId,
-                `📍 <b>${host}:${port}</b>\n\n${formatAsHtml(body)}`,
-                { parse_mode: "HTML" }
-            );
-
-        } catch (error: any) {
-            console.error('[OpenCodeBot] Error sending remote prompt:', error);
-            await this.bot?.api.editMessageText(
-                chatId, placeholderMsgId,
-                `❌ <b>${host}:${port}</b> — ${escapeHtml(error.message || String(error))}`,
-                { parse_mode: "HTML" }
-            ).catch(() => {});
-        }
     }
 }
