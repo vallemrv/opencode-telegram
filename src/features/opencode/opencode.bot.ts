@@ -23,7 +23,9 @@ import { ConfigService } from "../../services/config.service.js";
 import { AgentDbService } from "../../services/agent-db.service.js";
 import type { PersistentAgent } from "../../services/agent-db.service.js";
 import { PersistentAgentService, pickPort, resolveDir, findOpencodeCmd } from "../../services/persistent-agent.service.js";
-import type { AgentSendResult, HeartbeatSummary } from "../../services/persistent-agent.service.js";import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
+import type { AgentSendResult, HeartbeatSummary } from "../../services/persistent-agent.service.js";
+import { createOpencodeClient } from "@opencode-ai/sdk";
+import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
 import { MessageUtils } from "../../utils/message.utils.js";
 import { ErrorUtils } from "../../utils/error.utils.js";
 import { formatAsHtml, escapeHtml } from "./event-handlers/utils.js";
@@ -2327,7 +2329,7 @@ export class OpenCodeBot {
         await ctx.editMessageText(`💬 Escribe el prompt para el agente remoto ${host}:${port}\n\n/escribe el mensaje o /esc para cancelar.`);
     }
     
-    /** Handle prompt text for remote agent */
+    /** Handle prompt text for remote agent — uses SSE for real-time feedback */
     private async handleRemoteRunPrompt(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
         if (!userId) return;
@@ -2350,11 +2352,15 @@ export class OpenCodeBot {
         // remote agent for all subsequent messages until they send /esc.
         
         // Show a placeholder message
-        const placeholder = await ctx.reply(`🚀 Enviando a ${host}:${port}...`);
-        
+        const placeholder = await ctx.reply(`⏳ <b>${host}:${port}</b> procesando…`, { parse_mode: "HTML" });
+        const placeholderMsgId = placeholder.message_id;
+        const chatId = ctx.chat!.id;
+
         try {
-            // Send the prompt to the remote OpenCode server
-            const response = await fetch(`http://${host}:${port}/session`, {
+            const baseUrl = `http://${host}:${port}`;
+
+            // 1. Create or reuse session
+            const sessionRes = await fetch(`${baseUrl}/session`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -2370,16 +2376,11 @@ export class OpenCodeBot {
                 }),
                 signal: AbortSignal.timeout(10000),
             });
-            
-            if (!response.ok) {
-                throw new Error(`Create session failed: ${response.status} ${await response.text()}`);
-            }
-            
-            const sessionData = await response.json();
-            const sessionId = sessionData.id;
-            
-            // Send the prompt to the session
-            const promptResponse = await fetch(`http://${host}:${port}/session/${sessionId}/prompt_async`, {
+            if (!sessionRes.ok) throw new Error(`Create session: ${sessionRes.status} ${await sessionRes.text()}`);
+            const { id: sessionId } = await sessionRes.json();
+
+            // 2. Send prompt async
+            const promptRes = await fetch(`${baseUrl}/session/${sessionId}/prompt_async`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -2389,79 +2390,121 @@ export class OpenCodeBot {
                 }),
                 signal: AbortSignal.timeout(10000),
             });
-            
-            if (!promptResponse.ok) {
-                throw new Error(`Send prompt failed: ${promptResponse.status} ${await promptResponse.text()}`);
-            }
-            
-            // Poll for the result
-            let attempts = 0;
-            const maxAttempts = 30; // 30 attempts * 2 seconds = 60 seconds max
-            
-            while (attempts < maxAttempts) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                
-                const sessionStatus = await fetch(`http://${host}:${port}/session/${sessionId}`, {
-                    signal: AbortSignal.timeout(5000),
-                });
-                
-                if (!sessionStatus.ok) {
-                    throw new Error(`Check session failed: ${sessionStatus.status}`);
-                }
-                
-                const sessionInfo = await sessionStatus.json();
-                const isIdle = sessionInfo?.status === "idle" || sessionInfo?.info?.status === "idle";
-                
-                if (isIdle) {
-                    // Get the result
-                    const msgResponse = await fetch(`http://${host}:${port}/session/${sessionId}/message`, {
-                        signal: AbortSignal.timeout(10000),
-                    });
-                    
-                    if (!msgResponse.ok) {
-                        throw new Error(`Get messages failed: ${msgResponse.status} ${await msgResponse.text()}`);
-                    }
-                    
-                    const messages: any[] = await msgResponse.json();
-                    const lastAssistant = [...messages]
-                        .reverse()
-                        .find((m: any) => m.role === "assistant" || m.info?.role === "assistant");
+            if (!promptRes.ok) throw new Error(`Send prompt: ${promptRes.status} ${await promptRes.text()}`);
 
-                    let resultText = "✅ Prompt enviado exitosamente.";
-                    if (lastAssistant) {
-                        const parts: any[] = lastAssistant.parts || [];
-                        const text = parts
-                            .filter((p: any) => p.type === "text" && p.text)
-                            .map((p: any) => p.text as string)
-                            .join("");
-                        
-                        if (text.trim()) {
-                            resultText = text.trim();
+            // 3. Subscribe to SSE and wait for session.idle
+            const client = createOpencodeClient({ baseUrl });
+            const abort = new AbortController();
+            let lastEdit = Date.now();
+
+            const editPlaceholder = async (text: string) => {
+                // Throttle edits to avoid Telegram rate limits (max 1 per second)
+                const now = Date.now();
+                if (now - lastEdit < 1200) return;
+                lastEdit = now;
+                await this.bot?.api.editMessageText(chatId, placeholderMsgId, text, { parse_mode: "HTML" }).catch(() => {});
+            };
+
+            await new Promise<void>(async (resolve, reject) => {
+                // Safety timeout — 10 minutes
+                const timeout = setTimeout(() => {
+                    abort.abort();
+                    reject(new Error("Timeout: sin respuesta en 10 minutos"));
+                }, 10 * 60 * 1000);
+
+                try {
+                    const events = await client.event.subscribe();
+                    for await (const event of events.stream) {
+                        if (abort.signal.aborted) break;
+
+                        const type = (event as any).type;
+                        const props = (event as any).properties;
+
+                        // Show intermediate status feedback
+                        if (type === "session.status") {
+                            const status = props?.status ?? props?.message ?? "";
+                            if (status) {
+                                await editPlaceholder(`⏳ <b>${host}:${port}</b> — ${escapeHtml(String(status))}`);
+                            }
+                        }
+
+                        if (type === "message.part.updated") {
+                            const partType = props?.part?.type ?? props?.type ?? "";
+                            if (partType === "tool-invocation") {
+                                const toolName = props?.part?.toolInvocation?.toolName ?? props?.toolName ?? "";
+                                if (toolName) {
+                                    await editPlaceholder(`⚙️ <b>${host}:${port}</b> — <code>${escapeHtml(String(toolName))}</code>`);
+                                }
+                            }
+                        }
+
+                        // session.error → reject
+                        if (type === "session.error") {
+                            const errSessionId = props?.sessionID ?? props?.id ?? "";
+                            if (!errSessionId || errSessionId === sessionId) {
+                                clearTimeout(timeout);
+                                abort.abort();
+                                reject(new Error(props?.error?.message ?? props?.message ?? "Error del servidor remoto"));
+                                break;
+                            }
+                        }
+
+                        // session.idle → done
+                        if (type === "session.idle") {
+                            const idleSessionId = props?.sessionID ?? props?.id ?? "";
+                            if (!idleSessionId || idleSessionId === sessionId) {
+                                clearTimeout(timeout);
+                                abort.abort();
+                                resolve();
+                                break;
+                            }
                         }
                     }
-                    
-                    // Update the message with the result
-                    const MAX_LENGTH = 3800;
-                    if (resultText.length <= MAX_LENGTH) {
-                        await ctx.editMessageText(`📍 Resultado de ${host}:${port}\n\n${formatAsHtml(resultText)}`, 
-                            { parse_mode: "HTML" }).catch(() => {});
-                    } else {
-                        // Send as document if too long
-                        const truncated = resultText.substring(0, MAX_LENGTH) + "\n\n...(truncated)";
-                        await ctx.editMessageText(`📍 Resultado de ${host}:${port}\n\n${formatAsHtml(truncated)}`, 
-                            { parse_mode: "HTML" }).catch(() => {});
-                    }
-                    return;
+                } catch (err) {
+                    clearTimeout(timeout);
+                    reject(err);
                 }
-                
-                attempts++;
+            });
+
+            // 4. Fetch result
+            const msgRes = await fetch(`${baseUrl}/session/${sessionId}/message`, {
+                signal: AbortSignal.timeout(10000),
+            });
+            if (!msgRes.ok) throw new Error(`Get messages: ${msgRes.status}`);
+
+            const messages: any[] = await msgRes.json();
+            const lastAssistant = [...messages]
+                .reverse()
+                .find((m: any) => m.role === "assistant" || m.info?.role === "assistant");
+
+            let resultText = "✅ Completado (sin respuesta de texto).";
+            if (lastAssistant) {
+                const parts: any[] = lastAssistant.parts || [];
+                const text = parts
+                    .filter((p: any) => p.type === "text" && p.text)
+                    .map((p: any) => p.text as string)
+                    .join("").trim();
+                if (text) resultText = text;
             }
-            
-            throw new Error("Timeout: La operación no completó dentro del tiempo límite");
-            
+
+            // 5. Delete placeholder and send result as new message (triggers notification)
+            await this.bot?.api.deleteMessage(chatId, placeholderMsgId).catch(() => {});
+
+            const MAX_LENGTH = 3800;
+            const body = resultText.length <= MAX_LENGTH ? resultText : resultText.substring(0, MAX_LENGTH) + "\n\n…(truncado)";
+            await this.bot?.api.sendMessage(
+                chatId,
+                `📍 <b>${host}:${port}</b>\n\n${formatAsHtml(body)}`,
+                { parse_mode: "HTML" }
+            );
+
         } catch (error: any) {
             console.error('[OpenCodeBot] Error sending remote prompt:', error);
-            await ctx.editMessageText(`❌ Error en ${host}:${port}: ${error.message || error}`);
+            await this.bot?.api.editMessageText(
+                chatId, placeholderMsgId,
+                `❌ <b>${host}:${port}</b> — ${escapeHtml(error.message || String(error))}`,
+                { parse_mode: "HTML" }
+            ).catch(() => {});
         }
     }
 }
