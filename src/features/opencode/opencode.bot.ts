@@ -416,24 +416,13 @@ export class OpenCodeBot {
 
     /**
      * Shows the optional git integration picker.
-     * Only shown if GITEA_URL+GITEA_TOKEN or GITHUB_TOKEN are configured.
-     * If neither is configured, skips straight to confirm.
+     * Always shows GitHub, Gitea and "Sin repositorio" — regardless of token config.
+     * Tokens are only checked at creation time.
      */
     private async sendGitPicker(ctx: Context, wizard: NewAgentWizard): Promise<void> {
-        const isGitea  = !!process.env.GITEA_URL && !!process.env.GITEA_TOKEN;
-        const isGithub = !!process.env.GITHUB_TOKEN;
-
-        if (!isGitea && !isGithub) {
-            // No git configured → skip git step, go straight to confirm
-            wizard.gitSource = "none";
-            wizard.step = "confirm";
-            await this.sendNewConfirm(ctx, wizard);
-            return;
-        }
-
         const keyboard = new InlineKeyboard();
-        if (isGitea)  keyboard.text("🟠 Gitea",  "new:source:gitea").row();
-        if (isGithub) keyboard.text("⚫ GitHub", "new:source:github").row();
+        keyboard.text("⚫ GitHub", "new:source:github").row();
+        keyboard.text("🟠 Gitea",  "new:source:gitea").row();
         keyboard.text("📁 Sin repositorio remoto", "new:source:none").row();
         keyboard.text("❌ Cancelar", "new:cancel");
 
@@ -463,14 +452,10 @@ export class OpenCodeBot {
             wizard.step = "confirm";
             await this.sendNewConfirm(ctx, wizard);
         } else {
-            // Ask for repo name (default: agent name)
-            wizard.step = "git";
-            const platform = source === "gitea" ? "🟠 Gitea" : "⚫ GitHub";
-            await ctx.reply(
-                `${platform} — nombre del repositorio:\n` +
-                `<i>Deja en blanco y envía <code>-</code> para usar <b>${escapeHtml(wizard.name!)}</b></i>`,
-                { parse_mode: "HTML" }
-            );
+            // Use the project folder name as repo name — no need to ask
+            wizard.repoName = wizard.name!;
+            wizard.step = "confirm";
+            await this.sendNewConfirm(ctx, wizard);
         }
     }
 
