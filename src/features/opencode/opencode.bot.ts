@@ -159,8 +159,13 @@ export class OpenCodeBot {
     /** Model selection state: userId → { agentId, modelsCache, providers, currentProvider? } */
     private modelSelection: Map<number, ModelSelectionState> = new Map();
 
-    /** Pending /run state for remote agents: userId → { host, port } */
-    private remoteRunWizard: Map<number, { host: string; port: number }> = new Map();
+    /**
+     * Sticky remote agent per user: userId → { host, port }.
+     * Set when the user selects a remote agent via /agents <ip>.
+     * All subsequent plain-text messages are forwarded to that remote agent
+     * until the user runs /esc or selects another agent.
+     */
+    private remoteSticky: Map<number, { host: string; port: number }> = new Map();
 
     /** Short-key → model full name for callback buttons */
     private modelIndex: Map<string, string> = new Map();
@@ -283,8 +288,8 @@ export class OpenCodeBot {
             const userId = ctx.from?.id;
             if (!userId) return;
 
-            // Check for remote run wizard first
-            if (this.remoteRunWizard.has(userId)) {
+            // Check for sticky remote agent first
+            if (this.remoteSticky.has(userId)) {
                 await this.handleRemoteRunPrompt(ctx);
                 return;
             }
@@ -1429,6 +1434,17 @@ export class OpenCodeBot {
             return;
         }
 
+        // Deactivate sticky remote agent
+        if (this.remoteSticky.has(userId)) {
+            const { host, port } = this.remoteSticky.get(userId)!;
+            this.remoteSticky.delete(userId);
+            await ctx.reply(
+                `⏹️ Desconectado del agente remoto <b>${host}:${port}</b>.`,
+                { parse_mode: "HTML" }
+            );
+            return;
+        }
+
         await ctx.reply("ℹ️ Nada que cancelar.");
     }
 
@@ -2280,7 +2296,7 @@ export class OpenCodeBot {
         }
     }
     
-    /** Handle selecting a remote agent */
+    /** Handle selecting a remote agent — sets it as sticky for all subsequent messages */
     private async handleRemoteAgentSelect(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         // Parse callback data: remote:select:host:port
@@ -2292,8 +2308,16 @@ export class OpenCodeBot {
         
         const host = parts[2];
         const port = parseInt(parts[3], 10);
-        
-        await ctx.editMessageText(`📍 Has seleccionado el agente remoto en ${host}:${port}\n\nPuedes usar /run para enviar comandos.`);
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        // Set as sticky — all subsequent plain-text messages go to this remote agent
+        this.remoteSticky.set(userId, { host, port });
+
+        await ctx.editMessageText(
+            `📍 <b>Agente remoto activo:</b> ${host}:${port}\n\nTodos tus mensajes se enviarán a este agente. Usa /esc para desconectar.`,
+            { parse_mode: "HTML" }
+        );
     }
     
     /** Handle running a command on a remote agent */
@@ -2309,11 +2333,11 @@ export class OpenCodeBot {
         const host = parts[2];
         const port = parseInt(parts[3], 10);
         
-        // Store in wizard for the user to provide the prompt
+        // Set sticky remote agent for the user
         const userId = ctx.from?.id;
         if (!userId) return;
         
-        this.remoteRunWizard.set(userId, { host, port });
+        this.remoteSticky.set(userId, { host, port });
         
         await ctx.editMessageText(`💬 Escribe el prompt para el agente remoto ${host}:${port}\n\n/escribe el mensaje o /esc para cancelar.`);
     }
@@ -2323,7 +2347,7 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
         
-        const remoteRunData = this.remoteRunWizard.get(userId);
+        const remoteRunData = this.remoteSticky.get(userId);
         if (!remoteRunData) {
             await ctx.reply("❌ No hay operación remota en curso.");
             return;
@@ -2337,8 +2361,8 @@ export class OpenCodeBot {
             return;
         }
         
-        // Remove the wizard entry
-        this.remoteRunWizard.delete(userId);
+        // NOTE: remoteSticky is NOT cleared here — the user stays connected to this
+        // remote agent for all subsequent messages until they send /esc.
         
         // Show a placeholder message
         const placeholder = await ctx.reply(`🚀 Enviando a ${host}:${port}...`);
