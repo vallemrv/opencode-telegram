@@ -177,10 +177,15 @@ export class PersistentAgentService {
             return { success: true, message: "already running" };
         }
 
-            if (await this.isServerRunning(agent)) {
+        if (await this.isServerRunning(agent)) {
             await this.ensureSession(agent);
             this.startSseStream(agent);
             return { success: true, message: "already running (external)" };
+        }
+
+        // Remote agents run on another machine — we never spawn a local process for them
+        if (agent.isRemote) {
+            return { success: false, message: `Remote agent ${agent.host}:${agent.port} is not reachable` };
         }
 
         const cmd = await findOpencodeCmd();
@@ -241,7 +246,8 @@ export class PersistentAgentService {
      * Ensures the agent has a live long-lived OpenCode session.
      */
     private async ensureSession(agent: PersistentAgent): Promise<string> {
-        const baseUrl = `http://localhost:${agent.port}`;
+        const host = agent.host || 'localhost';
+        const baseUrl = `http://${host}:${agent.port}`;
         const cachedId = this.sessionIds.get(agent.id) ?? agent.sessionId;
 
         if (cachedId) {
