@@ -797,6 +797,16 @@ export class PersistentAgentService {
         // There is NO hard timeout — the user cancels explicitly with /esc.
         console.log(`[PersistentAgent] sendPrompt → agent="${agent.name}" session="${sessionId}" text="${userText.slice(0, 80)}${userText.length > 80 ? "…" : ""}"`);
 
+        // Build request body — omit 'model' field entirely if not configured
+        // (Copilot API rejects null/undefined model)
+        const requestBody: any = {
+            parts: [{ type: "text", text: userText }],
+            agent: "build",
+        };
+        if (modelConfig) {
+            requestBody.model = modelConfig;
+        }
+
         const result = await new Promise<AgentSendResult>((resolve, reject) => {
             this.pendingPrompts.set(agent.id, {
                 sessionId,
@@ -809,11 +819,7 @@ export class PersistentAgentService {
             fetch(`${baseUrl}/session/${sessionId}/prompt_async`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    parts: [{ type: "text", text: userText }],
-                    agent: "build",
-                    model: modelConfig,
-                }),
+                body: JSON.stringify(requestBody),
                 signal: AbortSignal.timeout(10000),
             }).then(res => {
                 if (!res.ok) {
