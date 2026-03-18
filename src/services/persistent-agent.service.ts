@@ -478,9 +478,17 @@ export class PersistentAgentService {
                         const idleSessionId: string = props?.sessionID ?? props?.id ?? "";
                         const mySessionId = this.sessionIds.get(agent.id);
 
-                        if (idleSessionId && mySessionId && idleSessionId === mySessionId) {
-                            console.log(`[PersistentAgent] session.idle for agent "${agent.name}" session ${idleSessionId}`);
-                            await this.resolvePromptFromIdle(agent, idleSessionId);
+                        // Use the same liberal matching as session.error:
+                        // if opencode omits sessionID (some versions do), assume it's ours.
+                        const sessionMatches =
+                            !idleSessionId ||
+                            !mySessionId ||
+                            idleSessionId === mySessionId;
+
+                        if (sessionMatches) {
+                            const resolveId = idleSessionId || mySessionId || "";
+                            console.log(`[PersistentAgent] session.idle for agent "${agent.name}" session "${resolveId}"`);
+                            await this.resolvePromptFromIdle(agent, resolveId);
                         }
                     }
                 }
@@ -501,7 +509,14 @@ export class PersistentAgentService {
      */
     private async resolvePromptFromIdle(agent: PersistentAgent, sessionId: string): Promise<void> {
         const pending = this.pendingPrompts.get(agent.id);
-        if (!pending || pending.sessionId !== sessionId) return;
+        // Accept the event if there is a pending prompt AND either:
+        //   (a) sessionId matches exactly, or
+        //   (b) sessionId is empty (opencode omitted it) — assume it's ours
+        if (!pending) return;
+        if (sessionId && pending.sessionId && sessionId !== pending.sessionId) return;
+
+        // Use the pending session's own ID for fetching messages
+        const resolveSessionId = pending.sessionId || sessionId;
 
         // Stop heartbeat — response arrived
         this.stopHeartbeat(agent.id);
@@ -510,11 +525,11 @@ export class PersistentAgentService {
         try {
             const host = agent.host || 'localhost';
             const msgRes = await fetch(
-                `http://${host}:${agent.port}/session/${sessionId}/message`,
+                `http://${host}:${agent.port}/session/${resolveSessionId}/message`,
                 { signal: AbortSignal.timeout(10000) }
             );
             if (!msgRes.ok) {
-                pending.resolve({ output: `❌ Error al leer mensajes: HTTP ${msgRes.status}`, sessionId });
+                pending.resolve({ output: `❌ Error al leer mensajes: HTTP ${msgRes.status}`, sessionId: resolveSessionId });
                 return;
             }
 
@@ -524,7 +539,7 @@ export class PersistentAgentService {
                 .find((m: any) => m.role === "assistant" || m.info?.role === "assistant");
 
             if (!lastAssistant) {
-                pending.resolve({ output: "⚠️ Sin respuesta del asistente", sessionId });
+                pending.resolve({ output: "⚠️ Sin respuesta del asistente", sessionId: resolveSessionId });
                 return;
             }
 
@@ -542,15 +557,15 @@ export class PersistentAgentService {
                 // Verificar si hubo llamadas a herramientas (indica que trabajó)
                 const hasTools = parts.some((p: any) => p.type === "tool-invocation");
                 if (hasTools) {
-                    pending.resolve({ output: "✅ Completado (ejecutó herramientas pero no generó texto)", sessionId });
+                    pending.resolve({ output: "✅ Completado (ejecutó herramientas pero no generó texto)", sessionId: resolveSessionId });
                 } else {
-                    pending.resolve({ output: "⚠️ Sin salida (ejecución vacía)", sessionId });
+                    pending.resolve({ output: "⚠️ Sin salida (ejecución vacía)", sessionId: resolveSessionId });
                 }
             } else {
-                pending.resolve({ output: trimmed, sessionId });
+                pending.resolve({ output: trimmed, sessionId: resolveSessionId });
             }
         } catch (err) {
-            pending.resolve({ output: `❌ Error al leer respuesta: ${err}`, sessionId });
+            pending.resolve({ output: `❌ Error al leer respuesta: ${err}`, sessionId: resolveSessionId });
         }
 
         // Once the current prompt is resolved, drain the next item from the queue (if any)
