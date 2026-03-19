@@ -1024,6 +1024,13 @@ export class PersistentAgentService {
                 console.log(`[PersistentAgent] Skipping parked agent "${agent.name}" (status=stopped)`);
                 continue;
             }
+            
+            // Remote agents are on another machine — skip restore, they'll connect on-demand
+            if (agent.isRemote) {
+                console.log(`[PersistentAgent] Skipping remote agent "${agent.name}" at ${agent.host}:${agent.port} — will connect on first use`);
+                continue;
+            }
+            
             console.log(`[PersistentAgent] Restoring agent "${agent.name}" on port ${agent.port}…`);
             const result = await this.startAgent(agent);
             console.log(`[PersistentAgent] → ${result.message}`);
