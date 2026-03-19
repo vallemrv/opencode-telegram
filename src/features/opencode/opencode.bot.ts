@@ -65,6 +65,14 @@ function resolveHome(p: string): string {
     return p;
 }
 
+/**
+ * Get the base URL for an agent, using the correct host (localhost for local, actual host for remote)
+ */
+function getAgentBaseUrl(agent: { host?: string; port: number }): string {
+    const host = agent.host || 'localhost';
+    return `http://${host}:${agent.port}`;
+}
+
 /** Global workspace root: WORKSPACE_DIR env or ~/proyectos */
 function workspaceDir(): string {
     const raw = process.env.WORKSPACE_DIR || "~/proyectos";
@@ -344,7 +352,7 @@ export class OpenCodeBot {
             `<b>TelegramCoder</b>${contextLine}\n` +
             `<b>Comandos:</b>\n` +
             `/new — Crear agente (${isGitea ? "Gitea ✅" : "Gitea ❌"} / ${isGithub ? "GitHub ✅" : "GitHub ❌"} / local)\n` +
-            `/agents — Ver y gestionar tus agentes\n` +
+            `/agents — Ver y gestionar tus agentes (del contexto activo)\n` +
             `/run — Prompt puntual a un agente\n` +
             `/session — Ver sesiones del agente activo\n` +
             `/rename — Renombrar la sesión activa\n` +
@@ -354,7 +362,7 @@ export class OpenCodeBot {
             `/esc — Cancelar / desactivar agente / abortar\n` +
             `/undo — Revertir último cambio\n` +
             `/redo — Restaurar cambio revertido\n` +
-            `/restart — Reiniciar bot y servidores\n` +
+            `/restart — Reiniciar bot (git pull + build + restart)\n` +
             `/remoto &lt;ip&gt; — Cambiar contexto a nodo remoto\n` +
             `/local — Volver a contexto local\n\n` +
             `<b>Flujo:</b>\n` +
@@ -760,11 +768,7 @@ export class OpenCodeBot {
     /** Handle /agents command — respects remote context */
     private async handleAgentsWithIp(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
-        const args = ctx.message?.text?.split(/\s+/).slice(1) || [];
-        const ipArg = args[0]?.trim();
-
-        // Explicit IP argument always wins; otherwise use remote context if set
-        const host = ipArg || (userId ? this.getContextHost(userId) : null);
+        const host = userId ? this.getContextHost(userId) : null;
 
         if (host) {
             await this.handleRemoteAgents(ctx, host);
@@ -907,7 +911,7 @@ export class OpenCodeBot {
 
         // 1. Delete all OpenCode sessions on the server before stopping the process
         try {
-            const baseUrl = `http://localhost:${agent.port}`;
+            const baseUrl = getAgentBaseUrl(agent);
             const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
             if (sessRes.ok) {
                 const sessions: any[] = await sessRes.json();
@@ -1205,7 +1209,7 @@ export class OpenCodeBot {
         if (!sessionId) return;
 
         try {
-            const baseUrl = `http://localhost:${agent.port}`;
+            const baseUrl = getAgentBaseUrl(agent);
             const res = await fetch(`${baseUrl}/session/${sessionId}`, { signal: AbortSignal.timeout(5000) });
             if (!res.ok) return;
             const sess: any = await res.json();
@@ -1605,11 +1609,30 @@ export class OpenCodeBot {
             const agent = this.agentDb.getById(state.agentId);
             if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
 
+            // Update model in DB
             this.agentDb.updateModel(state.agentId, model);
             this.modelSelection.delete(userId);
 
+            // Option A: Clear current session so next prompt uses new model
+            const sessionId = this.persistentAgentService.getSessionId(agent.id);
+            if (sessionId) {
+                try {
+                    const baseUrl = getAgentBaseUrl(agent);
+                    // Delete old session
+                    await fetch(`${baseUrl}/session/${sessionId}`, {
+                        method: "DELETE",
+                        signal: AbortSignal.timeout(5000),
+                    }).catch(() => {});
+                } catch (err) {
+                    console.warn(`[handleModelCallback] Error deleting old session:`, err);
+                }
+                // Clear cached session ID
+                this.persistentAgentService.setSessionId(agent.id, "");
+                console.log(`[handleModelCallback] Cleared session ${sessionId} for agent "${agent.name}" - new model: ${model}`);
+            }
+
             await ctx.editMessageText(
-                `✅ Modelo de <b>${escapeHtml(agent.name)}</b> cambiado a <code>${escapeHtml(model)}</code>`,
+                `✅ Modelo de <b>${escapeHtml(agent.name)}</b> cambiado a <code>${escapeHtml(model)}</code>\n\n🔄 Se creará una nueva sesión con el próximo mensaje.`,
                 { parse_mode: "HTML" }
             );
             return;
@@ -1634,7 +1657,7 @@ export class OpenCodeBot {
     // ─────────────────────────────────────────────────────────────────────────
 
     private async sendSessionList(ctx: Context, agent: PersistentAgent, edit = false): Promise<void> {
-        const baseUrl = `http://localhost:${agent.port}`;
+        const baseUrl = getAgentBaseUrl(agent);
         const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
         if (!sessRes.ok) {
             const txt = `❌ No se pudo conectar al servidor del agente <b>${escapeHtml(agent.name)}</b>.`;
@@ -1770,7 +1793,7 @@ export class OpenCodeBot {
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {}); return; }
 
-        const baseUrl = `http://localhost:${agent.port}`;
+        const baseUrl = getAgentBaseUrl(agent);
         try {
             await fetch(`${baseUrl}/session/${sessId}`, {
                 method: "DELETE",
@@ -1801,7 +1824,7 @@ export class OpenCodeBot {
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {}); return; }
 
-        const baseUrl = `http://localhost:${agent.port}`;
+        const baseUrl = getAgentBaseUrl(agent);
         try {
             const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
             if (sessRes.ok) {
@@ -1833,7 +1856,7 @@ export class OpenCodeBot {
         const agent = this.getActiveOrLastAgent(userId);
         if (!agent) { await ctx.reply("ℹ️ No hay agente activo."); return; }
 
-        const baseUrl = `http://localhost:${agent.port}`;
+        const baseUrl = getAgentBaseUrl(agent);
         try {
             // Get last session for this agent
             const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
@@ -1862,7 +1885,7 @@ export class OpenCodeBot {
         const agent = this.getActiveOrLastAgent(userId);
         if (!agent) { await ctx.reply("ℹ️ No hay agente activo."); return; }
 
-        const baseUrl = `http://localhost:${agent.port}`;
+        const baseUrl = getAgentBaseUrl(agent);
         try {
             const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
             if (!sessRes.ok) { await ctx.reply("❌ No se pudo conectar al servidor del agente."); return; }
@@ -1903,7 +1926,7 @@ export class OpenCodeBot {
         const sessionId = this.persistentAgentService.getSessionId(agent.id);
         if (!sessionId) { await ctx.reply("ℹ️ No hay sesión activa que borrar."); return; }
 
-        const baseUrl = `http://localhost:${agent.port}`;
+        const baseUrl = getAgentBaseUrl(agent);
         try {
             await fetch(`${baseUrl}/session/${sessionId}`, {
                 method: "DELETE",
@@ -2006,7 +2029,7 @@ export class OpenCodeBot {
 
     /** PATCH /session/:id with a new title */
     private async renameSession(ctx: Context, agent: PersistentAgent, sessionId: string, newName: string): Promise<void> {
-        const baseUrl = `http://localhost:${agent.port}`;
+        const baseUrl = getAgentBaseUrl(agent);
         try {
             const res = await fetch(`${baseUrl}/session/${sessionId}`, {
                 method: "PATCH",
@@ -2025,18 +2048,89 @@ export class OpenCodeBot {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // /restart
+    // /restart — git pull + build + restart service
     // ─────────────────────────────────────────────────────────────────────────
 
     private async handleRestart(ctx: Context): Promise<void> {
-        const msg = await ctx.reply("🔄 Reiniciando...");
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        // Check if user is admin (only admins can restart the service)
+        const adminId = this.configService.getAdminUserId();
+        if (!adminId || userId !== adminId) {
+            await ctx.reply("⛔ Solo administradores pueden reiniciar el servicio.");
+            return;
+        }
+
+        const statusMsg = await ctx.reply("🔄 <b>Reiniciando servicio...</b>\n\n1️⃣ Git pull...", { parse_mode: "HTML" });
+
         try {
+            const { execSync } = await import("child_process");
+            const cwd = process.cwd();
+
+            // 1. Git pull
+            try {
+                console.log("[restart] Running git pull...");
+                const gitOutput = execSync("git pull", { cwd, encoding: "utf-8" });
+                console.log("[restart] Git pull output:", gitOutput);
+                await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id, 
+                    "🔄 <b>Reiniciando servicio...</b>\n\n1️⃣ Git pull ✅\n2️⃣ Building...", 
+                    { parse_mode: "HTML" }
+                );
+            } catch (gitErr: any) {
+                console.warn("[restart] Git pull error:", gitErr.message);
+                // Not fatal - continue with build
+            }
+
+            // 2. Build
+            console.log("[restart] Running npm run build...");
+            const buildOutput = execSync("npm run build", { cwd, encoding: "utf-8" });
+            console.log("[restart] Build output:", buildOutput);
+            await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id, 
+                "🔄 <b>Reiniciando servicio...</b>\n\n1️⃣ Git pull ✅\n2️⃣ Build ✅\n3️⃣ Restarting service...", 
+                { parse_mode: "HTML" }
+            );
+
+            // 3. Restart systemd service
+            console.log("[restart] Restarting systemd service...");
+            try {
+                execSync("systemctl restart opencode-telegram", { encoding: "utf-8" });
+            } catch (systemctlErr: any) {
+                console.warn("[restart] systemctl restart failed:", systemctlErr.message);
+                // Fallback: try pm2 if systemd is not available
+                try {
+                    execSync("pm2 restart opencode-telegram", { encoding: "utf-8" });
+                    console.log("[restart] Restarted via pm2");
+                } catch (pm2Err: any) {
+                    console.warn("[restart] pm2 restart failed:", pm2Err.message);
+                    // Final fallback: just exit and let systemd/docker restart us
+                    console.log("[restart] Will exit and let process manager restart");
+                }
+            }
+
+            // 4. Save state for post-restart notification
             const { SessionDbService } = await import("../../services/session-db.service.js");
             const db = new SessionDbService();
             db.setState("restart_pending_chat_id", String(ctx.chat!.id));
-            db.setState("restart_pending_message_id", String(msg.message_id));
-        } catch { /* ignore */ }
-        setTimeout(() => process.exit(0), 500);
+            db.setState("restart_pending_message_id", String(statusMsg.message_id));
+            db.setState("restart_initiated_by", String(userId));
+
+            await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id, 
+                "✅ <b>Servicio reiniciado correctamente</b>\n\nEl bot se está reiniciando...", 
+                { parse_mode: "HTML" }
+            );
+
+        } catch (err: any) {
+            console.error("[restart] Error:", err);
+            await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id, 
+                `❌ <b>Error al reiniciar</b>\n\n${escapeHtml(err.message || String(err))}`, 
+                { parse_mode: "HTML" }
+            );
+            return;
+        }
+
+        // Exit the bot - process manager will restart it
+        setTimeout(() => process.exit(0), 1000);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2309,6 +2403,7 @@ export class OpenCodeBot {
         const key = ctx.callbackQuery!.data.replace("remote:select:", "");
         const info = this.remoteAgentIndex.get(key);
         if (!info) {
+            console.error(`[handleRemoteAgentSelect] Remote agent data not found for key: ${key}`);
             await ctx.editMessageText("❌ Datos del agente remoto no encontrados. Vuelve a hacer /agents <ip>.");
             return;
         }
@@ -2316,11 +2411,15 @@ export class OpenCodeBot {
         const { host, port, project, workdir, sessionId, model } = info;
         const defaultModel = model || process.env.OPENCODE_DEFAULT_MODEL || "github-copilot/claude-sonnet-4.6";
 
+        console.log(`[handleRemoteAgentSelect] Connecting to remote agent: ${project} at ${host}:${port}`);
+        console.log(`[handleRemoteAgentSelect] Workdir: ${workdir}, SessionId: ${sessionId || 'N/A'}, Model: ${defaultModel}`);
+
         // Reuse existing DB entry for this host:port, or create a new one
         const existingAll = this.agentDb.getAll();
         let agent = existingAll.find(a => a.host === host && a.port === port && a.isRemote);
 
         if (!agent) {
+            console.log(`[handleRemoteAgentSelect] Creating new DB entry for remote agent`);
             agent = {
                 id: randomUUID(),
                 userId,
@@ -2336,19 +2435,34 @@ export class OpenCodeBot {
                 isRemote: true,
             };
             this.agentDb.save(agent);
+            console.log(`[handleRemoteAgentSelect] Agent saved with ID: ${agent.id}`);
         } else {
+            console.log(`[handleRemoteAgentSelect] Reusing existing DB entry (ID: ${agent.id})`);
             // Update userId and sessionId in case they changed
             agent = { ...agent, userId, sessionId: sessionId ?? agent.sessionId };
             this.agentDb.save(agent);
         }
 
-        // Connect SSE stream (startAgent detects it's already running, just opens SSE)
-        await this.persistentAgentService.startAgent(agent);
+        console.log(`[handleRemoteAgentSelect] Calling startAgent for remote agent at ${host}:${port}`);
+        const startResult = await this.persistentAgentService.startAgent(agent);
+        console.log(`[handleRemoteAgentSelect] startAgent result: ${JSON.stringify(startResult)}`);
+
+        if (!startResult.success) {
+            console.error(`[handleRemoteAgentSelect] Failed to start remote agent: ${startResult.message}`);
+            await ctx.editMessageText(
+                `❌ <b>Error al conectar con agente remoto</b>\n\n` +
+                `📡 ${host}:${port}\n` +
+                `<i>${escapeHtml(startResult.message)}</i>`,
+                { parse_mode: "HTML" }
+            );
+            return;
+        }
 
         // Activate as sticky — from now on all messages go here via normal handleMessage
         this.persistentAgentService.setActiveAgent(userId, agent.id);
         this.agentDb.setLastUsed(userId, agent.id);
 
+        console.log(`[handleRemoteAgentSelect] Remote agent ${agent.name} activated successfully`);
         await ctx.editMessageText(
             `✅ <b>${escapeHtml(agent.name)}</b> activo\n\n` +
             `📡 ${host}:${port}\n` +
@@ -2417,7 +2531,7 @@ export class OpenCodeBot {
                 `Ahora todos los comandos operan en ese nodo:\n` +
                 `• /agents — ver agentes remotos\n` +
                 `• /new — crear agente en el nodo remoto\n` +
-                `• /deleteall — borrar registros de agentes remotos\n\n` +
+                `• /deleteall — borrar sesiones del agente activo\n\n` +
                 `Usa /local para volver al contexto local.`,
                 { parse_mode: "HTML" }
             );

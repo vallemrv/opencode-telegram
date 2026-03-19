@@ -173,11 +173,15 @@ export class PersistentAgentService {
     // ─── Server lifecycle ─────────────────────────────────────────────────────
 
     async startAgent(agent: PersistentAgent): Promise<{ success: boolean; message: string }> {
+        console.log(`[PersistentAgent.startAgent] Starting agent "${agent.name}" (ID: ${agent.id}, isRemote: ${agent.isRemote}, host: ${agent.host || 'N/A'}, port: ${agent.port})`);
+        
         if (this.processes.has(agent.id)) {
+            console.log(`[PersistentAgent.startAgent] Agent already has a local process, returning success`);
             return { success: true, message: "already running" };
         }
 
         if (await this.isServerRunning(agent)) {
+            console.log(`[PersistentAgent.startAgent] Server is already running at ${agent.host || 'localhost'}:${agent.port}, ensuring session and starting SSE`);
             await this.ensureSession(agent);
             this.startSseStream(agent);
             return { success: true, message: "already running (external)" };
@@ -185,13 +189,48 @@ export class PersistentAgentService {
 
         // Remote agents run on another machine — we never spawn a local process for them
         if (agent.isRemote) {
-            return { success: false, message: `Remote agent ${agent.host}:${agent.port} is not reachable` };
+            console.log(`[PersistentAgent.startAgent] Agent is remote (${agent.host}:${agent.port}), checking if reachable...`);
+            
+            // Try to connect to the remote server
+            const remoteUrl = `http://${agent.host}:${agent.port}`;
+            try {
+                console.log(`[PersistentAgent.startAgent] Testing connection to ${remoteUrl}`);
+                const testRes = await fetch(remoteUrl, {
+                    method: 'HEAD',
+                    signal: AbortSignal.timeout(5000),
+                });
+                console.log(`[PersistentAgent.startAgent] Remote server responded with status: ${testRes.status}`);
+                
+                if (testRes.ok || testRes.status < 500) {
+                    console.log(`[PersistentAgent.startAgent] Remote server is reachable, ensuring session and starting SSE`);
+                    await this.ensureSession(agent);
+                    this.startSseStream(agent);
+                    return { success: true, message: `remote agent ${agent.host}:${agent.port} is reachable` };
+                } else {
+                    console.error(`[PersistentAgent.startAgent] Remote server returned unexpected status: ${testRes.status}`);
+                    return { success: false, message: `Remote agent ${agent.host}:${agent.port} returned HTTP ${testRes.status}` };
+                }
+            } catch (err: any) {
+                console.error(`[PersistentAgent.startAgent] Failed to connect to remote agent at ${remoteUrl}:`, err.message);
+                return { success: false, message: `Remote agent ${agent.host}:${agent.port} is not reachable: ${err.message || err}` };
+            }
         }
 
-        const cmd = await findOpencodeCmd();
+        console.log(`[PersistentAgent.startAgent] Agent is local, finding opencode binary...`);
+        let cmd: string;
+        try {
+            cmd = await findOpencodeCmd();
+            console.log(`[PersistentAgent.startAgent] Found opencode binary at: ${cmd}`);
+        } catch (e) {
+            console.error(`[PersistentAgent.startAgent] opencode binary not found:`, e);
+            return { success: false, message: "opencode binary not found" };
+        }
+        
         const workdir = resolveDir(agent.workdir);
+        console.log(`[PersistentAgent.startAgent] Workdir: ${workdir}`);
 
         const hostname = process.env.OPENCODE_BIND_HOST || "0.0.0.0";
+        console.log(`[PersistentAgent.startAgent] Spawning opencode serve on ${hostname}:${agent.port}`);
         const child = spawn(cmd, [
             "serve",
             "--port", String(agent.port),
@@ -250,23 +289,30 @@ export class PersistentAgentService {
         const baseUrl = `http://${host}:${agent.port}`;
         const cachedId = this.sessionIds.get(agent.id) ?? agent.sessionId;
 
+        console.log(`[PersistentAgent.ensureSession] Agent "${agent.name}" (${agent.id}), host: ${host}, port: ${agent.port}, cachedSessionId: ${cachedId || 'N/A'}`);
+
         if (cachedId) {
             try {
+                console.log(`[PersistentAgent.ensureSession] Checking if existing session ${cachedId} is still valid`);
                 const res = await fetch(`${baseUrl}/session/${cachedId}`, {
                     signal: AbortSignal.timeout(5000),
                 });
                 if (res.ok) {
                     this.sessionIds.set(agent.id, cachedId);
+                    console.log(`[PersistentAgent.ensureSession] Existing session ${cachedId} is valid`);
                     return cachedId;
                 }
-            } catch { /* fall through */ }
-            console.log(`[PersistentAgent] Session ${cachedId} for agent "${agent.name}" is gone, creating a new one`);
+                console.log(`[PersistentAgent.ensureSession] Existing session ${cachedId} returned status ${res.status}, creating new session`);
+            } catch (err: any) {
+                console.log(`[PersistentAgent.ensureSession] Error checking session ${cachedId}: ${err.message || err}`);
+            }
+            console.log(`[PersistentAgent.ensureSession] Session ${cachedId} for agent "${agent.name}" is gone, creating a new one`);
         }
 
         const sessionId = await this.createSession(agent);
         this.sessionIds.set(agent.id, sessionId);
         this.agentDb.setSessionId(agent.id, sessionId);
-        console.log(`[PersistentAgent] Created session ${sessionId} for agent "${agent.name}"`);
+        console.log(`[PersistentAgent.ensureSession] Created new session ${sessionId} for agent "${agent.name}"`);
         return sessionId;
     }
 
@@ -274,12 +320,14 @@ export class PersistentAgentService {
     private async createSession(agent: PersistentAgent): Promise<string> {
         const host = agent.host || 'localhost';
         const baseUrl = `http://${host}:${agent.port}`;
+        console.log(`[PersistentAgent.createSession] Creating session for agent "${agent.name}" at ${baseUrl}`);
 
         let modelConfig: { providerID: string; modelID: string } | undefined;
         if (agent.model) {
             const parts = agent.model.split("/");
             if (parts.length === 2) {
                 modelConfig = { providerID: parts[0], modelID: parts[1] };
+                console.log(`[PersistentAgent.createSession] Using model: ${modelConfig.providerID}/${modelConfig.modelID}`);
             }
         }
 
@@ -300,11 +348,16 @@ export class PersistentAgentService {
             signal: AbortSignal.timeout(10000),
         });
 
+        console.log(`[PersistentAgent.createSession] Session creation response status: ${createRes.status}`);
+
         if (!createRes.ok) {
-            throw new Error(`Create session failed: ${createRes.status} ${await createRes.text()}`);
+            const errorText = await createRes.text().catch(() => 'N/A');
+            console.error(`[PersistentAgent.createSession] Session creation failed: ${createRes.status} - ${errorText}`);
+            throw new Error(`Create session failed: ${createRes.status} ${errorText}`);
         }
 
         const sess = await createRes.json() as any;
+        console.log(`[PersistentAgent.createSession] Session created with ID: ${sess.id}`);
         return sess.id as string;
     }
 
@@ -363,13 +416,18 @@ export class PersistentAgentService {
             port = agent.port;
         }
         
+        const url = `http://${host}:${port}`;
         try {
+            console.log(`[PersistentAgent.isServerRunning] Checking server at ${url}`);
             const res = await fetch(`http://${host}:${port}`, {
                 method: "HEAD",
                 signal: AbortSignal.timeout(3000),
             });
-            return res.ok || res.status < 500;
-        } catch {
+            const result = res.ok || res.status < 500;
+            console.log(`[PersistentAgent.isServerRunning] Server at ${url} responded: ${result ? 'RUNNING' : 'NOT RUNNING'} (status: ${res.status})`);
+            return result;
+        } catch (err: any) {
+            console.log(`[PersistentAgent.isServerRunning] Server at ${url} NOT reachable: ${err.message || err}`);
             return false;
         }
     }
@@ -381,8 +439,12 @@ export class PersistentAgentService {
     // ─── SSE stream per agent ─────────────────────────────────────────────────
 
     private startSseStream(agent: PersistentAgent): void {
-        if (this.sseControllers.has(agent.id)) return;
+        if (this.sseControllers.has(agent.id)) {
+            console.log(`[PersistentAgent.startSseStream] SSE stream already running for agent "${agent.name}"`);
+            return;
+        }
 
+        console.log(`[PersistentAgent.startSseStream] Starting SSE stream for agent "${agent.name}" at ${agent.host || 'localhost'}:${agent.port}`);
         const abort = new AbortController();
         this.sseControllers.set(agent.id, abort);
 

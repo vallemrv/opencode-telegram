@@ -53,6 +53,10 @@ BACKGROUND_WORKDIR=
 # Maximum number of simultaneous agents (soft limit — bot warns but does not block)
 MAX_AGENTS=10
 
+# Discovery server port for remote agent discovery (multi-node support)
+# This port is used to discover and connect to agents on remote nodes
+DISCOVERY_PORT=17000
+
 # Auto-delete timeout for confirmation messages in milliseconds (0 = disable)
 MESSAGE_DELETE_TIMEOUT=10000
 
