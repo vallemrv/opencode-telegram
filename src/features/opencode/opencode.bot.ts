@@ -386,16 +386,13 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        const maxAgents = this.configService.getMaxAgents();
-        const existing = this.agentDb.getByUser(userId);
-        // Only running agents count against the limit — stopped/parked ones don't
-        const runningCount = existing.filter(a => a.status === "running").length;
-        if (runningCount >= maxAgents) {
-            // Soft warning — do not block
-            await ctx.reply(
-                `⚠️ Tienes ${runningCount} agentes activos (límite recomendado: ${maxAgents}).\n\n` +
-                `Puedes crear uno más, o aparcar alguno con ⏹️ en /agents para liberar espacio.`
-            );
+        // Disconnect any active remote agent
+        this.disconnectRemoteAgent(userId);
+
+        const inWizard = this.newWizard.get(userId);
+        if (inWizard) {
+            await ctx.reply("ℹ️ Ya estás creando un agente. Termina ese proceso o usa /esc para cancelar.");
+            return;
         }
 
         const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "github-copilot/claude-sonnet-4.6";
@@ -771,8 +768,15 @@ export class OpenCodeBot {
     /** Handle /agents command — optional IP for remote nodes */
     private async handleAgentsWithIp(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
+        if (!userId) return;
+        
         const args = ctx.message?.text?.split(/\s+/).slice(1) || [];
         const ipArg = args[0]?.trim();
+
+        // If called without IP, disconnect any active remote agent first
+        if (!ipArg) {
+            this.disconnectRemoteAgent(userId);
+        }
 
         if (ipArg) {
             await this.handleRemoteAgents(ctx, ipArg);
@@ -1020,6 +1024,9 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
 
+        // Disconnect any active remote agent
+        this.disconnectRemoteAgent(userId);
+
         const allAgents = this.agentDb.getByUser(userId);
         const agents = allAgents.filter(a => a.status !== "stopped");
         if (agents.length === 0) {
@@ -1158,9 +1165,6 @@ export class OpenCodeBot {
     private async handleMessage(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
         if (!userId) return;
-
-        // Disconnect any remote agent before processing (one-shot behavior)
-        this.disconnectRemoteAgent(userId);
 
         const prompt = ctx.message?.text?.trim() || "";
         if (!prompt) return;
@@ -1493,6 +1497,9 @@ export class OpenCodeBot {
     private async handleModels(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
         if (!userId) return;
+
+        // Disconnect any active remote agent
+        this.disconnectRemoteAgent(userId);
 
         const activeId = this.persistentAgentService.getActiveAgentId(userId)
             ?? this.agentDb.getLastUsed(userId)?.id;
@@ -1939,6 +1946,22 @@ export class OpenCodeBot {
                     isRemote: true,
                 } as PersistentAgent;
             }
+        }
+        
+        // No active agent - check for remote agent in memory as fallback
+        const remoteAgent = this.remoteAgentsInMemory.get(userId);
+        if (remoteAgent) {
+            return {
+                id: remoteAgent.id,
+                userId,
+                name: `Remote (${remoteAgent.host})`,
+                workdir: `/remote/${remoteAgent.host}/`,
+                model: remoteAgent.model,
+                port: remoteAgent.port,
+                status: "running",
+                host: remoteAgent.host,
+                isRemote: true,
+            } as PersistentAgent;
         }
         
         const lastUsed = this.agentDb.getLastUsed(userId);
