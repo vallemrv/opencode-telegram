@@ -1,0 +1,4 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "bailian-coding-plan/qwen3.5-plus"
+}

@@ -724,6 +724,25 @@ export class PersistentAgentService {
             return;
         }
 
+        // Watchdog: if session.idle was missed, resolve once the server reports idle.
+        try {
+            const host = agent.host || 'localhost';
+            const statusRes = await fetch(
+                `http://${host}:${agent.port}/session/${pending.sessionId}`,
+                { signal: AbortSignal.timeout(5000) }
+            );
+            if (statusRes.ok) {
+                const session: any = await statusRes.json();
+                const status = session?.status ?? session?.info?.status;
+                if (status === "idle") {
+                    await this.resolvePromptFromIdle(agent, pending.sessionId);
+                    return;
+                }
+            }
+        } catch {
+            // best-effort watchdog only
+        }
+
         const minutesRunning = (Date.now() - pending.startedAt) / 60000;
 
         // Best-effort: fetch messages and extract rich info
@@ -835,6 +854,9 @@ export class PersistentAgentService {
             if (!started.success) {
                 return { output: `❌ Could not start agent server: ${started.message}` };
             }
+        } else if (!this.sseControllers.has(agent.id)) {
+            // If the server is up but SSE is detached, attach now to avoid hanging prompts.
+            this.startSseStream(agent);
         }
 
         // Get or create the long-lived session for this agent

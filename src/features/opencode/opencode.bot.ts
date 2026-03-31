@@ -4,6 +4,7 @@
  * Comandos:
  *   /new       — Wizard: crea agente (Gitea / GitHub / local) + arranca servidor
  *   /agents    — Lista agentes, activa sticky, borra
+ *   /web       — Abre OpenCode Web remoto por IP/host
  *   /run       — One-shot: prompt puntual a un agente
  *   /models    — Cambia el modelo del agente activo
  *   /esc       — Cancela wizard, desactiva sticky, o aborta operación en curso
@@ -71,6 +72,36 @@ function resolveHome(p: string): string {
 function getAgentBaseUrl(agent: { host?: string; port: number }): string {
     const host = agent.host || 'localhost';
     return `http://${host}:${agent.port}`;
+}
+
+function base64UrlEncode(value: string): string {
+    return Buffer.from(value, "utf8")
+        .toString("base64")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "");
+}
+
+function normalizeHostForUrl(value?: string): string | undefined {
+    if (!value) return undefined;
+
+    let host = value.trim();
+    if (!host) return undefined;
+
+    host = host.replace(/^https?:\/\//i, "");
+    host = host.split("/")[0] || "";
+
+    if (host.includes("@")) {
+        host = host.split("@").pop() || "";
+    }
+
+    if (host.startsWith("[")) {
+        const end = host.indexOf("]");
+        return end > 0 ? host.slice(0, end + 1) : undefined;
+    }
+
+    const [withoutPort] = host.split(":");
+    return withoutPort?.trim() || undefined;
 }
 
 /** Global workspace root: WORKSPACE_DIR env or ~/proyectos */
@@ -265,6 +296,7 @@ export class OpenCodeBot {
         bot.command("help",  AccessControlMiddleware.requireAccess, this.handleStart.bind(this));
         bot.command("new",     AccessControlMiddleware.requireAccess, this.handleNew.bind(this));
         bot.command("agents",  AccessControlMiddleware.requireAccess, (ctx) => this.handleAgentsWithIp(ctx));
+        bot.command("web",     AccessControlMiddleware.requireAccess, this.handleWeb.bind(this));
         bot.command("run",     AccessControlMiddleware.requireAccess, this.handleRun.bind(this));
         bot.command("models",  AccessControlMiddleware.requireAccess, this.handleModels.bind(this));
         bot.command("esc",     AccessControlMiddleware.requireAccess, this.handleEsc.bind(this));
@@ -357,6 +389,7 @@ export class OpenCodeBot {
             `<b>Comandos:</b>\n` +
             `/new — Crear agente (${isGitea ? "Gitea ✅" : "Gitea ❌"} / ${isGithub ? "GitHub ✅" : "GitHub ❌"} / local)\n` +
             `/agents [<ip>] — Ver agentes (usa <ip> para nodos remotos)\n` +
+            `/web <ip> — Abrir OpenCode Web por proyecto (remoto)\n` +
             `/run — Prompt puntual a un agente\n` +
             `/session — Ver sesiones del agente activo\n` +
             `/rename — Renombrar la sesión activa\n` +
@@ -372,6 +405,7 @@ export class OpenCodeBot {
             `2. Escribe tus mensajes directamente\n` +
             `3. <code>/esc</code> para desactivar agente\n\n` +
             `<b>Remoto:</b> <code>/agents 10.0.0.8</code> → pulsa agente → úsalo una vez\n\n` +
+            `<b>Web:</b> <code>/web 10.0.0.8</code>\n\n` +
             `<b>Límite:</b> ${maxAgents} agentes activos (MAX_AGENTS en .env)\n` +
             `Los agentes aparcados (⏹️ en /agents) no cuentan para el límite.`,
             { parse_mode: "HTML" }
@@ -395,7 +429,7 @@ export class OpenCodeBot {
             return;
         }
 
-        const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "github-copilot/claude-sonnet-4.6";
+        const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "bailian-coding-plan/qwen3.5-plus";
         const inlineName = ctx.message?.text?.replace(/^\/new\s*/i, "").trim() || "";
 
         if (inlineName) {
@@ -785,12 +819,115 @@ export class OpenCodeBot {
         }
     }
 
+    private isValidHost(host: string): boolean {
+        const trimmed = host.trim();
+        if (!trimmed || trimmed.length > 253) return false;
+
+        // IP v4 or hostname without protocol/path.
+        const hostRegex = /^(\d{1,3}(?:\.\d{1,3}){3}|[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*)$/;
+        if (!hostRegex.test(trimmed)) return false;
+
+        // Additional octet guard when IP format is used.
+        if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(trimmed)) {
+            const octets = trimmed.split(".").map(Number);
+            return octets.every(o => Number.isInteger(o) && o >= 0 && o <= 255);
+        }
+
+        return true;
+    }
+
+    private getAgentWebProjectUrl(host: string, port: number, workdir: string): string {
+        const slug = base64UrlEncode(workdir);
+        return `http://${host}:${port}/${slug}/session`;
+    }
+
+    private getPreferredLocalWebHost(agentHost?: string): string {
+        const fromAgent = normalizeHostForUrl(agentHost);
+        if (fromAgent && fromAgent !== "0.0.0.0") return fromAgent;
+
+        const fromEnv = normalizeHostForUrl(process.env.OPENCODE_WEB_HOST || "");
+        if (fromEnv) return fromEnv;
+
+        return "localhost";
+    }
+
+    private async handleWeb(ctx: Context): Promise<void> {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const args = ctx.message?.text?.split(/\s+/).slice(1) || [];
+        const hostArg = args[0]?.trim();
+
+        if (!hostArg) {
+            await ctx.reply(
+                `ℹ️ Para abrir OpenCode Web debes indicar la IP/host del nodo.\n\n` +
+                `Usa: <code>/web &lt;ip&gt;</code>\n` +
+                `Ejemplo: <code>/web 10.0.0.8</code>`,
+                { parse_mode: "HTML" }
+            );
+            return;
+        }
+
+        await this.handleRemoteWeb(ctx, hostArg);
+    }
+
+    private async handleRemoteWeb(ctx: Context, host: string): Promise<void> {
+        if (!this.isValidHost(host)) {
+            await ctx.reply(`❌ Host inválido: ${host}`);
+            return;
+        }
+
+        const discoveryPort = parseInt(process.env.DISCOVERY_PORT || "17000", 10);
+        const discoveryUrl = `http://${host}:${discoveryPort}/discovery`;
+
+        try {
+            const response = await fetch(discoveryUrl, {
+                signal: AbortSignal.timeout(5000),
+            });
+
+            if (!response.ok) {
+                await ctx.reply(`❌ No se pudo consultar ${host}:${discoveryPort} (HTTP ${response.status}).`);
+                return;
+            }
+
+            const data = await response.json() as any;
+            const agents = (data.agents || []) as Array<{ port: number; project: string; workdir: string; status?: string }>;
+            const activeAgents = agents.filter(a => !a.status || a.status === "running");
+
+            if (activeAgents.length === 0) {
+                await ctx.reply(`📭 ${host} no reporta proyectos por discovery.`);
+                return;
+            }
+
+            const keyboard = new InlineKeyboard();
+            const lines: string[] = [];
+
+            for (const agent of activeAgents) {
+                const status = agent.status === "running" ? "🟢" : "⏸️";
+                const projectName = agent.project || `puerto-${agent.port}`;
+                const serverUrl = `http://${host}:${agent.port}`;
+
+                keyboard
+                    .url(`${status} ${projectName}`, serverUrl)
+                    .row();
+
+                lines.push(`• <b>${escapeHtml(projectName)}</b> — <code>${host}:${agent.port}</code>`);
+            }
+
+            await ctx.reply(
+                `🌐 <b>OpenCode Web (remoto)</b>\n\nHost: <code>${escapeHtml(host)}</code>\n\n${lines.join("\n")}\n\nPulsa el botón del proyecto para abrir su server web (<code>${escapeHtml(host)}:puerto</code>).`,
+                { parse_mode: "HTML", reply_markup: keyboard }
+            );
+        } catch (error: any) {
+            await ctx.reply(`❌ Error consultando ${host}: ${error?.message || error}`);
+        }
+    }
+
     /** Discover and display agents from a remote host */
     private async handleRemoteAgents(ctx: Context, host: string): Promise<void> {
         try {
-            // Validate IP format
-            const ipRegex = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9](\.[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])*)$/;
-            if (!ipRegex.test(host)) {
+            // Validate host format
+            if (!this.isValidHost(host)) {
                 await ctx.reply(`❌ Formato de IP/host inválido: ${host}`);
                 return;
             }
@@ -865,7 +1002,7 @@ export class OpenCodeBot {
         );
         const userId = ctx.from?.id;
         if (!userId) return;
-        const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "github-copilot/claude-sonnet-4.6";
+        const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "bailian-coding-plan/qwen3.5-plus";
         this.newWizard.set(userId, { step: "name", model: defaultModel });
     }
 
@@ -1491,6 +1628,31 @@ export class OpenCodeBot {
         }
     }
 
+    private async getAuthorizedProviders(): Promise<Set<string>> {
+        try {
+            const opencodeCmd = await findOpencodeCmd();
+            const output = execSync(`"${opencodeCmd}" auth list 2>/dev/null`, { encoding: "utf-8" });
+            const providers = new Set<string>();
+
+            for (const line of output.split("\n")) {
+                const clean = line
+                    // Remove ANSI escape sequences if present
+                    .replace(/\x1b\[[0-9;]*m/g, "")
+                    .trim();
+
+                const match = clean.match(/^(?:●|\*|-)\s+([a-zA-Z0-9._-]+)/);
+                if (match?.[1]) {
+                    providers.add(match[1]);
+                }
+            }
+
+            return providers;
+        } catch (error) {
+            console.error("Error fetching authorized providers from opencode:", error);
+            return new Set();
+        }
+    }
+
     // /models — cambiar modelo del agente activo
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1540,7 +1702,24 @@ export class OpenCodeBot {
         if (!userId) return;
 
         const modelsCache = await this.getAvailableModels();
-        const providers = Object.keys(modelsCache).sort();
+        const authorizedProviders = await this.getAuthorizedProviders();
+        const currentProvider = currentModel.split("/")[0] || "";
+
+        let providers = Object.keys(modelsCache)
+            .filter(provider => {
+                // If auth list is unavailable, keep legacy behavior (show all)
+                if (authorizedProviders.size === 0) return true;
+                // Always keep current provider so user can see current state
+                // Keep "opencode" too: it can expose free/available models
+                // even when it is not listed in auth credentials.
+                return authorizedProviders.has(provider) || provider === currentProvider || provider === "opencode";
+            })
+            .sort();
+
+        // Fallback to all providers if filtering leaves no options
+        if (providers.length === 0) {
+            providers = Object.keys(modelsCache).sort();
+        }
 
         this.modelSelection.set(userId, { agentId, modelsCache, providers });
 
@@ -1631,8 +1810,9 @@ export class OpenCodeBot {
             this.agentDb.updateModel(state.agentId, model);
             this.modelSelection.delete(userId);
 
-            // Option A: Clear current session so next prompt uses new model
-            const sessionId = this.persistentAgentService.getSessionId(agent.id);
+            // Clear current session so the next prompt is created with the new model.
+            // Use DB fallback because in-memory cache can be empty after restart.
+            const sessionId = this.persistentAgentService.getSessionId(agent.id) || agent.sessionId;
             if (sessionId) {
                 try {
                     const baseUrl = getAgentBaseUrl(agent);
@@ -1644,10 +1824,12 @@ export class OpenCodeBot {
                 } catch (err) {
                     console.warn(`[handleModelCallback] Error deleting old session:`, err);
                 }
-                // Clear cached session ID
-                this.persistentAgentService.setSessionId(agent.id, "");
                 console.log(`[handleModelCallback] Cleared session ${sessionId} for agent "${agent.name}" - new model: ${model}`);
             }
+
+            // Always clear persisted + cached session ID.
+            // If deletion failed or there was no in-memory cache, this still forces a fresh session.
+            this.persistentAgentService.setSessionId(agent.id, "");
 
             await ctx.editMessageText(
                 `✅ Modelo de <b>${escapeHtml(agent.name)}</b> cambiado a <code>${escapeHtml(model)}</code>\n\n🔄 Se creará una nueva sesión con el próximo mensaje.`,
@@ -2467,7 +2649,7 @@ export class OpenCodeBot {
         }
 
         const { host, port, project, workdir, sessionId, model } = info;
-        const defaultModel = model || process.env.OPENCODE_DEFAULT_MODEL || "github-copilot/claude-sonnet-4.6";
+        const defaultModel = model || process.env.OPENCODE_DEFAULT_MODEL || "bailian-coding-plan/qwen3.5-plus";
 
         console.log(`[handleRemoteAgentSelect] Connecting to remote agent: ${project} at ${host}:${port}`);
 

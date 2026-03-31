@@ -89,6 +89,7 @@ async function startBot() {
             await bot.api.setMyCommands([
                 { command: 'new',       description: 'Crear nuevo agente' },
                 { command: 'agents',    description: 'Listar / gestionar agentes' },
+                { command: 'web',       description: 'Abrir OpenCode Web por proyecto' },
                 { command: 'run',       description: 'Enviar prompt one-shot a un agente' },
                 { command: 'session',   description: 'Ver sesiones del agente activo' },
                 { command: 'rename',    description: 'Renombrar sesión activa' },
@@ -100,6 +101,7 @@ async function startBot() {
                 { command: 'redo',      description: 'Restaurar cambio revertido' },
                 { command: 'restart',   description: 'Reiniciar bot y agentes' },
                 { command: 'start',     description: 'Mensaje de bienvenida' },
+                { command: 'help',      description: 'Mostrar ayuda' },
             ]);
             console.log('[TelegramCoder] ✅ Bot commands registered');
         } catch (error) {

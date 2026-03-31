@@ -21,7 +21,7 @@ AUTO_KILL=false
 OPENCODE_SERVER_URL=http://localhost:4096
 
 # Default model to use when no model is selected (provider/model-id)
-OPENCODE_DEFAULT_MODEL=github-copilot/claude-sonnet-4.6
+OPENCODE_DEFAULT_MODEL=bailian-coding-plan/qwen3.5-plus
 
 # ─── Workspace ───────────────────────────────────────────────────────────────
 # Root directory where new projects are created when you type a plain name in /new.
@@ -44,7 +44,7 @@ GITHUB_TOKEN=
 # ─── Background Agent (/run command) ────────────────────────────────────────
 # Default model for background opencode run tasks (provider/model-id)
 # If not set, falls back to OPENCODE_DEFAULT_MODEL
-BACKGROUND_MODEL=github-copilot/claude-sonnet-4.6
+BACKGROUND_MODEL=bailian-coding-plan/qwen3.5-plus
 
 # Default working directory for /run tasks (optional, the command will ask)
 # Supports ~ expansion. If empty, /run always asks the user.
