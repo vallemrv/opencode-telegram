@@ -10,6 +10,7 @@
     "lib": ["ES2020", "dom"],
     "types": ["node"],
     "downlevelIteration": true,
+    "ignoreDeprecations": "6.0",
     "skipLibCheck": true
   },
   "include": ["src/**/*"],

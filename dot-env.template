@@ -20,6 +20,10 @@ AUTO_KILL=false
 # OpenCode server URL (default: http://localhost:4096)
 OPENCODE_SERVER_URL=http://localhost:4096
 
+# Path to the opencode binary. Required when the process manager (systemd/PM2) runs without
+# the user's PATH (e.g. installed via nvm). Run: which opencode  to get the value.
+OPENCODE_CMD=/home/valle/.nvm/versions/node/v22.22.0/bin/opencode
+
 # Default model to use when no model is selected (provider/model-id)
 OPENCODE_DEFAULT_MODEL=bailian-coding-plan/qwen3.5-plus
 

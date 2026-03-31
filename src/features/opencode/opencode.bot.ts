@@ -498,7 +498,9 @@ export class OpenCodeBot {
         const wizard = this.newWizard.get(userId);
         if (!wizard) { await ctx.editMessageText("❌ Sesión expirada. Usa /new."); return; }
 
-        const source = ctx.callbackQuery!.data.replace("new:source:", "") as "gitea" | "github" | "none";
+        const callbackData = ctx.callbackQuery?.data;
+        if (!callbackData?.startsWith("new:source:")) return;
+        const source = callbackData.replace("new:source:", "") as "gitea" | "github" | "none";
         wizard.gitSource = source;
 
         await ctx.deleteMessage().catch(() => {});
@@ -1011,7 +1013,9 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        const agentId = ctx.callbackQuery!.data.replace("agent:activate:", "");
+        const callbackData = ctx.callbackQuery?.data;
+        if (!callbackData?.startsWith("agent:activate:")) return;
+        const agentId = callbackData.replace("agent:activate:", "");
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
 
@@ -1031,7 +1035,9 @@ export class OpenCodeBot {
 
     private async handleAgentDelete(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
-        const agentId = ctx.callbackQuery!.data.replace("agent:del:", "");
+        const callbackData = ctx.callbackQuery?.data;
+        if (!callbackData?.startsWith("agent:del:")) return;
+        const agentId = callbackData.replace("agent:del:", "");
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
 
@@ -1050,7 +1056,9 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        const agentId = ctx.callbackQuery!.data.replace("agent:delconfirm:", "");
+        const callbackData = ctx.callbackQuery?.data;
+        if (!callbackData?.startsWith("agent:delconfirm:")) return;
+        const agentId = callbackData.replace("agent:delconfirm:", "");
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
 
@@ -1101,7 +1109,9 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        const agentId = ctx.callbackQuery!.data.replace("agent:park:", "");
+        const callbackData = ctx.callbackQuery?.data;
+        if (!callbackData?.startsWith("agent:park:")) return;
+        const agentId = callbackData.replace("agent:park:", "");
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
 
@@ -1128,7 +1138,9 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        const agentId = ctx.callbackQuery!.data.replace("agent:unpark:", "");
+        const callbackData = ctx.callbackQuery?.data;
+        if (!callbackData?.startsWith("agent:unpark:")) return;
+        const agentId = callbackData.replace("agent:unpark:", "");
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
 
@@ -1233,7 +1245,9 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        const agentId = ctx.callbackQuery!.data.replace("run:agent:", "");
+        const callbackData = ctx.callbackQuery?.data;
+        if (!callbackData?.startsWith("run:agent:")) return;
+        const agentId = callbackData.replace("run:agent:", "");
         const agent = this.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
 
@@ -1628,30 +1642,7 @@ export class OpenCodeBot {
         }
     }
 
-    private async getAuthorizedProviders(): Promise<Set<string>> {
-        try {
-            const opencodeCmd = await findOpencodeCmd();
-            const output = execSync(`"${opencodeCmd}" auth list 2>/dev/null`, { encoding: "utf-8" });
-            const providers = new Set<string>();
 
-            for (const line of output.split("\n")) {
-                const clean = line
-                    // Remove ANSI escape sequences if present
-                    .replace(/\x1b\[[0-9;]*m/g, "")
-                    .trim();
-
-                const match = clean.match(/^(?:●|\*|-)\s+([a-zA-Z0-9._-]+)/);
-                if (match?.[1]) {
-                    providers.add(match[1]);
-                }
-            }
-
-            return providers;
-        } catch (error) {
-            console.error("Error fetching authorized providers from opencode:", error);
-            return new Set();
-        }
-    }
 
     // /models — cambiar modelo del agente activo
     // ─────────────────────────────────────────────────────────────────────────
@@ -1702,24 +1693,7 @@ export class OpenCodeBot {
         if (!userId) return;
 
         const modelsCache = await this.getAvailableModels();
-        const authorizedProviders = await this.getAuthorizedProviders();
-        const currentProvider = currentModel.split("/")[0] || "";
-
-        let providers = Object.keys(modelsCache)
-            .filter(provider => {
-                // If auth list is unavailable, keep legacy behavior (show all)
-                if (authorizedProviders.size === 0) return true;
-                // Always keep current provider so user can see current state
-                // Keep "opencode" too: it can expose free/available models
-                // even when it is not listed in auth credentials.
-                return authorizedProviders.has(provider) || provider === currentProvider || provider === "opencode";
-            })
-            .sort();
-
-        // Fallback to all providers if filtering leaves no options
-        if (providers.length === 0) {
-            providers = Object.keys(modelsCache).sort();
-        }
+        const providers = Object.keys(modelsCache).sort();
 
         this.modelSelection.set(userId, { agentId, modelsCache, providers });
 
@@ -1936,7 +1910,8 @@ export class OpenCodeBot {
     private async handleSessionActivate(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         // sa:PREFIX:INDEX — look up agentId + sessionId from sessIndex
-        const key = ctx.callbackQuery!.data;
+        const key = ctx.callbackQuery?.data;
+        if (!key) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
         const entry = this.sessIndex.get(key);
         if (!entry) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
         const { agentId, sessionId: sessId } = entry;
@@ -1964,7 +1939,8 @@ export class OpenCodeBot {
     private async handleSessionNew(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         // sn:PREFIX — look up agentId from sessIndex
-        const key = ctx.callbackQuery!.data;
+        const key = ctx.callbackQuery?.data;
+        if (!key) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
         const entry = this.sessIndex.get(key);
         if (!entry) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
         const { agentId } = entry;
@@ -1985,7 +1961,8 @@ export class OpenCodeBot {
     private async handleSessionDelete(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         // sx:PREFIX:INDEX — look up agentId + sessionId from sessIndex
-        const key = ctx.callbackQuery!.data;
+        const key = ctx.callbackQuery?.data;
+        if (!key) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
         const entry = this.sessIndex.get(key);
         if (!entry) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
         const { agentId, sessionId: sessId } = entry;
@@ -2016,7 +1993,8 @@ export class OpenCodeBot {
     private async handleSessionDeleteAll(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         // sd:PREFIX — look up agentId from sessIndex
-        const key = ctx.callbackQuery!.data;
+        const key = ctx.callbackQuery?.data;
+        if (!key) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
         const entry = this.sessIndex.get(key);
         if (!entry) { await ctx.editMessageText("⚠️ Botón expirado. Vuelve a ejecutar /session.").catch(() => {}); return; }
         const { agentId } = entry;
@@ -2453,7 +2431,8 @@ export class OpenCodeBot {
 
     private async handleAgentQuestionCallback(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
-        const data = ctx.callbackQuery!.data; // agq:SHORTKEY:IDX or agq:SHORTKEY:r
+        const data = ctx.callbackQuery?.data; // agq:SHORTKEY:IDX or agq:SHORTKEY:r
+        if (!data) return;
         const match = data.match(/^agq:([^:]+):(.+)$/);
         if (!match) return;
         const shortKey = match[1];
@@ -2640,7 +2619,9 @@ export class OpenCodeBot {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        const key = ctx.callbackQuery!.data.replace("remote:select:", "");
+        const callbackData = ctx.callbackQuery?.data;
+        if (!callbackData?.startsWith("remote:select:")) return;
+        const key = callbackData.replace("remote:select:", "");
         const info = this.remoteAgentIndex.get(key);
         if (!info) {
             console.error(`[handleRemoteAgentSelect] Remote agent data not found for key: ${key}`);

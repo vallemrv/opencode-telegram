@@ -83,6 +83,19 @@ export function pickPort(usedPorts: number[]): number {
 }
 
 export async function findOpencodeCmd(): Promise<string> {
+    // Allow explicit override via env var (useful when systemd PATH lacks nvm)
+    if (process.env.OPENCODE_CMD) {
+        try { await access(process.env.OPENCODE_CMD, constants.X_OK); return process.env.OPENCODE_CMD; } catch { /* invalid, fall through */ }
+    }
+
+    // Prefer the opencode found in PATH (e.g. nvm-installed) over the local
+    // node_modules copy which may be an older version with a different model list.
+    try {
+        const { execSync } = await import("child_process");
+        const found = execSync("which opencode 2>/dev/null").toString().trim();
+        if (found) return found;
+    } catch { /* not in PATH, try static candidates */ }
+
     const candidates = [
         "/usr/bin/opencode",
         "/usr/local/bin/opencode",
@@ -92,11 +105,6 @@ export async function findOpencodeCmd(): Promise<string> {
     for (const p of candidates) {
         try { await access(p, constants.X_OK); return p; } catch { /* next */ }
     }
-    try {
-        const { execSync } = await import("child_process");
-        const found = execSync("which opencode").toString().trim();
-        if (found) return found;
-    } catch { /* not found */ }
     throw new Error("opencode binary not found");
 }
 
