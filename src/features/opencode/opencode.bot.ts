@@ -746,6 +746,11 @@ export class OpenCodeBot {
     // /agents — lista y gestión
     // ─────────────────────────────────────────────────────────────────────────
 
+    private getAgentDisplayName(name: string): string {
+        const parts = name.split(/[\/\\]/);
+        return parts.length > 1 ? parts[parts.length - 1] : name;
+    }
+
     private async handleAgents(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
         if (!userId) return;
@@ -758,9 +763,10 @@ export class OpenCodeBot {
         for (const agent of agents) {
             const isStopped = agent.status === "stopped";
             const isActive = agent.id === activeId;
+            const displayName = this.getAgentDisplayName(agent.name);
             const label = isStopped
-                ? `⏸️ ${agent.name}`
-                : isActive ? `✅ ${agent.name}` : agent.name;
+                ? `⏸️ ${displayName}`
+                : isActive ? `✅ ${displayName}` : displayName;
 
             if (isStopped) {
                 // Parked agent: show resume button instead of activate/prompt
@@ -772,7 +778,6 @@ export class OpenCodeBot {
             } else {
                 keyboard
                     .text(label, `agent:activate:${agent.id}`)
-                    .text("💬", `run:agent:${agent.id}`)
                     .text("⏹️", `agent:park:${agent.id}`)
                     .text("🗑️", `agent:del:${agent.id}`)
                     .row();
@@ -782,8 +787,9 @@ export class OpenCodeBot {
         // Always show "➕ Nuevo agente" at the bottom
         keyboard.text("➕ Nuevo agente", "agent:new");
 
+        const activeAgent = agents.find(a => a.id === activeId);
         const activeInfo = activeId
-            ? `\n\n🟢 <b>${escapeHtml(agents.find(a => a.id === activeId)?.name ?? "")}</b> activo — tus mensajes van a él.\n/esc para volver a ninguno.`
+            ? `\n\n🟢 <b>${escapeHtml(this.getAgentDisplayName(activeAgent?.name ?? ""))}</b> activo — tus mensajes van a él.\n/esc para volver a ninguno.`
             : agents.length === 0
                 ? `\n\n⚪ Aún no tienes agentes.`
                 : `\n\n⚪ Ningún agente activo.`;
@@ -792,7 +798,7 @@ export class OpenCodeBot {
         const header = agents.length === 0
             ? `🤖 <b>Tus agentes</b>\n\nNo tienes agentes todavía.`
             : `🤖 <b>Tus agentes (${runningAgents.length}/${maxAgents} activos, ${agents.length} total)</b>\n\n` +
-              `Toca el nombre para activar (sticky), 💬 prompt, ⏹️ aparcar, ▶️ reanudar, 🗑️ borrar.\n` +
+              `Toca el nombre para activar (sticky), ⏹️ aparcar, ▶️ reanudar, 🗑️ borrar.\n` +
               `Los agentes aparcados (⏸️) no cuentan para el límite de ${maxAgents}.`;
 
         await ctx.reply(

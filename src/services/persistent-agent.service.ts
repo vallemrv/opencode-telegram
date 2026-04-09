@@ -88,6 +88,13 @@ export async function findOpencodeCmd(): Promise<string> {
         try { await access(process.env.OPENCODE_CMD, constants.X_OK); return process.env.OPENCODE_CMD; } catch { /* invalid, fall through */ }
     }
 
+    // Force use /usr/bin/opencode explicitly
+    const forcedPath = "/usr/bin/opencode";
+    try {
+        await access(forcedPath, constants.X_OK);
+        return forcedPath;
+    } catch { /* fall through to other candidates */ }
+
     // Prefer the opencode found in PATH (e.g. nvm-installed) over the local
     // node_modules copy which may be an older version with a different model list.
     try {
@@ -97,7 +104,6 @@ export async function findOpencodeCmd(): Promise<string> {
     } catch { /* not in PATH, try static candidates */ }
 
     const candidates = [
-        "/usr/bin/opencode",
         "/usr/local/bin/opencode",
         path.join(process.env.HOME || "", ".opencode", "bin", "opencode"),
         path.join(process.cwd(), "node_modules", ".bin", "opencode"),
@@ -502,10 +508,18 @@ export class PersistentAgentService {
                     if (type === "session.error") {
                         const errorSessionId: string = props?.sessionID ?? props?.id ?? "";
                         const mySessionId = this.sessionIds.get(agent.id);
-                        const errorMessage: string =
+                        let errorMessage: string =
                             props?.error?.message ?? props?.message ??
                             (typeof props?.error === "string" ? props.error : null) ??
                             "Error desconocido del modelo";
+                        
+                        // Extraer mensaje real de errores anidados (ej: APIError con data.message)
+                        if ((errorMessage === "Error desconocido del modelo" || errorMessage?.includes("Unauthorized")) && props?.error?.data) {
+                            const nestedMessage = props.error.data?.message || props.error.data?.error?.message;
+                            if (nestedMessage) {
+                                errorMessage = nestedMessage;
+                            }
+                        }
 
                         // Log the full raw event so we can see what opencode is actually sending
                         console.error(`[PersistentAgent] session.error for agent "${agent.name}": ${errorMessage} | raw: ${JSON.stringify(props)}`);
