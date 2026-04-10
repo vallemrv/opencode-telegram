@@ -19,6 +19,7 @@
 
 import { spawn, ChildProcess, execSync } from "child_process";
 import { access, constants } from "fs/promises";
+import { realpathSync } from "fs";
 import * as path from "path";
 import * as os from "os";
 import { createOpencodeClient } from "@opencode-ai/sdk";
@@ -52,7 +53,7 @@ export interface HeartbeatSummary {
     minutesRunning: number;
     /** Name of the last tool called (e.g. "edit", "bash", "read") — best-effort */
     lastToolName: string;
-    /** Last snippet of assistant text (up to 120 chars) — best-effort */
+    /** Last snippet of assistant text (up to 300 chars) — best-effort */
     lastText: string;
     /** Total number of messages in the session so far */
     messageCount: number;
@@ -60,6 +61,10 @@ export interface HeartbeatSummary {
     filesModified: number;
     /** True if approaching hard timeout (80% of TIMEOUT_MS) */
     isNearTimeout?: boolean;
+    /** List of recently modified file paths (up to 5) */
+    recentFiles: string[];
+    /** Last bash command executed, if any */
+    lastBashCmd: string;
 }
 
 /** Called by OpenCodeBot on each heartbeat tick (only while a prompt is in-flight) */
@@ -67,10 +72,16 @@ export type OnHeartbeatCallback = (agentId: string, summary: HeartbeatSummary) =
 
 /** Resolve ~ in paths */
 export function resolveDir(p: string): string {
-    if (p.startsWith("~/") || p === "~") {
-        return path.join(os.homedir(), p.slice(1));
+    let resolved = p;
+    if (resolved.startsWith("~/") || resolved === "~") {
+        resolved = path.join(os.homedir(), resolved.slice(1));
     }
-    return p;
+    try {
+        resolved = realpathSync(resolved);
+    } catch {
+        // path may not exist yet; return the expanded path as-is
+    }
+    return resolved;
 }
 
 /** Pick an available port in range 15000-16000, avoiding already-used ones */
@@ -115,7 +126,7 @@ export async function findOpencodeCmd(): Promise<string> {
 }
 
 /** Heartbeat interval while a prompt is in-flight */
-const HEARTBEAT_INTERVAL_MS = 3 * 60 * 1000;
+const HEARTBEAT_INTERVAL_MS = 1 * 60 * 1000;
 
 /** File-modifying tool names recognised for the filesModified counter */
 const FILE_WRITE_TOOLS = new Set(["edit", "write", "patch", "multiedit"]);
@@ -312,15 +323,23 @@ export class PersistentAgentService {
                     signal: AbortSignal.timeout(5000),
                 });
                 if (res.ok) {
-                    this.sessionIds.set(agent.id, cachedId);
-                    console.log(`[PersistentAgent.ensureSession] Existing session ${cachedId} is valid`);
-                    return cachedId;
+                    const sess: any = await res.json();
+                    // Validate that the session belongs to this agent's workdir
+                    const expectedDir = resolveDir(agent.workdir);
+                    if (sess.directory && sess.directory !== expectedDir) {
+                        console.log(`[PersistentAgent.ensureSession] Session ${cachedId} belongs to a different directory (${sess.directory} vs ${expectedDir}), creating new session`);
+                    } else {
+                        this.sessionIds.set(agent.id, cachedId);
+                        console.log(`[PersistentAgent.ensureSession] Existing session ${cachedId} is valid`);
+                        return cachedId;
+                    }
+                } else {
+                    console.log(`[PersistentAgent.ensureSession] Existing session ${cachedId} returned status ${res.status}, creating new session`);
                 }
-                console.log(`[PersistentAgent.ensureSession] Existing session ${cachedId} returned status ${res.status}, creating new session`);
             } catch (err: any) {
                 console.log(`[PersistentAgent.ensureSession] Error checking session ${cachedId}: ${err.message || err}`);
             }
-            console.log(`[PersistentAgent.ensureSession] Session ${cachedId} for agent "${agent.name}" is gone, creating a new one`);
+            console.log(`[PersistentAgent.ensureSession] Session ${cachedId} for agent "${agent.name}" is gone or mismatched, creating a new one`);
         }
 
         const sessionId = await this.createSession(agent);
@@ -807,6 +826,8 @@ export class PersistentAgentService {
         let lastText = "";
         let messageCount = 0;
         let filesModified = 0;
+        const recentFilesSet: string[] = [];
+        let lastBashCmd = "";
 
         try {
         const host = agent.host || 'localhost';
@@ -823,10 +844,28 @@ export class PersistentAgentService {
                         if (part.type === "tool-invocation") {
                             const toolName: string = (part.toolName ?? part.name ?? "").toLowerCase();
                             if (toolName) lastToolName = toolName;
-                            if (FILE_WRITE_TOOLS.has(toolName)) filesModified++;
+                            if (FILE_WRITE_TOOLS.has(toolName)) {
+                                filesModified++;
+                                // Extract file path from tool args
+                                const args = part.args ?? part.input ?? {};
+                                const filePath: string = args.filePath ?? args.path ?? args.file ?? "";
+                                if (filePath) {
+                                    // Keep only the last 5 unique files, most recent last
+                                    const idx = recentFilesSet.indexOf(filePath);
+                                    if (idx !== -1) recentFilesSet.splice(idx, 1);
+                                    recentFilesSet.push(filePath);
+                                    if (recentFilesSet.length > 5) recentFilesSet.shift();
+                                }
+                            }
+                            // Capture last bash command
+                            if (toolName === "bash") {
+                                const args = part.args ?? part.input ?? {};
+                                const cmd: string = args.command ?? args.cmd ?? "";
+                                if (cmd) lastBashCmd = cmd.trim().slice(0, 120);
+                            }
                         }
                         if (part.type === "text" && part.text) {
-                            lastText = (part.text as string).replace(/\s+/g, " ").trim().slice(0, 120);
+                            lastText = (part.text as string).replace(/\s+/g, " ").trim().slice(0, 300);
                         }
                     }
                 }
@@ -840,6 +879,8 @@ export class PersistentAgentService {
                 lastText,
                 messageCount,
                 filesModified,
+                recentFiles: recentFilesSet,
+                lastBashCmd,
             });
         } catch (err) {
             console.error(`[PersistentAgent] heartbeat error for "${agent.name}":`, err);
