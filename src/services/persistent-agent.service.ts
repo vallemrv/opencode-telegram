@@ -841,13 +841,16 @@ export class PersistentAgentService {
 
                 for (const msg of messages) {
                     for (const part of (msg.parts ?? [])) {
-                        if (part.type === "tool-invocation") {
-                            const toolName: string = (part.toolName ?? part.name ?? "").toLowerCase();
+                        // opencode v2 API uses type "tool" with part.tool (name) and part.state.input
+                        // Kept "tool-invocation" fallback for legacy compatibility
+                        const isToolPart = part.type === "tool" || part.type === "tool-invocation";
+                        if (isToolPart) {
+                            const toolName: string = (part.tool ?? part.toolName ?? part.name ?? "").toLowerCase();
                             if (toolName) lastToolName = toolName;
                             if (FILE_WRITE_TOOLS.has(toolName)) {
                                 filesModified++;
-                                // Extract file path from tool args
-                                const args = part.args ?? part.input ?? {};
+                                // v2: args live in part.state.input; legacy: part.args or part.input
+                                const args = part.state?.input ?? part.args ?? part.input ?? {};
                                 const filePath: string = args.filePath ?? args.path ?? args.file ?? "";
                                 if (filePath) {
                                     // Keep only the last 5 unique files, most recent last
@@ -859,7 +862,7 @@ export class PersistentAgentService {
                             }
                             // Capture last bash command
                             if (toolName === "bash") {
-                                const args = part.args ?? part.input ?? {};
+                                const args = part.state?.input ?? part.args ?? part.input ?? {};
                                 const cmd: string = args.command ?? args.cmd ?? "";
                                 if (cmd) lastBashCmd = cmd.trim().slice(0, 120);
                             }
