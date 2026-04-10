@@ -113,24 +113,8 @@ export class ModelsHandler {
             this.ctx.agentDb.updateModel(state.agentId, model);
             this.ctx.modelSelection.delete(userId);
 
-            // Clear current session so next prompt uses the new model
-            const sessionId = this.ctx.persistentAgentService.getSessionId(agent.id) || agent.sessionId;
-            if (sessionId) {
-                try {
-                    const baseUrl = getAgentBaseUrl(agent);
-                    await fetch(`${baseUrl}/session/${sessionId}`, {
-                        method: "DELETE",
-                        signal: AbortSignal.timeout(5000),
-                    }).catch(() => {});
-                } catch (err) {
-                    console.warn(`[ModelsHandler] Error deleting old session:`, err);
-                }
-            }
-
-            this.ctx.persistentAgentService.setSessionId(agent.id, "");
-
             await ctx.editMessageText(
-                `✅ Modelo de <b>${escapeHtml(agent.name)}</b> cambiado a <code>${escapeHtml(model)}</code>\n\n🔄 Se creará una nueva sesión con el próximo mensaje.`,
+                `✅ Modelo de <b>${escapeHtml(agent.name)}</b> cambiado a <code>${escapeHtml(model)}</code>\n\n🔄 El nuevo modelo se usará en el próximo mensaje (misma sesión).`,
                 { parse_mode: "HTML" }
             );
             return;

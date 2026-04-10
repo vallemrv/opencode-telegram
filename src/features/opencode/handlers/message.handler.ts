@@ -259,6 +259,9 @@ export class MessageHandler {
             db.setState("restart_pending_chat_id", String(ctx.chat!.id));
             db.setState("restart_pending_message_id", String(statusMsg.message_id));
             db.setState("restart_initiated_by", String(userId));
+            
+            // 5. Save active agents state for persistence
+            this.ctx.persistentAgentService.saveActiveAgentsState();
 
             await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
                 "✅ <b>Servicio reiniciado correctamente</b>\n\nEl bot se está reiniciando...",
@@ -329,25 +332,51 @@ export class MessageHandler {
 
         const pending = this.ctx.pendingAgentQuestions.get(shortKey);
         if (!pending) {
-            await ctx.editMessageText("⚠️ Esta pregunta ya fue respondida o expiró.").catch(() => {});
+            try {
+                await ctx.editMessageText("⚠️ Esta pregunta ya fue respondida o expiró.");
+            } catch (err) {
+                console.error("[MessageHandler] Failed to edit expired question message:", err);
+            }
             return;
         }
         this.ctx.pendingAgentQuestions.delete(shortKey);
 
         if (answerKey === "r") {
             const agent = this.ctx.agentDb.getById(pending.agentId);
-            if (!agent) { await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {}); return; }
+            if (!agent) {
+                try {
+                    await ctx.editMessageText("❌ Agente no encontrado.");
+                } catch (err) {
+                    console.error("[MessageHandler] Failed to edit agent not found message:", err);
+                }
+                return;
+            }
             await this.ctx.persistentAgentService.rejectQuestion(agent, pending.req.id);
-            await ctx.editMessageText("❌ Rechazado.").catch(() => {});
+            try {
+                await ctx.editMessageText("❌ Rechazado.");
+            } catch (err) {
+                console.error("[MessageHandler] Failed to edit rejection message:", err);
+            }
         } else {
             const idx = parseInt(answerKey, 10);
             const firstQ = pending.req.questions?.[0];
             const opt = firstQ?.options?.[idx];
             const label = typeof opt === "string" ? opt : (opt?.label ?? String(opt ?? answerKey));
             const agent = this.ctx.agentDb.getById(pending.agentId);
-            if (!agent) { await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {}); return; }
+            if (!agent) {
+                try {
+                    await ctx.editMessageText("❌ Agente no encontrado.");
+                } catch (err) {
+                    console.error("[MessageHandler] Failed to edit agent not found message:", err);
+                }
+                return;
+            }
             await this.ctx.persistentAgentService.replyQuestion(agent, pending.req.id, [[label]]);
-            await ctx.editMessageText(`✅ Respondido: <b>${escapeHtml(label)}</b>`, { parse_mode: "HTML" }).catch(() => {});
+            try {
+                await ctx.editMessageText(`✅ Respondido: <b>${escapeHtml(label)}</b>`, { parse_mode: "HTML" });
+            } catch (err) {
+                console.error("[MessageHandler] Failed to edit response message:", err);
+            }
         }
     }
 
@@ -400,11 +429,23 @@ export class MessageHandler {
 
         const existing = this.ctx.heartbeatMessages.get(agentId);
         if (existing) {
-            await bot.api.editMessageText(existing.chatId, existing.msgId, text, { parse_mode: "HTML" }).catch(() => {});
+            try {
+                await bot.api.editMessageText(existing.chatId, existing.msgId, text, { parse_mode: "HTML" });
+            } catch (err: any) {
+                // Message may have been deleted or already edited by another flow
+                // Clear from map to avoid stale references
+                if (err?.error_code === 400 || err?.description?.includes("message")) {
+                    this.ctx.heartbeatMessages.delete(agentId);
+                }
+            }
         } else {
-            const msg = await bot.api.sendMessage(agent.userId, text, { parse_mode: "HTML" }).catch(() => null);
-            if (msg) {
-                this.ctx.heartbeatMessages.set(agentId, { chatId: agent.userId, msgId: msg.message_id });
+            try {
+                const msg = await bot.api.sendMessage(agent.userId, text, { parse_mode: "HTML" });
+                if (msg) {
+                    this.ctx.heartbeatMessages.set(agentId, { chatId: agent.userId, msgId: msg.message_id });
+                }
+            } catch (err) {
+                console.error("[MessageHandler] Failed to send heartbeat message:", err);
             }
         }
     }
@@ -429,6 +470,15 @@ export class MessageHandler {
             );
         } catch (err) {
             console.error("[MessageHandler] Failed to send session error notification:", err);
+        }
+    }
+
+    // ── Heartbeat clear callback ──────────────────────────────────────────────
+
+    async handleAgentHeartbeatClear(agentId: string): Promise<void> {
+        const hb = this.ctx.heartbeatMessages.get(agentId);
+        if (hb) {
+            this.ctx.heartbeatMessages.delete(agentId);
         }
     }
 

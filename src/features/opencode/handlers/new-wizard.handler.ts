@@ -128,7 +128,7 @@ export class NewWizardHandler {
             return;
         }
 
-        const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "bailian-coding-plan/qwen3.5-plus";
+        const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "alibaba-coding-plan/qwen3.5-plus";
         const inlineName = ctx.message?.text?.replace(/^\/new\s*/i, "").trim() || "";
 
         if (inlineName) {
@@ -349,7 +349,7 @@ export class NewWizardHandler {
         );
         const userId = ctx.from?.id;
         if (!userId) return;
-        const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "bailian-coding-plan/qwen3.5-plus";
+        const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "alibaba-coding-plan/qwen3.5-plus";
         this.ctx.newWizard.set(userId, { step: "name", model: defaultModel });
     }
 

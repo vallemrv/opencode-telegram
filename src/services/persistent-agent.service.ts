@@ -70,6 +70,9 @@ export interface HeartbeatSummary {
 /** Called by OpenCodeBot on each heartbeat tick (only while a prompt is in-flight) */
 export type OnHeartbeatCallback = (agentId: string, summary: HeartbeatSummary) => Promise<void>;
 
+/** Called by OpenCodeBot to clear the heartbeat message when a prompt completes (success or error) */
+export type OnHeartbeatClearCallback = (agentId: string) => Promise<void>;
+
 /** Resolve ~ in paths */
 export function resolveDir(p: string): string {
     let resolved = p;
@@ -157,6 +160,9 @@ export class PersistentAgentService {
     /** Callback registered by OpenCodeBot to handle heartbeat ticks */
     private onHeartbeat?: OnHeartbeatCallback;
 
+    /** Callback registered by OpenCodeBot to clear heartbeat message when prompt completes */
+    private onHeartbeatClear?: OnHeartbeatClearCallback;
+
     /** Map of agentId → heartbeat timer handle (only active while prompt is in-flight) */
     private heartbeatTimers: Map<string, NodeJS.Timeout> = new Map();
 
@@ -193,6 +199,11 @@ export class PersistentAgentService {
     /** Register the heartbeat callback (called once at startup by OpenCodeBot) */
     setOnHeartbeatCallback(cb: OnHeartbeatCallback): void {
         this.onHeartbeat = cb;
+    }
+
+    /** Register the heartbeat clear callback (called once at startup by OpenCodeBot) */
+    setOnHeartbeatClearCallback(cb: OnHeartbeatClearCallback): void {
+        this.onHeartbeatClear = cb;
     }
 
     // ─── Server lifecycle ─────────────────────────────────────────────────────
@@ -561,6 +572,12 @@ export class PersistentAgentService {
                                     output: `❌ Error del modelo: ${errorMessage}`,
                                     sessionId: errorSessionId || mySessionId || "",
                                 });
+                                // Clear heartbeat message from bot's memory
+                                if (this.onHeartbeatClear) {
+                                    this.onHeartbeatClear(agent.id).catch(err =>
+                                        console.error(`[PersistentAgent] onHeartbeatClear callback error:`, err)
+                                    );
+                                }
                                 // Drain queue after error so queued prompts are not lost
                                 this.drainQueue(agent).catch(err =>
                                     console.error(`[PersistentAgent] drainQueue error after session.error for "${agent.name}":`, err)
@@ -639,6 +656,13 @@ export class PersistentAgentService {
         // Stop heartbeat — response arrived
         this.stopHeartbeat(agent.id);
         this.pendingPrompts.delete(agent.id);
+
+        // Clear heartbeat message from bot's memory
+        if (this.onHeartbeatClear) {
+            this.onHeartbeatClear(agent.id).catch(err =>
+                console.error(`[PersistentAgent] onHeartbeatClear callback error:`, err)
+            );
+        }
 
         try {
             const host = agent.host || 'localhost';
@@ -974,6 +998,9 @@ export class PersistentAgentService {
             const parts = agent.model.split("/");
             if (parts.length === 2) {
                 modelConfig = { providerID: parts[0], modelID: parts[1] };
+                console.log(`[PersistentAgent] Using model from agent: ${modelConfig.providerID}/${modelConfig.modelID}`);
+            } else {
+                console.warn(`[PersistentAgent] Invalid model format: ${agent.model}`);
             }
         }
 
@@ -1122,6 +1149,75 @@ export class PersistentAgentService {
             this.sessionIds.delete(agentId);
             this.agentDb.setSessionId(agentId, "");
         }
+    }
+
+    /**
+     * Save active agents state to DB for persistence across restarts
+     */
+    saveActiveAgentsState(): void {
+        const { SessionDbService } = require('./session-db.service.js');
+        const db = new SessionDbService();
+        
+        // Save each user's active agent with their session info
+        for (const [userId, agentId] of this.activeAgentByUser.entries()) {
+            db.setState(`active_agent_user_${userId}`, agentId);
+            
+            // Also save the session ID for this agent if it exists
+            const sessionId = this.sessionIds.get(agentId);
+            if (sessionId) {
+                db.setState(`sticky_session_${agentId}`, sessionId);
+            }
+        }
+        
+        // Save all session IDs cache
+        for (const [agentId, sessionId] of this.sessionIds.entries()) {
+            db.setState(`session_${agentId}`, sessionId);
+        }
+        
+        console.log(`[PersistentAgent] Saved ${this.activeAgentByUser.size} active agent(s) and ${this.sessionIds.size} session(s) to DB`);
+    }
+
+    /**
+     * Restore active agents state from DB after restart
+     * @returns Map of userId → agentId that were restored
+     */
+    restoreActiveAgentsState(): Map<number, string> {
+        const { SessionDbService } = require('./session-db.service.js');
+        const db = new SessionDbService();
+        const restored = new Map<number, string>();
+        
+        // Get all keys from bot_state that start with "active_agent_user_"
+        const activeRows = db.getStateByPattern('active_agent_user_%');
+        
+        for (const row of activeRows) {
+            const userId = parseInt(row.key.replace('active_agent_user_', ''), 10);
+            const agentId = row.value;
+            if (!isNaN(userId)) {
+                this.activeAgentByUser.set(userId, agentId);
+                restored.set(userId, agentId);
+                
+                // Restore sticky session for this agent
+                const stickySession = db.getState(`sticky_session_${agentId}`);
+                if (stickySession) {
+                    this.sessionIds.set(agentId, stickySession);
+                    console.log(`[PersistentAgent] Restored sticky session ${stickySession} for agent ${agentId} (user ${userId})`);
+                }
+            }
+        }
+        
+        // Restore all session IDs cache (includes sticky sessions)
+        const sessionEntries = db.getStateByPattern('session_%');
+        
+        for (const entry of sessionEntries) {
+            const agentId = entry.key.replace('session_', '');
+            // Don't overwrite sticky sessions
+            if (!this.sessionIds.has(agentId)) {
+                this.sessionIds.set(agentId, entry.value);
+            }
+        }
+        
+        console.log(`[PersistentAgent] Restored ${restored.size} active agent(s) and ${this.sessionIds.size} session(s) from DB`);
+        return restored;
     }
 
     /**

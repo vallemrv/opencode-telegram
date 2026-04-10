@@ -168,17 +168,29 @@ export class OpenCodeBot implements BotContext {
         const body   = result.output || "(sin salida)";
         const MAX    = 3800;
 
-        await this.bot!.api.deleteMessage(chatId, msgId).catch(() => {});
+        try {
+            await this.bot!.api.deleteMessage(chatId, msgId);
+        } catch (err) {
+            // Message may have been already deleted or edited
+        }
 
         if (body.length <= MAX) {
-            await this.bot!.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" }).catch(() => {});
+            try {
+                await this.bot!.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
+            } catch (err) {
+                console.error("[OpenCodeBot] Failed to send result message:", err);
+            }
         } else {
-            const buf = Buffer.from(body, "utf8");
-            await this.bot!.api.sendDocument(
-                chatId,
-                new InputFile(buf, `${agent.name}-respuesta.md`),
-                { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
-            ).catch(() => {});
+            try {
+                const buf = Buffer.from(body, "utf8");
+                await this.bot!.api.sendDocument(
+                    chatId,
+                    new InputFile(buf, `${agent.name}-respuesta.md`),
+                    { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
+                );
+            } catch (err) {
+                console.error("[OpenCodeBot] Failed to send result document:", err);
+            }
         }
     }
 
@@ -193,14 +205,22 @@ export class OpenCodeBot implements BotContext {
         const MAX    = 3800;
 
         if (body.length <= MAX) {
-            await this.bot!.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" }).catch(() => {});
+            try {
+                await this.bot!.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
+            } catch (err) {
+                console.error("[OpenCodeBot] Failed to send result message:", err);
+            }
         } else {
-            const buf = Buffer.from(body, "utf8");
-            await this.bot!.api.sendDocument(
-                chatId,
-                new InputFile(buf, `${agent.name}-respuesta.md`),
-                { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
-            ).catch(() => {});
+            try {
+                const buf = Buffer.from(body, "utf8");
+                await this.bot!.api.sendDocument(
+                    chatId,
+                    new InputFile(buf, `${agent.name}-respuesta.md`),
+                    { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
+                );
+            } catch (err) {
+                console.error("[OpenCodeBot] Failed to send result document:", err);
+            }
         }
     }
 
@@ -310,6 +330,9 @@ export class OpenCodeBot implements BotContext {
         );
         this.persistentAgentService.setOnHeartbeatCallback(
             this.messageHandler.handleAgentHeartbeat.bind(this.messageHandler)
+        );
+        this.persistentAgentService.setOnHeartbeatClearCallback(
+            this.messageHandler.handleAgentHeartbeatClear.bind(this.messageHandler)
         );
 
         // Restore all agents on startup

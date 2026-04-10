@@ -185,6 +185,13 @@ export class SessionDbService {
         return rows.map(r => this.mapRow(r));
     }
 
+    /** Get all key-value pairs from bot_state matching a pattern */
+    getStateByPattern(pattern: string): Array<{ key: string; value: string }> {
+        const stmt = this.db.prepare('SELECT key, value FROM bot_state WHERE key LIKE ?');
+        const rows = stmt.all(pattern) as any[];
+        return rows.map(r => ({ key: r.key, value: r.value }));
+    }
+
     private mapRow(row: any): DbSession {
         return {
             id: row.id,

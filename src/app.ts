@@ -5,6 +5,7 @@ import { PersistentAgentService } from './services/persistent-agent.service.js';
 import { OpenCodeBot } from './features/opencode/opencode.bot.js';
 import { AccessControlMiddleware } from './middleware/access-control.middleware.js';
 import { DiscoveryServerService } from './services/discovery-server.service.js';
+import { escapeHtml } from './features/opencode/event-handlers/utils.js';
 import dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -108,25 +109,91 @@ async function startBot() {
             console.error('[TelegramCoder] Failed to set bot commands:', error);
         }
 
-        // Notify user after restart if requested (before bot.start blocks)
+        // Restore active agents state from DB
         try {
+            const restoredAgents = persistentAgentService.restoreActiveAgentsState();
+            
+            // Helper: fetch session title with retry until server is ready (max 30s)
+            async function fetchSessionTitle(baseUrl: string, sessionId: string): Promise<string> {
+                const deadline = Date.now() + 30000;
+                while (Date.now() < deadline) {
+                    try {
+                        const res = await fetch(`${baseUrl}/session/${sessionId}`, { signal: AbortSignal.timeout(3000) });
+                        if (res.ok) {
+                            const sess: any = await res.json();
+                            return sess.title || sessionId.slice(0, 8);
+                        }
+                    } catch { /* server not ready yet */ }
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+                return sessionId.slice(0, 8);
+            }
+
+            // Notify admin who initiated the restart
             const { SessionDbService } = await import('./services/session-db.service.js');
             const db = new SessionDbService();
             const chatId = db.getState('restart_pending_chat_id');
             const messageId = db.getState('restart_pending_message_id');
-            if (chatId) {
-                db.deleteState('restart_pending_chat_id');
-                db.deleteState('restart_pending_message_id');
-                if (messageId) {
-                    await bot.api.editMessageText(
-                        Number(chatId), Number(messageId),
-                        '✅ Bot reiniciado correctamente.'
-                    ).catch(() => {});
+            const initiatedBy = db.getState('restart_initiated_by');
+            
+            db.deleteState('restart_pending_chat_id');
+            db.deleteState('restart_pending_message_id');
+            db.deleteState('restart_initiated_by');
+
+            // Build status message (async: waits for session titles)
+            async function buildStatusText(): Promise<string> {
+                let text = '✅ <b>Bot reiniciado correctamente</b>\n\n';
+                if (restoredAgents.size > 0) {
+                    text += '<b>📌 Agente activo (sticky) restaurado:</b>\n';
+                    for (const [userId, agentId] of restoredAgents.entries()) {
+                        const agent = agentDb.getById(agentId);
+                        if (agent) {
+                            const sessionId = persistentAgentService.getSessionId(agentId);
+                            const baseUrl = `http://${agent.host || 'localhost'}:${agent.port}`;
+                            const sessionTitle = sessionId
+                                ? await fetchSessionTitle(baseUrl, sessionId)
+                                : 'N/A';
+                            text += `• <b>${escapeHtml(agent.name)}</b> [${escapeHtml(agent.model)}]\n`;
+                            text += `  Sesión: <b>${escapeHtml(sessionTitle)}</b>\n`;
+                        } else {
+                            text += `• Agente ${agentId} (no encontrado en DB)\n`;
+                        }
+                    }
+                    text += '\n<i>💡 Puedes enviar mensajes directamente y el agente activo los recibirá.</i>\n';
                 } else {
-                    await bot.api.sendMessage(Number(chatId), '✅ Bot reiniciado correctamente.').catch(() => {});
+                    text += '<i>ℹ️ No había agentes activos antes del reinicio.</i>\n';
+                }
+                return text;
+            }
+
+            const targetChatId = chatId ? Number(chatId) : (initiatedBy ? Number(initiatedBy) : null);
+            if (targetChatId) {
+                // Send initial message immediately
+                const initialText = '🔄 <b>Bot reiniciado correctamente</b>\n\n<i>Obteniendo información de sesiones...</i>';
+                let sentMsgId: number | null = null;
+                if (messageId) {
+                    await bot.api.editMessageText(Number(chatId), Number(messageId), initialText, { parse_mode: 'HTML' }).catch(() => {});
+                    sentMsgId = Number(messageId);
+                } else {
+                    const sent = await bot.api.sendMessage(targetChatId, initialText, { parse_mode: 'HTML' }).catch(() => null);
+                    sentMsgId = sent?.message_id ?? null;
+                }
+
+                // Build full message with session titles (waits for servers to be ready)
+                const statusText = await buildStatusText();
+
+                // Update message with final content
+                if (sentMsgId) {
+                    await bot.api.editMessageText(targetChatId, sentMsgId, statusText, { parse_mode: 'HTML' }).catch(() => {
+                        bot.api.sendMessage(targetChatId, statusText, { parse_mode: 'HTML' }).catch(() => {});
+                    });
+                } else {
+                    await bot.api.sendMessage(targetChatId, statusText, { parse_mode: 'HTML' }).catch(() => {});
                 }
             }
-        } catch { /* non-fatal */ }
+        } catch (err) {
+            console.error('[TelegramCoder] Error restoring state:', err);
+        }
 
         // Start the discovery server
         await discoveryServer.start();

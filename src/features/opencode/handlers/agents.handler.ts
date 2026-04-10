@@ -317,7 +317,7 @@ export class AgentsHandler {
         }
 
         const { host, port, project, workdir, sessionId, model } = info;
-        const defaultModel = model || process.env.OPENCODE_DEFAULT_MODEL || "bailian-coding-plan/qwen3.5-plus";
+        const defaultModel = model || process.env.OPENCODE_DEFAULT_MODEL || "alibaba-coding-plan/qwen3.5-plus";
         const agentId = `remote-${host}-${port}`;
         const agent: any = {
             id: agentId,
