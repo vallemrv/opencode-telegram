@@ -73,6 +73,33 @@ export type OnHeartbeatCallback = (agentId: string, summary: HeartbeatSummary) =
 /** Called by OpenCodeBot to clear the heartbeat message when a prompt completes (success or error) */
 export type OnHeartbeatClearCallback = (agentId: string) => Promise<void>;
 
+/**
+ * Called when the bot reconnects after a restart and finds a busy session
+ * already in progress on the opencode server.
+ * The bot should:
+ *   1. Send a notification message to the user ("recovered in-progress job")
+ *   2. Store the returned msgId as the heartbeat placeholder (so the result
+ *      replaces that message when the session finishes)
+ * Returns { chatId, msgId } of the placeholder message, or null if it could
+ * not be sent (e.g. bot not yet ready).
+ */
+export type OnAdoptSessionCallback = (
+    agentId: string,
+    userId: number,
+) => Promise<{ chatId: number; msgId: number } | null>;
+
+/**
+ * Called when an adopted (recovered) session finally resolves.
+ * The bot receives the chatId/msgId of the placeholder sent by OnAdoptSessionCallback
+ * and the final result, so it can edit/replace the placeholder with the actual response.
+ */
+export type OnAdoptSessionResultCallback = (
+    agentId: string,
+    chatId: number,
+    msgId: number,
+    result: AgentSendResult,
+) => Promise<void>;
+
 /** Resolve ~ in paths */
 export function resolveDir(p: string): string {
     let resolved = p;
@@ -163,6 +190,12 @@ export class PersistentAgentService {
     /** Callback registered by OpenCodeBot to clear heartbeat message when prompt completes */
     private onHeartbeatClear?: OnHeartbeatClearCallback;
 
+    /** Callback registered by OpenCodeBot to handle adopted (recovered) sessions after restart */
+    private onAdoptSession?: OnAdoptSessionCallback;
+
+    /** Callback registered by OpenCodeBot to deliver result of an adopted session */
+    private onAdoptSessionResult?: OnAdoptSessionResultCallback;
+
     /** Map of agentId → heartbeat timer handle (only active while prompt is in-flight) */
     private heartbeatTimers: Map<string, NodeJS.Timeout> = new Map();
 
@@ -221,6 +254,16 @@ export class PersistentAgentService {
     /** Register the heartbeat clear callback (called once at startup by OpenCodeBot) */
     setOnHeartbeatClearCallback(cb: OnHeartbeatClearCallback): void {
         this.onHeartbeatClear = cb;
+    }
+
+    /** Register the adopt-session callback (called once at startup by OpenCodeBot) */
+    setOnAdoptSessionCallback(cb: OnAdoptSessionCallback): void {
+        this.onAdoptSession = cb;
+    }
+
+    /** Register the adopt-session result callback (called once at startup by OpenCodeBot) */
+    setOnAdoptSessionResultCallback(cb: OnAdoptSessionResultCallback): void {
+        this.onAdoptSessionResult = cb;
     }
 
     // ─── Server lifecycle ─────────────────────────────────────────────────────
@@ -890,16 +933,22 @@ export class PersistentAgentService {
     }
 
     /**
-     * Called on SSE connect/reconnect. If there is a pending in-flight prompt
-     * for this agent and the session is already idle in opencode (i.e. the
-     * session.idle event was missed while we were disconnected), resolve it
-     * immediately instead of waiting forever.
+     * Called on SSE connect/reconnect.
+     *
+     * Case 1 — SSE reconnect mid-session (pendingPrompt already exists):
+     *   If the session is already idle in opencode (session.idle was missed while
+     *   we were disconnected), resolve the pending promise immediately.
+     *
+     * Case 2 — Bot restart while session was busy (pendingPrompt is gone):
+     *   If the session is busy on the server but we have no pending promise,
+     *   "adopt" the session: create a synthetic pendingPrompt, start the
+     *   heartbeat, and notify the user so they know the result will arrive.
+     *   When session.idle eventually fires the result is delivered normally.
      */
     private async recoverPendingPrompt(agent: PersistentAgent): Promise<void> {
-        const pending = this.pendingPrompts.get(agent.id);
-        if (!pending) return; // nothing in flight
+        const existing = this.pendingPrompts.get(agent.id);
 
-        const sessionId = pending.sessionId;
+        const sessionId = existing?.sessionId ?? this.sessionIds.get(agent.id) ?? agent.sessionId;
         if (!sessionId) return;
 
         try {
@@ -911,14 +960,79 @@ export class PersistentAgentService {
             if (!res.ok) return;
 
             const session: any = await res.json();
-            // opencode reports the session as idle when it is not actively running a prompt
-            if (session?.status === "idle" || session?.info?.status === "idle") {
-                console.log(`[PersistentAgent] recoverPendingPrompt: session ${sessionId} is already idle for agent "${agent.name}" — resolving now`);
-                await this.resolvePromptFromIdle(agent, sessionId);
+            const status: string = session?.status ?? session?.info?.status ?? "";
+
+            if (existing) {
+                // Case 1: already have a pending prompt — resolve if idle
+                if (status === "idle" || session?.info?.status === "idle") {
+                    console.log(`[PersistentAgent] recoverPendingPrompt: session ${sessionId} is already idle for agent "${agent.name}" — resolving now`);
+                    await this.resolvePromptFromIdle(agent, sessionId);
+                }
+            } else if (status === "busy") {
+                // Case 2: bot restarted while session was busy — adopt it
+                await this.adoptBusySession(agent, sessionId);
             }
         } catch (err) {
             console.debug(`[PersistentAgent] recoverPendingPrompt for "${agent.name}": ${err}`);
         }
+    }
+
+    /**
+     * Adopt a session that is busy on the opencode server but has no
+     * corresponding pendingPrompt in memory (typically after a bot restart).
+     *
+     * Creates a synthetic PendingPrompt so the SSE loop can resolve it when
+     * session.idle eventually fires, and starts the heartbeat timer.
+     * Optionally notifies the user via the onAdoptSession callback.
+     */
+    private async adoptBusySession(agent: PersistentAgent, sessionId: string): Promise<void> {
+        if (this.pendingPrompts.has(agent.id)) return; // race guard
+
+        console.log(`[PersistentAgent] adoptBusySession: adopting busy session "${sessionId}" for agent "${agent.name}" after restart`);
+
+        // Notify the user and get a placeholder message to use as heartbeat anchor
+        let adoptedChatId: number | undefined;
+        let adoptedMsgId: number | undefined;
+
+        if (this.onAdoptSession) {
+            try {
+                const result = await this.onAdoptSession(agent.id, agent.userId);
+                if (result) {
+                    adoptedChatId = result.chatId;
+                    adoptedMsgId  = result.msgId;
+                }
+            } catch (err) {
+                console.error(`[PersistentAgent] onAdoptSession callback error for "${agent.name}":`, err);
+            }
+        }
+
+        // Create the synthetic pending promise.
+        // When it resolves, deliver the result to the user.
+        const promise = new Promise<AgentSendResult>((resolve, reject) => {
+            this.pendingPrompts.set(agent.id, {
+                sessionId,
+                resolve,
+                reject,
+                startedAt: Date.now(),
+            });
+        });
+
+        // Start heartbeat
+        this.startHeartbeat(agent);
+
+        // Handle the result asynchronously — this mirrors what sendPromptToAgent does
+        promise.then(async (result) => {
+            // If we got a placeholder message, use it; otherwise just send fresh
+            if (adoptedChatId !== undefined && adoptedMsgId !== undefined && this.onAdoptSessionResult) {
+                await this.onAdoptSessionResult(agent.id, adoptedChatId, adoptedMsgId, result).catch((err: unknown) =>
+                    console.error(`[PersistentAgent] onAdoptSessionResult error for "${agent.name}":`, err)
+                );
+            } else {
+                console.log(`[PersistentAgent] adoptBusySession: no result callback registered for "${agent.name}" — result dropped`);
+            }
+        }).catch((err: unknown) => {
+            console.error(`[PersistentAgent] adoptBusySession promise rejected for "${agent.name}":`, err);
+        });
     }
 
     // ─── Heartbeat (safeguard only) ───────────────────────────────────────────

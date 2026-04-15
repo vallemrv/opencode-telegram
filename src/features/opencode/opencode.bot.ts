@@ -29,6 +29,7 @@ import { AgentDbService } from "../../services/agent-db.service.js";
 import type { PersistentAgent } from "../../services/agent-db.service.js";
 import { PersistentAgentService } from "../../services/persistent-agent.service.js";
 import type { AgentSendResult } from "../../services/persistent-agent.service.js";
+import type { OnAdoptSessionCallback, OnAdoptSessionResultCallback } from "../../services/persistent-agent.service.js";
 import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
 import { formatAsHtml, escapeHtml } from "./event-handlers/utils.js";
 import { TranscriptionService } from "../../services/transcription.service.js";
@@ -334,6 +335,39 @@ export class OpenCodeBot implements BotContext {
         this.persistentAgentService.setOnHeartbeatClearCallback(
             this.messageHandler.handleAgentHeartbeatClear.bind(this.messageHandler)
         );
+
+        // ── Adopt-session callbacks (post-restart recovery) ───────────────────
+        const adoptSessionCallback: OnAdoptSessionCallback = async (agentId, userId) => {
+            if (!this.bot) return null;
+            const agent = this.agentDb.getById(agentId);
+            const agentName = agent?.name ?? agentId;
+            try {
+                const msg = await this.bot.api.sendMessage(
+                    userId,
+                    `🔄 <b>${escapeHtml(agentName)}</b> — bot reiniciado, recuperando trabajo en curso…`,
+                    { parse_mode: "HTML" }
+                );
+                // Register as heartbeat message so ticks update this placeholder
+                this.heartbeatMessages.set(agentId, { chatId: userId, msgId: msg.message_id });
+                return { chatId: userId, msgId: msg.message_id };
+            } catch (err) {
+                console.error("[OpenCodeBot] adoptSession notification failed:", err);
+                return null;
+            }
+        };
+        this.persistentAgentService.setOnAdoptSessionCallback(adoptSessionCallback);
+
+        const adoptSessionResultCallback: OnAdoptSessionResultCallback = async (agentId, chatId, msgId, result) => {
+            const agent = this.agentDb.getById(agentId);
+            if (!agent) {
+                console.warn(`[OpenCodeBot] adoptSessionResult: agent ${agentId} not found in DB`);
+                return;
+            }
+            // Clear heartbeatMessages before editOrSendResult (same pattern as sendPromptToAgent)
+            this.heartbeatMessages.delete(agentId);
+            await this.editOrSendResult(chatId, msgId, agent, result);
+        };
+        this.persistentAgentService.setOnAdoptSessionResultCallback(adoptSessionResultCallback);
 
         // Restore all agents on startup
         this.persistentAgentService.restoreAll(this.agentDb.getAll())
