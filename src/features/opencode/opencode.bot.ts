@@ -439,8 +439,8 @@ export class OpenCodeBot implements BotContext {
             `<b>TelegramCoder</b>\n\n` +
             `<b>Comandos:</b>\n` +
             `/new — Crear agente (${isGitea ? "Gitea ✅" : "Gitea ❌"} / ${isGithub ? "GitHub ✅" : "GitHub ❌"} / local)\n` +
-            `/agents [<ip>] — Ver agentes (usa <ip> para nodos remotos)\n` +
-            `/web <ip> — Abrir OpenCode Web por proyecto (remoto)\n` +
+            `/agents [&lt;ip&gt;] — Ver agentes (usa &lt;ip&gt; para nodos remotos)\n` +
+            `/web &lt;ip&gt; — Abrir OpenCode Web por proyecto (remoto)\n` +
             `/run — Prompt puntual a un agente\n` +
             `/session — Ver sesiones del agente activo\n` +
             `/rename — Renombrar la sesión activa\n` +

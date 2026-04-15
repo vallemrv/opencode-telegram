@@ -432,11 +432,19 @@ export class MessageHandler {
             try {
                 await bot.api.editMessageText(existing.chatId, existing.msgId, text, { parse_mode: "HTML" });
             } catch (err: any) {
-                // Message may have been deleted or already edited by another flow
-                // Clear from map to avoid stale references
-                if (err?.error_code === 400 || err?.description?.includes("message")) {
+                // "message is not modified" (400) is benign — the text didn't change this tick.
+                // Only clear the reference if the message truly no longer exists (deleted/too old).
+                const desc: string = err?.description ?? "";
+                const messageGone =
+                    err?.error_code === 400 &&
+                    (desc.includes("message to edit not found") ||
+                     desc.includes("MESSAGE_ID_INVALID") ||
+                     desc.includes("can't find"));
+                if (messageGone) {
                     this.ctx.heartbeatMessages.delete(agentId);
                 }
+                // For "message is not modified" we keep the reference so the next
+                // tick can still edit the same message when content changes.
             }
         } else {
             try {

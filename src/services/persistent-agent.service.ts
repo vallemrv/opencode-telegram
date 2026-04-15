@@ -184,6 +184,12 @@ export class PersistentAgentService {
      */
     private sessionIds: Map<string, string> = new Map();
 
+    /**
+     * Set of question IDs already forwarded to the bot.
+     * Prevents duplicate question messages when the SSE stream reconnects.
+     */
+    private forwardedQuestionIds: Set<string> = new Set();
+
     constructor(private readonly agentDb: AgentDbService) {}
 
     /** Register the question callback (called once at startup by OpenCodeBot) */
@@ -528,10 +534,17 @@ export class PersistentAgentService {
 
                     // ── question.asked → forward to bot ───────────────────
                     if (type === "question.asked" && this.onQuestion) {
-                        console.log(`[PersistentAgent] question.asked for agent "${agent.name}": ${props.id}`);
-                        this.onQuestion(agent.id, props).catch(err =>
-                            console.error(`[PersistentAgent] onQuestion callback error:`, err)
-                        );
+                        const questionId: string = props.id ?? "";
+                        console.log(`[PersistentAgent] question.asked for agent "${agent.name}": ${questionId}`);
+                        // Deduplicate: skip if already forwarded (can happen on SSE reconnect)
+                        if (!questionId || !this.forwardedQuestionIds.has(questionId)) {
+                            if (questionId) this.forwardedQuestionIds.add(questionId);
+                            this.onQuestion(agent.id, props).catch(err =>
+                                console.error(`[PersistentAgent] onQuestion callback error:`, err)
+                            );
+                        } else {
+                            console.log(`[PersistentAgent] question.asked for agent "${agent.name}" already forwarded, skipping duplicate`);
+                        }
                     }
 
                     // ── session.error → notify bot and resolve pending ─────
@@ -572,12 +585,10 @@ export class PersistentAgentService {
                                     output: `❌ Error del modelo: ${errorMessage}`,
                                     sessionId: errorSessionId || mySessionId || "",
                                 });
-                                // Clear heartbeat message from bot's memory
-                                if (this.onHeartbeatClear) {
-                                    this.onHeartbeatClear(agent.id).catch(err =>
-                                        console.error(`[PersistentAgent] onHeartbeatClear callback error:`, err)
-                                    );
-                                }
+                                // NOTE: Do NOT call onHeartbeatClear here — same race
+                                // condition as in resolvePromptFromIdle. OpenCodeBot's
+                                // .then() handler will clear heartbeatMessages after
+                                // sending/editing the result message.
                                 // Drain queue after error so queued prompts are not lost
                                 this.drainQueue(agent).catch(err =>
                                     console.error(`[PersistentAgent] drainQueue error after session.error for "${agent.name}":`, err)
@@ -657,12 +668,10 @@ export class PersistentAgentService {
         this.stopHeartbeat(agent.id);
         this.pendingPrompts.delete(agent.id);
 
-        // Clear heartbeat message from bot's memory
-        if (this.onHeartbeatClear) {
-            this.onHeartbeatClear(agent.id).catch(err =>
-                console.error(`[PersistentAgent] onHeartbeatClear callback error:`, err)
-            );
-        }
+        // NOTE: Do NOT call onHeartbeatClear here. The heartbeatMessages reference
+        // must remain intact so that OpenCodeBot.sendPromptToAgent can read it in
+        // its .then() handler to edit/delete the correct placeholder message.
+        // OpenCodeBot is responsible for clearing heartbeatMessages after use.
 
         try {
             const host = agent.host || 'localhost';
@@ -753,6 +762,13 @@ export class PersistentAgentService {
 
             console.log(`[PersistentAgent] Recovering ${questions.length} pending question(s) for agent "${agent.name}"`);
             for (const q of questions) {
+                const questionId: string = q.id ?? "";
+                // Deduplicate: skip questions already forwarded in this session
+                if (questionId && this.forwardedQuestionIds.has(questionId)) {
+                    console.log(`[PersistentAgent] recoverPendingQuestions: question ${questionId} already forwarded, skipping`);
+                    continue;
+                }
+                if (questionId) this.forwardedQuestionIds.add(questionId);
                 this.onQuestion(agent.id, q).catch(err =>
                     console.error(`[PersistentAgent] recoverPendingQuestions callback error:`, err)
                 );
@@ -930,6 +946,9 @@ export class PersistentAgentService {
             port = agent.port;
         }
         
+        // Remove from dedup set — question is now answered
+        this.forwardedQuestionIds.delete(requestId);
+
         await fetch(`http://${host}:${port}/question/${requestId}/reply`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -952,6 +971,9 @@ export class PersistentAgentService {
             port = agent.port;
         }
         
+        // Remove from dedup set — question is now rejected
+        this.forwardedQuestionIds.delete(requestId);
+
         await fetch(`http://${host}:${port}/question/${requestId}/reject`, {
             method: "POST",
             signal: AbortSignal.timeout(10000),
