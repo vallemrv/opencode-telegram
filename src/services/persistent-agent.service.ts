@@ -129,7 +129,7 @@ export async function findOpencodeCmd(): Promise<string> {
 }
 
 /** Heartbeat interval while a prompt is in-flight */
-const HEARTBEAT_INTERVAL_MS = 1 * 60 * 1000;
+const HEARTBEAT_INTERVAL_MS = 20 * 1000;
 
 /** File-modifying tool names recognised for the filesModified counter */
 const FILE_WRITE_TOOLS = new Set(["edit", "write", "patch", "multiedit"]);
@@ -610,11 +610,10 @@ export class PersistentAgentService {
                         const mySessionId = this.sessionIds.get(agent.id);
                         const pendingPrompt = this.pendingPrompts.get(agent.id);
 
-                        // Debug log
                         console.log(`[PersistentAgent] session.idle event: agent="${agent.name}", idleSessionId="${idleSessionId}", mySessionId="${mySessionId || 'N/A'}", hasPendingPrompt=${!!pendingPrompt}`);
 
-                        // Use the same liberal matching as session.error:
-                        // if opencode omits sessionID (some versions do), assume it's ours.
+                        // Match if: opencode omitted sessionID (some versions), OR sessionID
+                        // matches our registered parent session exactly.
                         const sessionMatches =
                             !idleSessionId ||
                             !mySessionId ||
@@ -626,6 +625,16 @@ export class PersistentAgentService {
                             const resolveId = idleSessionId || mySessionId || "";
                             console.log(`[PersistentAgent] session.idle for agent "${agent.name}" session "${resolveId}", resolving prompt...`);
                             await this.resolvePromptFromIdle(agent, resolveId);
+                        } else if (!sessionMatches && pendingPrompt) {
+                            // The idle event is for a DIFFERENT session — likely a sub-agent
+                            // (child session) spawned by the model using the "agent" tool.
+                            // opencode creates child sessions with parentID = our session.
+                            // The child emits session.idle when it finishes, but the parent
+                            // will emit its own session.idle only when all children are done.
+                            // We check the parent status right now: if the parent is also idle,
+                            // we missed its event and should resolve immediately.
+                            console.log(`[PersistentAgent] session.idle for CHILD/OTHER session "${idleSessionId}" — checking if parent "${mySessionId}" is also idle`);
+                            await this.handleChildSessionIdle(agent, idleSessionId, mySessionId ?? "");
                         } else if (!pendingPrompt) {
                             console.log(`[PersistentAgent] session.idle: NO pending prompt to resolve for agent "${agent.name}"`);
                         }
@@ -745,6 +754,78 @@ export class PersistentAgentService {
         console.log(`[PersistentAgent.resolvePromptFromIdle] COMPLETE: agent="${agent.name}"`);
     }
 
+    // ─── Sub-agent (child session) handling ───────────────────────────────────
+
+    /**
+     * Called when session.idle arrives for a session that does NOT match our
+     * registered parent sessionId. This happens when opencode uses sub-agents:
+     * the model calls the "agent" or "subtask" tool, opencode spawns a child
+     * session, and the child emits session.idle when it finishes.
+     *
+     * We immediately check whether the parent session is also idle — meaning
+     * opencode finished everything but we missed the parent's session.idle event.
+     * If so, resolve the pending prompt from the parent session now.
+     * If the parent is still busy, do nothing and wait for its own session.idle.
+     */
+    private async handleChildSessionIdle(
+        agent: PersistentAgent,
+        childSessionId: string,
+        parentSessionId: string,
+    ): Promise<void> {
+        if (!parentSessionId) return;
+
+        try {
+            const host = agent.host || "localhost";
+            const res = await fetch(
+                `http://${host}:${agent.port}/session/${parentSessionId}`,
+                { signal: AbortSignal.timeout(5000) }
+            );
+            if (!res.ok) return;
+
+            const session: any = await res.json();
+            const status: string = session?.status ?? session?.info?.status ?? "";
+
+            console.log(`[PersistentAgent] handleChildSessionIdle: parent "${parentSessionId}" status="${status}" after child "${childSessionId}" went idle`);
+
+            if (status === "idle") {
+                // Parent is also idle — the parent session.idle was either missed or
+                // not emitted. Resolve the pending prompt from the parent session now.
+                console.log(`[PersistentAgent] Parent session "${parentSessionId}" is idle after child finished — resolving prompt for agent "${agent.name}"`);
+                await this.resolvePromptFromIdle(agent, parentSessionId);
+            }
+            // If parent status is "busy" or anything else, the parent is still
+            // running (orchestrating other sub-agents or doing post-processing).
+            // Do nothing — wait for the parent's own session.idle event.
+        } catch (err) {
+            console.debug(`[PersistentAgent] handleChildSessionIdle error for agent "${agent.name}": ${err}`);
+        }
+    }
+
+    /**
+     * Returns true if the given parent session has any child sessions that are
+     * not yet idle. Used by the heartbeat watchdog to avoid resolving prematurely
+     * when the parent appears idle between sub-agent invocations.
+     */
+    private async hasActiveChildSessions(agent: PersistentAgent, parentSessionId: string): Promise<boolean> {
+        try {
+            const host = agent.host || "localhost";
+            const res = await fetch(
+                `http://${host}:${agent.port}/session/${parentSessionId}/children`,
+                { signal: AbortSignal.timeout(5000) }
+            );
+            if (!res.ok) return false;
+            const children: any[] = await res.json();
+            if (!Array.isArray(children) || children.length === 0) return false;
+            // If any child session is not idle, the parent is still coordinating
+            return children.some((c: any) => {
+                const s = c?.status ?? c?.info?.status ?? "";
+                return s !== "idle";
+            });
+        } catch {
+            return false;
+        }
+    }
+
     // ─── Question recovery ────────────────────────────────────────────────────
 
     private async recoverPendingQuestions(agent: PersistentAgent): Promise<void> {
@@ -841,6 +922,8 @@ export class PersistentAgentService {
         }
 
         // Watchdog: if session.idle was missed, resolve once the server reports idle.
+        // Guard against premature resolution when the parent is temporarily idle
+        // between sub-agent invocations (hasActiveChildSessions check).
         try {
             const host = agent.host || 'localhost';
             const statusRes = await fetch(
@@ -851,8 +934,14 @@ export class PersistentAgentService {
                 const session: any = await statusRes.json();
                 const status = session?.status ?? session?.info?.status;
                 if (status === "idle") {
-                    await this.resolvePromptFromIdle(agent, pending.sessionId);
-                    return;
+                    const hasChildren = await this.hasActiveChildSessions(agent, pending.sessionId);
+                    if (!hasChildren) {
+                        console.log(`[PersistentAgent] fireHeartbeat watchdog: parent session "${pending.sessionId}" is idle with no active children — resolving`);
+                        await this.resolvePromptFromIdle(agent, pending.sessionId);
+                        return;
+                    } else {
+                        console.log(`[PersistentAgent] fireHeartbeat watchdog: parent session "${pending.sessionId}" is idle but has active child sessions — waiting`);
+                    }
                 }
             }
         } catch {
