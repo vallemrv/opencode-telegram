@@ -317,7 +317,7 @@ export class AgentsHandler {
         }
 
         const { host, port, project, workdir, sessionId, model } = info;
-        const defaultModel = model || process.env.OPENCODE_DEFAULT_MODEL || "alibaba-coding-plan/qwen3.5-plus";
+        const defaultModel = model || process.env.OPENCODE_DEFAULT_MODEL || "github-copilot/claude-sonnet-4.6";
         const agentId = `remote-${host}-${port}`;
         const agent: any = {
             id: agentId,

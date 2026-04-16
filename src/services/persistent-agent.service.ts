@@ -938,14 +938,11 @@ export class PersistentAgentService {
                 await this.resolvePromptFromIdle(agent, parentSessionId);
             } else if (!status) {
                 // The REST endpoint does not expose status (common in older opencode).
-                // Fall back to trusting the SSE tracking: if all children are idle
-                // and we're here, it means we have no evidence the parent is still busy.
-                // The heartbeat watchdog will catch it at the next 20s tick if we're wrong.
-                const children = this.activeChildSessions.get(agent.id);
-                if (!children || children.size === 0) {
-                    console.log(`[PersistentAgent] Parent "${parentSessionId}" status unknown, no active children tracked — resolving prompt for agent "${agent.name}"`);
-                    await this.resolvePromptFromIdle(agent, parentSessionId);
-                }
+                // Do NOT resolve here — the parent session may still be generating its
+                // text response after finishing tool-calls (finish="tool-calls").
+                // Wait for the parent's own session.idle SSE event.
+                // The heartbeat watchdog will resolve if session.idle never arrives.
+                console.log(`[PersistentAgent] Parent "${parentSessionId}" status unknown — waiting for parent session.idle SSE event (watchdog will catch if missed)`);
             }
             // status === "busy": parent is still working — wait for its session.idle
         } catch (err) {
