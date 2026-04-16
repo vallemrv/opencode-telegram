@@ -1,8 +1,7 @@
 import type { Event } from "@opencode-ai/sdk";
 import type { Context } from "grammy";
 import type { UserSession } from "../opencode.types.js";
-import * as fs from 'fs';
-import * as path from 'path';
+import { escapeHtml, sendAndAutoDelete } from "./utils.js";
 
 type SessionDiffEvent = Extract<Event, { type: "session.diff" }>;
 
@@ -11,16 +10,29 @@ export default async function sessionDiffHandler(
     ctx: Context,
     userSession: UserSession
 ): Promise<string | null> {
-    console.log(event.type);
-    
-    const eventsDir = path.join(process.cwd(), 'events');
-    if (!fs.existsSync(eventsDir)) {
-        fs.mkdirSync(eventsDir, { recursive: true });
+    try {
+        const props: any = event.properties ?? {};
+        const sessionID: string | undefined = props.sessionID;
+        if (sessionID && sessionID !== userSession.sessionId) return null;
+
+        const diff = Array.isArray(props.diff) ? props.diff : [];
+        if (diff.length === 0) return null;
+
+        const files = diff
+            .map((d: any) => d?.file)
+            .filter((f: unknown) => typeof f === "string")
+            .slice(0, 3)
+            .map((f: string) => {
+                const p = f.replace(/\\/g, "/").split("/");
+                return p.length > 2 ? `…/${p.slice(-2).join("/")}` : f;
+            });
+
+        const preview = files.map(f => `<code>${escapeHtml(f)}</code>`).join(", ");
+        const extra = diff.length > files.length ? ` +${diff.length - files.length}` : "";
+        await sendAndAutoDelete(ctx, `📝 Diff actualizado: ${preview}${extra}`, 3500);
+    } catch (error) {
+        console.error("Error in session.diff handler:", error);
     }
 
-    const eventType = event.type.replace(/\./g, '-');
-    const filePath = path.join(eventsDir, `${eventType}.last.json`);
-    fs.writeFileSync(filePath, JSON.stringify(event, null, 2), 'utf8');
-    
     return null;
 }

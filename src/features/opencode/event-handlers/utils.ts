@@ -36,7 +36,10 @@ export async function sendAndAutoDelete(
 ): Promise<void> {
     try {
         // Send without notification to avoid phone buzzing
-        const sentMessage = await ctx.reply(message, { disable_notification: true });
+        const sentMessage = await ctx.reply(message, {
+            disable_notification: true,
+            parse_mode: "HTML",
+        });
         setTimeout(async () => {
             try {
                 await ctx.api.deleteMessage(ctx.chat!.id, sentMessage.message_id);

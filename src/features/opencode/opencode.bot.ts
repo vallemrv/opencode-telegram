@@ -64,6 +64,8 @@ export class OpenCodeBot implements BotContext {
     readonly remoteAgentsInMemory: Map<number, { id: string; host: string; port: number; model: string }> = new Map();
     readonly modelIndex:           Map<string, string>                                     = new Map();
     readonly pendingAgentQuestions: Map<string, { agentId: string; port: number; req: any }> = new Map();
+    /** userId → { shortKey, chatId, msgId } — user is typing a custom answer to a question */
+    readonly pendingCustomAnswer:  Map<number, { shortKey: string; chatId: number; msgId: number }> = new Map();
     readonly heartbeatMessages:    Map<string, { chatId: number; msgId: number }>          = new Map();
     readonly queueStatusMessage:   Map<string, { chatId: number; msgId: number }>          = new Map();
     readonly sessIndex:            Map<string, { agentId: string; sessionId: string }>     = new Map();

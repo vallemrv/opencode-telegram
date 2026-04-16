@@ -15,7 +15,13 @@ export default async function todoUpdatedHandler(
         
         if (todos && Array.isArray(todos)) {
             const todoCount = todos.length;
-            await sendAndAutoDelete(ctx, `📋 ${todoCount} todo${todoCount !== 1 ? 's' : ''}`, 2500);
+            const done = todos.filter((t: any) => t?.status === "completed").length;
+            const doing = todos.filter((t: any) => t?.status === "in_progress").length;
+            await sendAndAutoDelete(
+                ctx,
+                `📋 ${todoCount} todo${todoCount !== 1 ? 's' : ''} · ✅ ${done} · 🔄 ${doing}`,
+                2500
+            );
         }
     } catch (error) {
         console.log("Error in todo.updated handler:", error);

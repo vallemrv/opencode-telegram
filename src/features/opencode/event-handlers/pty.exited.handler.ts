@@ -1,9 +1,7 @@
 import type { Event } from "@opencode-ai/sdk";
 import type { Context } from "grammy";
 import type { UserSession } from "../opencode.types.js";
-import { escapeHtml } from "./utils.js";
-import * as fs from 'fs';
-import * as path from 'path';
+import { sendAndAutoDelete } from "./utils.js";
 
 type PtyExitedEvent = Extract<Event, { type: "pty.exited" }>;
 
@@ -12,16 +10,15 @@ export default async function ptyExitedHandler(
     ctx: Context,
     userSession: UserSession
 ): Promise<string | null> {
-    console.log(event.type);
-    
-    const eventsDir = path.join(process.cwd(), 'events');
-    if (!fs.existsSync(eventsDir)) {
-        fs.mkdirSync(eventsDir, { recursive: true });
+    try {
+        const props: any = event.properties ?? {};
+        const sessionID: string | undefined = props.sessionID;
+        if (sessionID && sessionID !== userSession.sessionId) return null;
+        const exitCode = typeof props.exitCode === "number" ? props.exitCode : "?";
+        await sendAndAutoDelete(ctx, `🧩 PTY salió con code ${exitCode}`, 3000);
+    } catch (error) {
+        console.error("Error in pty.exited handler:", error);
     }
 
-    const eventType = event.type.replace(/\./g, '-');
-    const filePath = path.join(eventsDir, `${eventType}.last.json`);
-    fs.writeFileSync(filePath, JSON.stringify(event, null, 2), 'utf8');
-    
     return null;
 }

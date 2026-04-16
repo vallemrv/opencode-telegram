@@ -30,6 +30,34 @@ export class MessageHandler {
         const prompt = ctx.message?.text?.trim() || "";
         if (!prompt) return;
 
+        // ── Custom answer to an agent question ────────────────────────────────
+        const customPending = this.ctx.pendingCustomAnswer.get(userId);
+        if (customPending) {
+            this.ctx.pendingCustomAnswer.delete(userId);
+            const pending = this.ctx.pendingAgentQuestions.get(customPending.shortKey);
+            if (pending) {
+                this.ctx.pendingAgentQuestions.delete(customPending.shortKey);
+                const agent = this.ctx.agentDb.getById(pending.agentId);
+                if (agent) {
+                    await this.ctx.persistentAgentService.replyQuestion(agent, pending.req.id, [[prompt]]);
+                    try {
+                        const bot2 = this.ctx.bot;
+                        if (bot2) {
+                            await bot2.api.editMessageText(
+                                customPending.chatId,
+                                customPending.msgId,
+                                `✅ Respondido: <b>${escapeHtml(prompt)}</b>`,
+                                { parse_mode: "HTML" }
+                            );
+                        }
+                    } catch (err) {
+                        console.error("[MessageHandler] Failed to edit custom answer message:", err);
+                    }
+                }
+            }
+            return;
+        }
+
         let activeId = this.ctx.persistentAgentService.getActiveAgentId(userId);
 
         if (!activeId) {
@@ -158,8 +186,7 @@ export class MessageHandler {
 
         const busyAgentId = this.ctx.persistentAgentService.getActiveAgentId(userId)
             ?? this.ctx.agentDb.getLastUsed(userId)?.id;
-        if (busyAgentId && this.ctx.persistentAgentService.isBusy(busyAgentId)) {
-            const agent = this.ctx.agentDb.getById(busyAgentId);
+        if (busyAgentId && this.ctx.persistentAgentService.isBusy(busyAgentId)) {            const agent = this.ctx.agentDb.getById(busyAgentId);
             this.ctx.persistentAgentService.cancelPendingPrompt(busyAgentId);
             const hb = this.ctx.heartbeatMessages.get(busyAgentId);
             this.ctx.heartbeatMessages.delete(busyAgentId);
@@ -178,6 +205,30 @@ export class MessageHandler {
         if (this.ctx.newWizard.has(userId)) {
             this.ctx.newWizard.delete(userId);
             await ctx.reply("❌ Cancelado.");
+            return;
+        }
+
+        if (this.ctx.pendingCustomAnswer.has(userId)) {
+            const pca = this.ctx.pendingCustomAnswer.get(userId)!;
+            this.ctx.pendingCustomAnswer.delete(userId);
+            // Restore keyboard on question message
+            const pending = this.ctx.pendingAgentQuestions.get(pca.shortKey);
+            if (pending) {
+                const firstQ = pending.req.questions?.[0];
+                const kb = new InlineKeyboard();
+                if (firstQ?.options && Array.isArray(firstQ.options)) {
+                    firstQ.options.forEach((opt: any, idx: number) => {
+                        const lbl = typeof opt === "string" ? opt : (opt.label ?? String(opt));
+                        kb.text(lbl, `agq:${pca.shortKey}:${idx}`).row();
+                    });
+                }
+                kb.text("❌ Rechazar", `agq:${pca.shortKey}:r`);
+                kb.text("✏️ Escribir respuesta", `agq:${pca.shortKey}:custom`);
+                try {
+                    await this.ctx.bot!.api.editMessageReplyMarkup(pca.chatId, pca.msgId, { reply_markup: kb });
+                } catch (_) { /* ignore */ }
+            }
+            await ctx.reply("❌ Respuesta libre cancelada.");
             return;
         }
 
@@ -307,6 +358,7 @@ export class MessageHandler {
         }
 
         keyboard.text("❌ Rechazar", `agq:${shortKey}:r`);
+        keyboard.text("✏️ Escribir respuesta", `agq:${shortKey}:custom`);
 
         try {
             await bot.api.sendMessage(
@@ -357,6 +409,39 @@ export class MessageHandler {
             } catch (err) {
                 console.error("[MessageHandler] Failed to edit rejection message:", err);
             }
+        } else if (answerKey === "custom") {
+            // Re-insert pending question so it can still be answered
+            this.ctx.pendingAgentQuestions.set(shortKey, pending);
+            const userId = ctx.from?.id;
+            if (userId) {
+                const chatId = ctx.chat?.id ?? 0;
+                const msgId = ctx.callbackQuery?.message?.message_id ?? 0;
+                this.ctx.pendingCustomAnswer.set(userId, { shortKey, chatId, msgId });
+            }
+            try {
+                await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard().text("❌ Cancelar respuesta", `agq:${shortKey}:cancelcustom`) });
+            } catch (_) { /* ignore */ }
+            await ctx.answerCallbackQuery("✏️ Escribe tu respuesta como mensaje de texto");
+            return; // already answered callback query above
+        } else if (answerKey === "cancelcustom") {
+            // Re-insert question and restore keyboard
+            this.ctx.pendingAgentQuestions.set(shortKey, pending);
+            const userId = ctx.from?.id;
+            if (userId) this.ctx.pendingCustomAnswer.delete(userId);
+            // Restore original keyboard
+            const firstQ2 = pending.req.questions?.[0];
+            const keyboard2 = new InlineKeyboard();
+            if (firstQ2?.options && Array.isArray(firstQ2.options)) {
+                firstQ2.options.forEach((opt: any, idx: number) => {
+                    const label2 = typeof opt === "string" ? opt : (opt.label ?? String(opt));
+                    keyboard2.text(label2, `agq:${shortKey}:${idx}`).row();
+                });
+            }
+            keyboard2.text("❌ Rechazar", `agq:${shortKey}:r`);
+            keyboard2.text("✏️ Escribir respuesta", `agq:${shortKey}:custom`);
+            try {
+                await ctx.editMessageReplyMarkup({ reply_markup: keyboard2 });
+            } catch (_) { /* ignore */ }
         } else {
             const idx = parseInt(answerKey, 10);
             const firstQ = pending.req.questions?.[0];
@@ -395,6 +480,12 @@ export class MessageHandler {
 
         // Header
         let text = `⏳ <b>${escapeHtml(agent.name)}</b> — trabajando (${elapsed})\n`;
+
+        const streamLabel = summary.streamConnected ? "🟢 SSE" : "🔴 SSE";
+        const age = summary.secondsSinceLastEvent;
+        const ageText = typeof age === "number" ? `${age}s` : "n/d";
+        const statusLabel = summary.sessionStatus ? summary.sessionStatus.toUpperCase() : "N/D";
+        text += `\n📡 ${streamLabel} · ⏱️ último evento: ${ageText} · estado: <code>${escapeHtml(statusLabel)}</code>`;
 
         // Last tool / action
         if (summary.lastToolName) {

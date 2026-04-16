@@ -65,6 +65,12 @@ export interface HeartbeatSummary {
     recentFiles: string[];
     /** Last bash command executed, if any */
     lastBashCmd: string;
+    /** True when stream received events recently */
+    streamConnected?: boolean;
+    /** Seconds since the last SSE event seen for this agent */
+    secondsSinceLastEvent?: number;
+    /** Last known session status from session.status events */
+    sessionStatus?: "busy" | "retry" | "idle";
 }
 
 /** Called by OpenCodeBot on each heartbeat tick (only while a prompt is in-flight) */
@@ -198,6 +204,12 @@ export class PersistentAgentService {
 
     /** Map of agentId → heartbeat timer handle (only active while prompt is in-flight) */
     private heartbeatTimers: Map<string, NodeJS.Timeout> = new Map();
+
+    /** Map of agentId → timestamp (ms) of last SSE event received */
+    private lastSseEventAt: Map<string, number> = new Map();
+
+    /** Map of agentId → last known session.status.type */
+    private lastSessionStatus: Map<string, "busy" | "retry" | "idle"> = new Map();
 
     /**
      * In-flight prompt promises, keyed by agentId.
@@ -551,6 +563,7 @@ export class PersistentAgentService {
         console.log(`[PersistentAgent.startSseStream] Starting SSE stream for agent "${agent.name}" at ${agent.host || 'localhost'}:${agent.port}`);
         const abort = new AbortController();
         this.sseControllers.set(agent.id, abort);
+        this.lastSseEventAt.set(agent.id, Date.now());
 
         this.runSseLoop(agent, abort).catch(err =>
             console.error(`[PersistentAgent] SSE loop error for agent ${agent.name}:`, err)
@@ -564,6 +577,7 @@ export class PersistentAgentService {
             this.sseControllers.delete(agentId);
         }
         this.stopHeartbeat(agentId);
+        this.lastSessionStatus.delete(agentId);
     }
 
     private async runSseLoop(agent: PersistentAgent, abort: AbortController): Promise<void> {
@@ -571,20 +585,50 @@ export class PersistentAgentService {
         const baseUrl = `http://${host}:${agent.port}`;
         const client = createOpencodeClient({ baseUrl });
         let retryDelay = 3000;
+        // Maximum time to keep a single SSE connection alive before forcing a reconnect.
+        // This prevents the stream from hanging silently when the TCP connection goes stale.
+        const SSE_RECONNECT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
         await this.recoverPendingQuestions(agent);
         await this.recoverPendingPrompt(agent);
 
         while (!abort.signal.aborted) {
+            // Per-connection abort: forces reconnect every SSE_RECONNECT_INTERVAL_MS
+            const connAbort = new AbortController();
+            const connTimeout = setTimeout(() => {
+                if (!abort.signal.aborted) {
+                    console.log(`[PersistentAgent] SSE connection for agent "${agent.name}" exceeded ${SSE_RECONNECT_INTERVAL_MS / 1000}s — forcing reconnect`);
+                    connAbort.abort();
+                }
+            }, SSE_RECONNECT_INTERVAL_MS);
+            abort.signal.addEventListener("abort", () => connAbort.abort(), { once: true });
+
             try {
                 const events = await client.event.subscribe();
                 retryDelay = 3000;
 
                 for await (const event of events.stream) {
-                    if (abort.signal.aborted) break;
+                    if (abort.signal.aborted || connAbort.signal.aborted) break;
+
+                    this.lastSseEventAt.set(agent.id, Date.now());
 
                     const type = (event as any).type;
                     const props = (event as any).properties;
+
+                    if (type === "server.connected" || type === "server.heartbeat") {
+                        continue;
+                    }
+
+                    if (type === "session.status") {
+                        const statusType = props?.status?.type;
+                        const sessionStatus =
+                            statusType === "busy" || statusType === "retry" || statusType === "idle"
+                                ? (statusType as "busy" | "retry" | "idle")
+                                : undefined;
+                        if (sessionStatus) {
+                            this.lastSessionStatus.set(agent.id, sessionStatus);
+                        }
+                    }
 
                     // ── question.asked → forward to bot ───────────────────
                     if (type === "question.asked" && this.onQuestion) {
@@ -725,12 +769,22 @@ export class PersistentAgentService {
                     }
                 }
             } catch (err) {
+                clearTimeout(connTimeout);
                 if (abort.signal.aborted) break;
+                // If it was a forced reconnect (connAbort), retry immediately without backoff
+                if (connAbort.signal.aborted && !abort.signal.aborted) {
+                    console.log(`[PersistentAgent] SSE reconnect triggered for agent "${agent.name}" — reconnecting immediately`);
+                    await this.recoverPendingQuestions(agent);
+                    await this.recoverPendingPrompt(agent);
+                    continue;
+                }
                 console.warn(`[PersistentAgent] SSE stream for agent "${agent.name}" disconnected, retrying in ${retryDelay}ms`);
                 await new Promise(r => setTimeout(r, retryDelay));
-                retryDelay = Math.min(retryDelay * 2, 30000);
+                retryDelay = Math.min(retryDelay * 2, 15000);
                 await this.recoverPendingQuestions(agent);
                 await this.recoverPendingPrompt(agent);
+            } finally {
+                clearTimeout(connTimeout);
             }
         }
     }
@@ -1087,16 +1141,8 @@ export class PersistentAgentService {
                     } else {
                         console.log(`[PersistentAgent] fireHeartbeat watchdog: parent session "${pending.sessionId}" is idle but ${children!.size} child session(s) still active — waiting`);
                     }
-                } else if (!status) {
-                    // REST endpoint doesn't expose status — fall back to trusting SSE tracking
-                    const children = this.activeChildSessions.get(agent.id);
-                    const hasActiveChildren = children && children.size > 0;
-                    if (!hasActiveChildren) {
-                        console.log(`[PersistentAgent] fireHeartbeat watchdog: parent status unknown, no active children — resolving`);
-                        await this.resolvePromptFromIdle(agent, pending.sessionId);
-                        return;
-                    }
                 }
+                // If status is missing or not 'idle', do NOT resolve — trust the SSE loop.
             }
         } catch {
             // best-effort watchdog only
@@ -1111,6 +1157,12 @@ export class PersistentAgentService {
         let filesModified = 0;
         const recentFilesSet: string[] = [];
         let lastBashCmd = "";
+        const lastEventAt = this.lastSseEventAt.get(agent.id);
+        const secondsSinceLastEvent = lastEventAt
+            ? Math.max(0, Math.round((Date.now() - lastEventAt) / 1000))
+            : undefined;
+        const streamConnected = secondsSinceLastEvent === undefined ? false : secondsSinceLastEvent <= 25;
+        const sessionStatus = this.lastSessionStatus.get(agent.id);
 
         try {
         const host = agent.host || 'localhost';
@@ -1167,6 +1219,9 @@ export class PersistentAgentService {
                 filesModified,
                 recentFiles: recentFilesSet,
                 lastBashCmd,
+                streamConnected,
+                secondsSinceLastEvent,
+                sessionStatus,
             });
         } catch (err) {
             console.error(`[PersistentAgent] heartbeat error for "${agent.name}":`, err);
