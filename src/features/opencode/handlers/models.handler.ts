@@ -22,8 +22,6 @@ export class ModelsHandler {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        this.ctx.disconnectRemoteAgent(userId);
-
         const activeId = this.ctx.persistentAgentService.getActiveAgentId(userId)
             ?? this.ctx.agentDb.getLastUsed(userId)?.id;
 

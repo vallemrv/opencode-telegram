@@ -17,13 +17,10 @@ export interface PersistentAgent {
     model: string;        // provider/model
     port: number;         // Fixed port for its opencode serve process
     sessionId?: string;   // Long-lived OpenCode session UUID (persisted across restarts)
-    /** 'running' (default) or 'stopped' (legacy — kept for migration; eviction now deletes) */
     status: "running" | "stopped";
     createdAt: string;
-    /** Last time this agent was selected/used (ISO). Drives LRU eviction when slots are full. */
     lastUsedAt: string;
-    host?: string;        // Host/IP del nodo (default: localhost)
-    isRemote?: boolean;   // Indica si es agente remoto (default: false)
+    host?: string;
 }
 
 const DB_PATH = path.join(
@@ -52,43 +49,24 @@ export class AgentDbService {
                 session_id  TEXT,
                 status      TEXT NOT NULL DEFAULT 'running',
                 created_at  DATETIME NOT NULL,
-                host        TEXT DEFAULT 'localhost',
-                is_remote   INTEGER DEFAULT 0
+                last_used_at DATETIME,
+                host        TEXT DEFAULT 'localhost'
             )
         `);
-        // Migrate existing databases that don't have the session_id column yet
         try {
             this.db.exec(`ALTER TABLE persistent_agents ADD COLUMN session_id TEXT`);
-        } catch {
-            // Column already exists — ignore
-        }
-        // Migrate existing databases that don't have the status column yet
+        } catch { /* Column already exists */ }
         try {
             this.db.exec(`ALTER TABLE persistent_agents ADD COLUMN status TEXT NOT NULL DEFAULT 'running'`);
-        } catch {
-            // Column already exists — ignore
-        }
-        // Migrate existing databases that don't have the host column yet
+        } catch { /* Column already exists */ }
         try {
             this.db.exec(`ALTER TABLE persistent_agents ADD COLUMN host TEXT DEFAULT 'localhost'`);
-        } catch {
-            // Column already exists — ignore
-        }
-        // Migrate existing databases that don't have the is_remote column yet
-        try {
-            this.db.exec(`ALTER TABLE persistent_agents ADD COLUMN is_remote INTEGER DEFAULT 0`);
-        } catch {
-            // Column already exists — ignore
-        }
-        // Migrate existing databases that don't have the last_used_at column yet
+        } catch { /* Column already exists */ }
         try {
             this.db.exec(`ALTER TABLE persistent_agents ADD COLUMN last_used_at DATETIME`);
-            // Backfill from created_at for existing rows
             this.db.exec(`UPDATE persistent_agents SET last_used_at = created_at WHERE last_used_at IS NULL`);
-        } catch {
-            // Column already exists — ignore
-        }
-        // Tracks which agent was last used per user (for auto-routing messages)
+        } catch { /* Column already exists */ }
+
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS agent_last_used (
                 user_id     INTEGER PRIMARY KEY,
@@ -100,8 +78,8 @@ export class AgentDbService {
 
     save(agent: PersistentAgent): void {
         this.db.prepare(`
-            INSERT INTO persistent_agents (id, user_id, name, role, workdir, model, port, session_id, status, created_at, last_used_at, host, is_remote)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO persistent_agents (id, user_id, name, role, workdir, model, port, session_id, status, created_at, last_used_at, host)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 role = excluded.role,
@@ -111,8 +89,7 @@ export class AgentDbService {
                 session_id = excluded.session_id,
                 status = excluded.status,
                 last_used_at = excluded.last_used_at,
-                host = excluded.host,
-                is_remote = excluded.is_remote
+                host = excluded.host
         `).run(
             agent.id,
             agent.userId,
@@ -126,7 +103,6 @@ export class AgentDbService {
             agent.createdAt,
             agent.lastUsedAt ?? agent.createdAt,
             agent.host ?? 'localhost',
-            agent.isRemote ? 1 : 0,
         );
     }
 
@@ -145,13 +121,11 @@ export class AgentDbService {
         return row ? this.mapRow(row) : undefined;
     }
 
-    /** Look up an agent by the first 8 characters of its UUID (for compact callback data). */
     getByPrefix(prefix: string): PersistentAgent | undefined {
         const row = this.db.prepare("SELECT * FROM persistent_agents WHERE id LIKE ?").get(prefix + '%') as any;
         return row ? this.mapRow(row) : undefined;
     }
 
-    /** Returns the first 8 characters of the agent UUID — safe for Telegram callback_data. */
     static shortId(agent: PersistentAgent): string {
         return agent.id.slice(0, 8);
     }
@@ -169,58 +143,28 @@ export class AgentDbService {
         this.db.prepare('UPDATE persistent_agents SET model = ? WHERE id = ?').run(model, id);
     }
 
-    /** Persist the long-lived OpenCode session ID for an agent */
     setSessionId(agentId: string, sessionId: string): void {
         this.db.prepare('UPDATE persistent_agents SET session_id = ? WHERE id = ?').run(sessionId, agentId);
     }
 
-    /** Clear the persisted session ID (e.g. after a session is deleted or corrupted) */
     clearSessionId(agentId: string): void {
         this.db.prepare('UPDATE persistent_agents SET session_id = NULL WHERE id = ?').run(agentId);
     }
 
-    /** Set the running status of an agent ('running' | 'stopped') */
     setStatus(agentId: string, status: "running" | "stopped"): void {
         this.db.prepare('UPDATE persistent_agents SET status = ? WHERE id = ?').run(status, agentId);
     }
 
-    /** Returns agents that are currently in 'running' status for a user */
     getRunningByUser(userId: number): PersistentAgent[] {
         return (this.db.prepare(
             "SELECT * FROM persistent_agents WHERE user_id = ? AND status = 'running' ORDER BY created_at ASC"
         ).all(userId) as any[]).map(this.mapRow);
     }
 
-    /** Returns all ports already in use by persistent agents */
     usedPorts(): number[] {
         return (this.db.prepare('SELECT port FROM persistent_agents').all() as any[]).map(r => r.port);
     }
 
-    /** Returns all agents from a specific host */
-    getByHost(host: string): PersistentAgent[] {
-        return (this.db.prepare('SELECT * FROM persistent_agents WHERE host = ? ORDER BY created_at ASC').all(host) as any[])
-            .map(this.mapRow);
-    }
-
-    /** Returns only remote agents */
-    getRemoteAgents(): PersistentAgent[] {
-        return (this.db.prepare('SELECT * FROM persistent_agents WHERE is_remote = 1 ORDER BY created_at ASC').all() as any[])
-            .map(this.mapRow);
-    }
-
-    /** Save a remote agent discovered from another host */
-    saveRemoteAgent(agent: Omit<PersistentAgent, 'userId'>, host: string): void {
-        // Create a temporary agent with default userId (will be set when added locally)
-        const remoteAgent: PersistentAgent = {
-            ...agent,
-            userId: 0, // Will be updated when user adds this remote agent
-            host,
-            isRemote: true
-        };
-        this.save(remoteAgent);
-    }
-
-    /** Persist the last-used agent for a user */
     setLastUsed(userId: number, agentId: string): void {
         this.db.prepare(`
             INSERT INTO agent_last_used (user_id, agent_id, updated_at)
@@ -229,14 +173,12 @@ export class AgentDbService {
         `).run(userId, agentId, new Date().toISOString());
     }
 
-    /** Returns the last-used agent for a user, or undefined */
     getLastUsed(userId: number): PersistentAgent | undefined {
         const row = this.db.prepare('SELECT agent_id FROM agent_last_used WHERE user_id = ?').get(userId) as any;
         if (!row) return undefined;
         return this.getById(row.agent_id);
     }
 
-    /** Clear last-used record (e.g. when the agent is deleted) */
     clearLastUsed(userId: number): void {
         this.db.prepare('DELETE FROM agent_last_used WHERE user_id = ?').run(userId);
     }
@@ -255,40 +197,30 @@ export class AgentDbService {
             createdAt: row.created_at,
             lastUsedAt: row.last_used_at ?? row.created_at,
             host: row.host ?? 'localhost',
-            isRemote: !!row.is_remote,
         };
     }
 
-    /** Update the lastUsedAt timestamp for an agent. Drives LRU eviction. */
     touchLastUsed(agentId: string): void {
         this.db.prepare('UPDATE persistent_agents SET last_used_at = ? WHERE id = ?')
             .run(new Date().toISOString(), agentId);
     }
 
-    /** Returns global running agents (excluding remote) ordered by last_used_at ASC (oldest first). */
     getRunningOrderedByLRU(): PersistentAgent[] {
         return (this.db.prepare(
-            `SELECT * FROM persistent_agents
-             WHERE status = 'running' AND (is_remote IS NULL OR is_remote = 0)
-             ORDER BY last_used_at ASC`
+            `SELECT * FROM persistent_agents WHERE status = 'running' ORDER BY last_used_at ASC`
         ).all() as any[]).map(this.mapRow);
     }
 
-    /** Returns count of locally-running (non-remote) agents. */
     countRunningLocal(): number {
         const row = this.db.prepare(
-            `SELECT COUNT(*) as c FROM persistent_agents
-             WHERE status = 'running' AND (is_remote IS NULL OR is_remote = 0)`
+            `SELECT COUNT(*) as c FROM persistent_agents WHERE status = 'running'`
         ).get() as any;
         return row?.c ?? 0;
     }
 
-    /** Find a local running agent whose workdir matches the given absolute path. */
     findByWorkdir(workdir: string): PersistentAgent | undefined {
         const row = this.db.prepare(
-            `SELECT * FROM persistent_agents
-             WHERE workdir = ? AND (is_remote IS NULL OR is_remote = 0)
-             LIMIT 1`
+            `SELECT * FROM persistent_agents WHERE workdir = ? LIMIT 1`
         ).get(workdir) as any;
         return row ? this.mapRow(row) : undefined;
     }

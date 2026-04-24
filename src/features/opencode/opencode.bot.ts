@@ -2,9 +2,9 @@
  * OpenCodeBot — Simplified unified design
  *
  * Comandos:
+ *   /proyectos — Navega proyectos del workspace, abre servidor
  *   /new       — Wizard: crea agente (Gitea / GitHub / local) + arranca servidor
  *   /agents    — Lista agentes, activa sticky, borra
- *   /web       — Abre OpenCode Web remoto por IP/host
  *   /run       — One-shot: prompt puntual a un agente
  *   /models    — Cambia el modelo del agente activo
  *   /esc       — Cancela wizard, desactiva sticky, o aborta operación en curso
@@ -43,7 +43,7 @@ import { ProjectsHandler }  from "./handlers/projects.handler.js";
 import { ModelsHandler }    from "./handlers/models.handler.js";
 import { SessionHandler }   from "./handlers/session.handler.js";
 import { MessageHandler }   from "./handlers/message.handler.js";
-import type { BotContext, NewAgentWizard, ModelSelectionState, RemoteAgentInfo } from "./handlers/bot-context.js";
+import type { BotContext, NewAgentWizard, ModelSelectionState } from "./handlers/bot-context.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -64,8 +64,6 @@ export class OpenCodeBot implements BotContext {
     readonly modelSelection:  Map<number, ModelSelectionState>               = new Map();
 
     // ── Index / lookup maps ───────────────────────────────────────────────────
-    readonly remoteAgentIndex:     Map<string, RemoteAgentInfo>                            = new Map();
-    readonly remoteAgentsInMemory: Map<number, { id: string; host: string; port: number; model: string }> = new Map();
     readonly modelIndex:           Map<string, string>                                     = new Map();
     readonly pendingAgentQuestions: Map<string, { agentId: string; port: number; req: any }> = new Map();
     /** userId → { shortKey, chatId, msgId } — user is typing a custom answer to a question */
@@ -75,7 +73,6 @@ export class OpenCodeBot implements BotContext {
     readonly sessIndex:            Map<string, { agentId: string; sessionId: string }>     = new Map();
 
     // ── Counters ──────────────────────────────────────────────────────────────
-    remoteAgentIndexCounter = 0;
     modelIndexCounter       = 0;
     sessIndexCounter        = 0;
     private static readonly MAX_CALLBACK_DATA = 64;
@@ -114,60 +111,15 @@ export class OpenCodeBot implements BotContext {
         return key;
     }
 
-    // ── Shared helper: disconnect remote agent ────────────────────────────────
-    disconnectRemoteAgent(userId: number): void {
-        const remoteAgent = this.remoteAgentsInMemory.get(userId);
-        if (remoteAgent) {
-            console.log(`[disconnectRemoteAgent] Disconnecting remote agent ${remoteAgent.host}:${remoteAgent.port}`);
-            this.remoteAgentsInMemory.delete(userId);
-            this.persistentAgentService.cancelPendingPrompt(remoteAgent.id);
-            const abortCtrl = (this.persistentAgentService as any).sseControllers?.get(remoteAgent.id);
-            if (abortCtrl) {
-                abortCtrl.abort();
-                (this.persistentAgentService as any).sseControllers.delete(remoteAgent.id);
-            }
-        }
-    }
-
     // ── Shared helper: resolve active or last-used agent ─────────────────────
     getActiveOrLastAgent(userId: number): PersistentAgent | undefined {
         const activeId = this.persistentAgentService.getActiveAgentId(userId);
         if (activeId) {
             const fromDb = this.agentDb.getById(activeId);
             if (fromDb) return fromDb;
-
-            const remoteAgent = this.remoteAgentsInMemory.get(userId);
-            if (remoteAgent && remoteAgent.id === activeId) {
-                return this.buildRemoteAgentRecord(userId, remoteAgent);
-            }
-        }
-
-        const remoteAgent = this.remoteAgentsInMemory.get(userId);
-        if (remoteAgent) {
-            return this.buildRemoteAgentRecord(userId, remoteAgent);
         }
 
         return this.agentDb.getLastUsed(userId) ?? undefined;
-    }
-
-    private buildRemoteAgentRecord(
-        userId: number,
-        r: { id: string; host: string; port: number; model: string },
-    ): PersistentAgent {
-        return {
-            id:       r.id,
-            userId,
-            name:     `Remote (${r.host})`,
-            role:     "",
-            workdir:  `/remote/${r.host}/`,
-            model:    r.model,
-            port:     r.port,
-            status:   "running",
-            createdAt: new Date().toISOString(),
-            lastUsedAt: new Date().toISOString(),
-            host:     r.host,
-            isRemote: true,
-        } as PersistentAgent;
     }
 
     // ── Multi-user routing: where does this agent answer back? ────────────────
@@ -462,9 +414,8 @@ export class OpenCodeBot implements BotContext {
         bot.command("start",   AccessControlMiddleware.requireAccess, this.handleStart.bind(this));
         bot.command("help",    AccessControlMiddleware.requireAccess, this.handleStart.bind(this));
         bot.command("new",     AccessControlMiddleware.requireAccess, this.newWizardHandler.handleNew.bind(this.newWizardHandler));
-        bot.command("agents",  AccessControlMiddleware.requireAccess, (ctx) => this.agentsHandler.handleAgentsWithIp(ctx));
+        bot.command("agents",  AccessControlMiddleware.requireAccess, (ctx) => this.agentsHandler.handleAgents(ctx));
         bot.command("proyectos", AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjects.bind(this.projectsHandler));
-        bot.command("web",     AccessControlMiddleware.requireAccess, this.agentsHandler.handleWeb.bind(this.agentsHandler));
         bot.command("run",     AccessControlMiddleware.requireAccess, this.messageHandler.handleRun.bind(this.messageHandler));
         bot.command("models",  AccessControlMiddleware.requireAccess, this.modelsHandler.handleModels.bind(this.modelsHandler));
         bot.command("esc",     AccessControlMiddleware.requireAccess, this.messageHandler.handleEsc.bind(this.messageHandler));
@@ -487,9 +438,9 @@ export class OpenCodeBot implements BotContext {
         bot.callbackQuery(/^agent:delcancel$/,  AccessControlMiddleware.requireAccess, this.agentsHandler.handleAgentDeleteCancel.bind(this.agentsHandler));
         bot.callbackQuery(/^agent:model:/,      AccessControlMiddleware.requireAccess, this.modelsHandler.handleAgentModelSelect.bind(this.modelsHandler));
         bot.callbackQuery("agent:new",          AccessControlMiddleware.requireAccess, this.newWizardHandler.handleAgentNew.bind(this.newWizardHandler));
-        bot.callbackQuery(/^proj:open:/,        AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectOpen.bind(this.projectsHandler));
-
-        bot.callbackQuery(/^remote:select:/,    AccessControlMiddleware.requireAccess, this.agentsHandler.handleRemoteAgentSelect.bind(this.agentsHandler));
+        bot.callbackQuery(/^proj:nav:/,        AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectNav.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:start:/,      AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectStart.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:open:/,       AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectOpen.bind(this.projectsHandler));
 
         bot.callbackQuery(/^run:agent:/,        AccessControlMiddleware.requireAccess, this.messageHandler.handleRunAgentSelected.bind(this.messageHandler));
         bot.callbackQuery(/^run:cancel$/,       AccessControlMiddleware.requireAccess, this.messageHandler.handleRunCancel.bind(this.messageHandler));
@@ -548,8 +499,7 @@ export class OpenCodeBot implements BotContext {
             `<b>Comandos:</b>\n` +
             `/proyectos — Listar proyectos del workspace y abrir uno\n` +
             `/new — Crear proyecto nuevo con wizard (${isGitea ? "Gitea ✅" : "Gitea ❌"} / ${isGithub ? "GitHub ✅" : "GitHub ❌"} / local)\n` +
-            `/agents [&lt;ip&gt;] — Ver servidores OpenCode (usa &lt;ip&gt; para nodos remotos)\n` +
-            `/web &lt;ip&gt; — Abrir OpenCode Web por proyecto (remoto)\n` +
+            `/agents — Ver servidores OpenCode activos\n` +
             `/run — Prompt puntual a un agente\n` +
             `/session — Ver sesiones del agente activo\n` +
             `/rename — Renombrar la sesión activa\n` +
@@ -564,8 +514,6 @@ export class OpenCodeBot implements BotContext {
             `1. <code>/proyectos</code> → toca un proyecto → servidor listo\n` +
             `2. Escribe tus mensajes directamente\n` +
             `3. <code>/esc</code> para desactivar el servidor activo\n\n` +
-            `<b>Remoto:</b> <code>/agents 10.0.0.8</code> → pulsa agente → úsalo una vez\n\n` +
-            `<b>Web:</b> <code>/web 10.0.0.8</code>\n\n` +
             `<b>Límite:</b> ${maxAgents} servidores OpenCode simultáneos (MAX_OPENCODE_SERVERS en .env). ` +
             `Si abres uno nuevo y ya hay ${maxAgents} en marcha, se para automáticamente el menos usado (LRU).`,
             { parse_mode: "HTML" }

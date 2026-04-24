@@ -102,8 +102,6 @@ export class MessageHandler {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        this.ctx.disconnectRemoteAgent(userId);
-
         const allAgents = this.ctx.agentDb.getByUser(userId);
         const agents = allAgents.filter(a => a.status !== "stopped");
         if (agents.length === 0) {
@@ -248,7 +246,6 @@ export class MessageHandler {
         if (activeId) {
             const agent = this.ctx.agentDb.getById(activeId);
             this.ctx.persistentAgentService.clearActiveAgent(userId);
-            this.ctx.remoteAgentsInMemory.delete(userId);
 
             if (agent) {
                 await ctx.reply(`⏹️ <b>${escapeHtml(agent.name)}</b> desactivado.`, { parse_mode: "HTML" });

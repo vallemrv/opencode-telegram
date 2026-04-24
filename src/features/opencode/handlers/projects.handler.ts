@@ -1,9 +1,8 @@
 /**
  * ProjectsHandler — handles /proyectos.
  *
- * Lists subdirectories of WORKSPACE_DIR. Tapping a project either activates
- * its existing OpenCode server (if running) or starts a new one (evicting
- * the LRU server when the 3-server limit is reached).
+ * Browser-style navigation of WORKSPACE_DIR. User can navigate into
+ * subdirectories and start an OpenCode server at any level.
  */
 
 import { Context, InlineKeyboard } from "grammy";
@@ -29,7 +28,6 @@ function workspaceDir(): string {
 }
 
 export class ProjectsHandler {
-    /** Maps short callback index → absolute path */
     private readonly projectIndex = new Map<string, string>();
     private projectIndexCounter = 0;
 
@@ -41,18 +39,32 @@ export class ProjectsHandler {
         return key;
     }
 
+    private isRootDir(absPath: string): boolean {
+        return absPath === workspaceDir();
+    }
+
     // ── /proyectos ────────────────────────────────────────────────────────────
 
     async handleProjects(ctx: Context): Promise<void> {
+        await this.showDirectory(ctx, workspaceDir());
+    }
+
+    // ── Show directory contents ────────────────────────────────────────────────
+
+    private async showDirectory(ctx: Context, absPath: string, editMsgId?: number): Promise<void> {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        const root = workspaceDir();
         let entries: fs.Dirent[];
         try {
-            entries = fs.readdirSync(root, { withFileTypes: true });
+            entries = fs.readdirSync(absPath, { withFileTypes: true });
         } catch (err) {
-            await ctx.reply(`❌ No se pudo leer ${escapeHtml(root)}: ${escapeHtml(String(err))}`, { parse_mode: "HTML" });
+            const msg = `❌ No se pudo leer ${escapeHtml(absPath)}: ${escapeHtml(String(err))}`;
+            if (editMsgId && ctx.chat) {
+                await ctx.api.editMessageText(ctx.chat.id, editMsgId, msg, { parse_mode: "HTML" });
+            } else {
+                await ctx.reply(msg, { parse_mode: "HTML" });
+            }
             return;
         }
 
@@ -65,44 +77,101 @@ export class ProjectsHandler {
         const allAgents = this.ctx.agentDb.getAll();
 
         const keyboard = new InlineKeyboard();
-        for (const name of dirs) {
-            const absPath = nodePath.join(root, name);
+
+        // Botón para abrir servidor en el directorio actual (si no es la raíz)
+        if (!this.isRootDir(absPath)) {
             const existing = allAgents.find(a => a.workdir === absPath);
+            let statusIcon = "🟢";
+            if (existing) {
+                if (existing.id === activeId) statusIcon = "✅";
+                else if (existing.status === "running") statusIcon = "🟢";
+                else statusIcon = "🔴";
+            }
+            const currentKey = this.makeProjectKey(absPath);
+            keyboard.text(`⚡ Abrir servidor aquí ${statusIcon}`, `proj:start:${currentKey}`).row();
+        }
+
+        // Subcarpetas
+        for (const name of dirs) {
+            const subPath = nodePath.join(absPath, name);
+            const existing = allAgents.find(a => a.workdir === subPath);
             let prefix = "📁";
             if (existing) {
                 if (existing.id === activeId) prefix = "✅";
                 else if (existing.status === "running") prefix = "🟢";
             }
-            const key = this.makeProjectKey(absPath);
-            keyboard.text(`${prefix} ${name}`, `proj:open:${key}`).row();
+            const key = this.makeProjectKey(subPath);
+            keyboard.text(`${prefix} ${name}`, `proj:nav:${key}`).row();
         }
-        keyboard.text("🆕 Nuevo proyecto (wizard)", "agent:new");
+
+        // Botón atrás (si no estamos en la raíz)
+        if (!this.isRootDir(absPath)) {
+            const parentPath = nodePath.dirname(absPath);
+            const parentKey = this.makeProjectKey(parentPath);
+            keyboard.text("⬅️ Atrás", `proj:nav:${parentKey}`);
+        }
+
+        // Botón para crear nuevo proyecto
+        if (this.isRootDir(absPath)) {
+            keyboard.text("🆕 Nuevo proyecto (wizard)", "agent:new");
+        }
 
         const maxAgents = this.ctx.configService.getMaxAgents();
         const running = this.ctx.agentDb.countRunningLocal();
-        const header =
-            `📂 <b>Proyectos en</b> <code>${escapeHtml(root)}</code>\n` +
-            `Servidores activos: ${running}/${maxAgents}\n\n` +
-            (dirs.length === 0
-                ? `No hay subdirectorios. Pulsa 🆕 para crear uno con el wizard.`
-                : `Toca un proyecto para abrirlo. Si hay ${maxAgents} servidores corriendo, se parará el menos usado (LRU).`);
+        const relPath = this.isRootDir(absPath) ? "/" : nodePath.relative(workspaceDir(), absPath) || "/";
 
-        await ctx.reply(header, { parse_mode: "HTML", reply_markup: keyboard });
+        const header =
+            `📂 <b>${escapeHtml(relPath)}</b>\n` +
+            `Servidores activos: ${running}/${maxAgents}\n\n` +
+            (dirs.length === 0 && this.isRootDir(absPath)
+                ? `No hay subdirectorios. Pulsa 🆕 para crear uno.`
+                : dirs.length === 0
+                ? `Esta carpeta está vacía. Puedes abrir un servidor aquí.`
+                : `Toca una carpeta para navegar. ⚡ para abrir servidor.`);
+
+        if (editMsgId && ctx.chat) {
+            await ctx.api.editMessageText(ctx.chat.id, editMsgId, header, {
+                parse_mode: "HTML",
+                reply_markup: keyboard,
+            });
+        } else {
+            await ctx.reply(header, { parse_mode: "HTML", reply_markup: keyboard });
+        }
     }
 
-    // ── proj:open:<key> ───────────────────────────────────────────────────────
+    // ── proj:nav:<key> — navigate into directory ───────────────────────────────
 
-    async handleProjectOpen(ctx: Context): Promise<void> {
+    async handleProjectNav(ctx: Context): Promise<void> {
+        await ctx.answerCallbackQuery();
+        const data = ctx.callbackQuery?.data;
+        if (!data?.startsWith("proj:nav:")) return;
+        const key = data.slice("proj:nav:".length);
+        const absPath = this.projectIndex.get(key);
+        if (!absPath) {
+            await ctx.reply("❌ Ruta caducada, ejecuta /proyectos de nuevo.");
+            return;
+        }
+        if (!fs.existsSync(absPath)) {
+            await ctx.reply(`❌ Ya no existe: <code>${escapeHtml(absPath)}</code>`, { parse_mode: "HTML" });
+            return;
+        }
+        const msgId = ctx.callbackQuery?.message?.message_id;
+        await this.showDirectory(ctx, absPath, msgId);
+    }
+
+    // ── proj:start:<key> — start server in directory ────────────────────────────
+
+    async handleProjectStart(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         const userId = ctx.from?.id;
         if (!userId) return;
 
         const data = ctx.callbackQuery?.data;
-        if (!data?.startsWith("proj:open:")) return;
-        const key = data.slice("proj:open:".length);
+        if (!data?.startsWith("proj:start:")) return;
+        const key = data.slice("proj:start:".length);
         const absPath = this.projectIndex.get(key);
         if (!absPath) {
-            await ctx.reply("❌ Proyecto caducado, ejecuta /proyectos de nuevo.");
+            await ctx.reply("❌ Ruta caducada, ejecuta /proyectos de nuevo.");
             return;
         }
         if (!fs.existsSync(absPath)) {
@@ -110,7 +179,7 @@ export class ProjectsHandler {
             return;
         }
 
-        const projectName = nodePath.basename(absPath);
+        const projectName = nodePath.basename(absPath) || "workspace";
         const existing = this.ctx.agentDb.findByWorkdir(absPath);
 
         // Existing running agent → activate
@@ -127,7 +196,8 @@ export class ProjectsHandler {
             return;
         }
 
-        // Otherwise we need to start one. Ensure slot first.
+        // Delete message and start server
+        await ctx.deleteMessage().catch(() => {});
         const status = await ctx.reply(`⏳ Abriendo <b>${escapeHtml(projectName)}</b>...`, { parse_mode: "HTML" });
         const editStatus = (text: string) =>
             ctx.api.editMessageText(status.chat.id, status.message_id, text, { parse_mode: "HTML" }).catch(() => {});
@@ -176,5 +246,11 @@ export class ProjectsHandler {
             `Puerto: <code>${port}</code>\n\n` +
             `Tus mensajes van a este servidor. /esc para desactivar.`
         );
+    }
+
+    // ── Legacy: proj:open (delegates to start) ───────────────────────────────────
+
+    async handleProjectOpen(ctx: Context): Promise<void> {
+        await this.handleProjectStart(ctx);
     }
 }

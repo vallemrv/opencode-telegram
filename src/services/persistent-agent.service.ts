@@ -319,7 +319,7 @@ export class PersistentAgentService {
     // ─── Server lifecycle ─────────────────────────────────────────────────────
 
     async startAgent(agent: PersistentAgent): Promise<{ success: boolean; message: string }> {
-        console.log(`[PersistentAgent.startAgent] Starting agent "${agent.name}" (ID: ${agent.id}, isRemote: ${agent.isRemote}, host: ${agent.host || 'N/A'}, port: ${agent.port})`);
+        console.log(`[PersistentAgent.startAgent] Starting agent "${agent.name}" (ID: ${agent.id}, port: ${agent.port})`);
         
         if (this.processes.has(agent.id)) {
             console.log(`[PersistentAgent.startAgent] Agent already has a local process, returning success`);
@@ -333,36 +333,7 @@ export class PersistentAgentService {
             return { success: true, message: "already running (external)" };
         }
 
-        // Remote agents run on another machine — we never spawn a local process for them
-        if (agent.isRemote) {
-            console.log(`[PersistentAgent.startAgent] Agent is remote (${agent.host}:${agent.port}), checking if reachable...`);
-            
-            // Try to connect to the remote server
-            const remoteUrl = `http://${agent.host}:${agent.port}`;
-            try {
-                console.log(`[PersistentAgent.startAgent] Testing connection to ${remoteUrl}`);
-                const testRes = await fetch(remoteUrl, {
-                    method: 'HEAD',
-                    signal: AbortSignal.timeout(5000),
-                });
-                console.log(`[PersistentAgent.startAgent] Remote server responded with status: ${testRes.status}`);
-                
-                if (testRes.ok || testRes.status < 500) {
-                    console.log(`[PersistentAgent.startAgent] Remote server is reachable, ensuring session and starting SSE`);
-                    await this.ensureSession(agent);
-                    this.startSseStream(agent);
-                    return { success: true, message: `remote agent ${agent.host}:${agent.port} is reachable` };
-                } else {
-                    console.error(`[PersistentAgent.startAgent] Remote server returned unexpected status: ${testRes.status}`);
-                    return { success: false, message: `Remote agent ${agent.host}:${agent.port} returned HTTP ${testRes.status}` };
-                }
-            } catch (err: any) {
-                console.error(`[PersistentAgent.startAgent] Failed to connect to remote agent at ${remoteUrl}:`, err.message);
-                return { success: false, message: `Remote agent ${agent.host}:${agent.port} is not reachable: ${err.message || err}` };
-            }
-        }
-
-        console.log(`[PersistentAgent.startAgent] Agent is local, finding opencode binary...`);
+        console.log(`[PersistentAgent.startAgent] Finding opencode binary...`);
         let cmd: string;
         try {
             cmd = await findOpencodeCmd();
@@ -1683,12 +1654,6 @@ export class PersistentAgentService {
             // Parked agents are intentionally stopped — skip them
             if (agent.status === "stopped") {
                 console.log(`[PersistentAgent] Skipping parked agent "${agent.name}" (status=stopped)`);
-                continue;
-            }
-            
-            // Remote agents are on another machine — skip restore, they'll connect on-demand
-            if (agent.isRemote) {
-                console.log(`[PersistentAgent] Skipping remote agent "${agent.name}" at ${agent.host}:${agent.port} — will connect on first use`);
                 continue;
             }
             

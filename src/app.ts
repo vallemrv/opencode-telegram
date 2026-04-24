@@ -4,7 +4,6 @@ import { AgentDbService } from './services/agent-db.service.js';
 import { PersistentAgentService } from './services/persistent-agent.service.js';
 import { OpenCodeBot } from './features/opencode/opencode.bot.js';
 import { AccessControlMiddleware } from './middleware/access-control.middleware.js';
-import { DiscoveryServerService } from './services/discovery-server.service.js';
 import { escapeHtml } from './features/opencode/event-handlers/utils.js';
 import dotenv from 'dotenv';
 import * as fs from 'fs';
@@ -42,7 +41,6 @@ const bot = new Bot(botToken);
 // Initialize services
 const agentDb = new AgentDbService();
 const persistentAgentService = new PersistentAgentService(agentDb);
-const discoveryServer = new DiscoveryServerService(agentDb);
 
 // Set global error handler to prevent crashes
 bot.catch((err) => {
@@ -88,9 +86,9 @@ async function startBot() {
         // Set bot commands for Telegram UI
         try {
             await bot.api.setMyCommands([
+                { command: 'proyectos', description: 'Listar proyectos del workspace' },
                 { command: 'new',       description: 'Crear nuevo agente' },
                 { command: 'agents',    description: 'Listar / gestionar agentes' },
-                { command: 'web',       description: 'Abrir OpenCode Web por proyecto' },
                 { command: 'run',       description: 'Enviar prompt one-shot a un agente' },
                 { command: 'session',   description: 'Ver sesiones del agente activo' },
                 { command: 'rename',    description: 'Renombrar sesión activa' },
@@ -195,10 +193,6 @@ async function startBot() {
             console.error('[TelegramCoder] Error restoring state:', err);
         }
 
-        // Start the discovery server
-        await discoveryServer.start();
-        console.log('[TelegramCoder] ✅ Discovery server started successfully');
-        
         // Start the bot
         await bot.start();
         console.log('[TelegramCoder] ✅ Bot started successfully');
@@ -221,7 +215,6 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
     try {
         await bot.stop();
-        await discoveryServer.stop();
         console.log('[TelegramCoder] ✅ Shutdown complete');
         process.exit(0);
     } catch (error) {

@@ -120,8 +120,6 @@ export class NewWizardHandler {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        this.ctx.disconnectRemoteAgent(userId);
-
         const inWizard = this.ctx.newWizard.get(userId);
         if (inWizard) {
             await ctx.reply("ℹ️ Ya estás creando un agente. Termina ese proceso o usa /esc para cancelar.");
