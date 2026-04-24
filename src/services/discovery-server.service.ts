@@ -122,6 +122,17 @@ export class DiscoveryServerService {
           fs.mkdirSync(workdir, { recursive: true });
         }
 
+        // Anchor opencode workspace to this exact directory (prevent walking up to parent)
+        const opencodeJsonPath = `${workdir}/opencode.json`;
+        if (!fs.existsSync(opencodeJsonPath)) {
+          try {
+            fs.writeFileSync(opencodeJsonPath, "{}\n", { encoding: "utf-8" });
+            console.log(`[DiscoveryServer] Created opencode.json in ${workdir} to anchor workspace`);
+          } catch (e: any) {
+            console.warn(`[DiscoveryServer] Could not create opencode.json in ${workdir}: ${e.message}`);
+          }
+        }
+
         // Find opencode binary
         let cmd: string;
         try {
@@ -133,7 +144,9 @@ export class DiscoveryServerService {
         }
 
         const hostname = process.env.OPENCODE_BIND_HOST || '0.0.0.0';
-        const child = spawn(cmd, ['serve', '--port', String(port), '--hostname', hostname], {
+        const shellCmd = `cd ${workdir} && ${cmd} serve --port ${port} --hostname ${hostname}`;
+        console.log(`[DiscoveryServer] Shell command: ${shellCmd}`);
+        const child = spawn("sh", ["-c", shellCmd], {
           cwd: workdir,
           detached: true,
           stdio: 'ignore',
