@@ -21,9 +21,19 @@ function resolveHome(p: string): string {
 }
 
 function workspaceDir(): string {
-    const raw = process.env.WORKSPACE_DIR || process.cwd();
+    const raw = process.env.WORKSPACE_DIR || "~/proyectos";
     if (raw.startsWith("~/") || raw === "~") return nodePath.join(os.homedir(), raw.slice(1));
     return raw;
+}
+
+function resolveAbsolutePath(input: string): string {
+    let resolved = input.trim();
+    if (resolved.startsWith("~/") || resolved === "~") {
+        resolved = nodePath.join(os.homedir(), resolved.slice(1));
+    } else if (!nodePath.isAbsolute(resolved)) {
+        resolved = nodePath.join(workspaceDir(), resolved);
+    }
+    return resolved;
 }
 
 export class ProjectsHandler {
@@ -38,20 +48,44 @@ export class ProjectsHandler {
         return key;
     }
 
-    private isRootDir(absPath: string): boolean {
-        return absPath === workspaceDir();
+    private readonly userRoots = new Map<number, string>();
+
+    private isRootDir(userId: number, absPath: string): boolean {
+        const root = this.userRoots.get(userId) || workspaceDir();
+        return absPath === root;
     }
 
-    // ── /proyectos ────────────────────────────────────────────────────────────
+    // ── /proyectos [path] ────────────────────────────────────────────────────────
 
     async handleProjects(ctx: Context): Promise<void> {
-        await this.showDirectory(ctx, workspaceDir());
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const args = ctx.message?.text?.split(/\s+/).slice(1) || [];
+        const pathArg = args[0]?.trim();
+
+        let startPath: string;
+        if (pathArg) {
+            const customPath = resolveAbsolutePath(pathArg);
+            if (!fs.existsSync(customPath)) {
+                await ctx.reply(`❌ El directorio no existe: <code>${escapeHtml(customPath)}</code>`, { parse_mode: "HTML" });
+                return;
+            }
+            if (!fs.statSync(customPath).isDirectory()) {
+                await ctx.reply(`❌ No es un directorio: <code>${escapeHtml(customPath)}</code>`, { parse_mode: "HTML" });
+                return;
+            }
+            startPath = customPath;
+        } else {
+            startPath = workspaceDir();
+        }
+        this.userRoots.set(userId, startPath);
+        await this.showDirectory(ctx, userId, startPath);
     }
 
     // ── Show directory contents ────────────────────────────────────────────────
 
-    private async showDirectory(ctx: Context, absPath: string, editMsgId?: number): Promise<void> {
-        const userId = ctx.from?.id;
+    private async showDirectory(ctx: Context, userId: number, absPath: string, editMsgId?: number): Promise<void> {
         if (!userId) return;
 
         let entries: fs.Dirent[];
@@ -78,7 +112,7 @@ export class ProjectsHandler {
         const keyboard = new InlineKeyboard();
 
         // Botón para abrir servidor en el directorio actual (si no es la raíz)
-        if (!this.isRootDir(absPath)) {
+        if (!this.isRootDir(userId, absPath)) {
             const existing = allAgents.find(a => a.workdir === absPath);
             let statusIcon = "🟢";
             if (existing) {
@@ -104,14 +138,14 @@ export class ProjectsHandler {
         }
 
         // Botón atrás (si no estamos en la raíz)
-        if (!this.isRootDir(absPath)) {
+        if (!this.isRootDir(userId, absPath)) {
             const parentPath = nodePath.dirname(absPath);
             const parentKey = this.makeProjectKey(parentPath);
             keyboard.text("⬅️ Atrás", `proj:nav:${parentKey}`);
         }
 
         // Botón para crear nuevo proyecto
-        if (this.isRootDir(absPath)) {
+        if (this.isRootDir(userId, absPath)) {
             keyboard.text("🆕 Nuevo proyecto (wizard)", "agent:new");
         }
 
@@ -122,7 +156,7 @@ export class ProjectsHandler {
         const header =
             `📂 <b>${escapeHtml(relPath)}</b>\n` +
             `Servidores activos: ${running}/${maxAgents}\n\n` +
-            (dirs.length === 0 && this.isRootDir(absPath)
+            (dirs.length === 0 && this.isRootDir(userId, absPath)
                 ? `No hay subdirectorios. Pulsa 🆕 para crear uno.`
                 : dirs.length === 0
                 ? `Esta carpeta está vacía. Puedes abrir un servidor aquí.`
@@ -142,6 +176,9 @@ export class ProjectsHandler {
 
     async handleProjectNav(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
         const data = ctx.callbackQuery?.data;
         if (!data?.startsWith("proj:nav:")) return;
         const key = data.slice("proj:nav:".length);
@@ -155,7 +192,7 @@ export class ProjectsHandler {
             return;
         }
         const msgId = ctx.callbackQuery?.message?.message_id;
-        await this.showDirectory(ctx, absPath, msgId);
+        await this.showDirectory(ctx, userId, absPath, msgId);
     }
 
     // ── proj:start:<key> — start server in directory ────────────────────────────
