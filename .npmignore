@@ -16,16 +16,12 @@ logs/
 .git/
 .gitignore
 
-# Documentation (keep essential docs, exclude Docker-specific)
+# Documentation
 docs/
 
 # Development configs
 nodemon.json
 ecosystem.config.cjs
-
-# Docker files (not needed in npm package)
-Dockerfile
-docker-compose.yml
 
 # IDE
 .vscode/

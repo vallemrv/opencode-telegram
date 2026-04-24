@@ -69,7 +69,11 @@ export class ConfigService {
         this.giteaToken = process.env.GITEA_TOKEN || '';
 
         // Load agent configuration
-        this.maxAgents = parseInt(process.env.MAX_AGENTS || '10', 10);
+        // MAX_OPENCODE_SERVERS is the new name (default 3); MAX_AGENTS kept as legacy fallback.
+        this.maxAgents = parseInt(
+            process.env.MAX_OPENCODE_SERVERS || process.env.MAX_AGENTS || '3',
+            10,
+        );
 
         // Load system environment
         this.homeDirectory = process.env.HOME || '/tmp';

@@ -17,9 +17,11 @@ export interface PersistentAgent {
     model: string;        // provider/model
     port: number;         // Fixed port for its opencode serve process
     sessionId?: string;   // Long-lived OpenCode session UUID (persisted across restarts)
-    /** 'running' (default) or 'stopped' (parked — process not started, not counted in MAX_AGENTS) */
+    /** 'running' (default) or 'stopped' (legacy — kept for migration; eviction now deletes) */
     status: "running" | "stopped";
     createdAt: string;
+    /** Last time this agent was selected/used (ISO). Drives LRU eviction when slots are full. */
+    lastUsedAt: string;
     host?: string;        // Host/IP del nodo (default: localhost)
     isRemote?: boolean;   // Indica si es agente remoto (default: false)
 }
@@ -78,6 +80,14 @@ export class AgentDbService {
         } catch {
             // Column already exists — ignore
         }
+        // Migrate existing databases that don't have the last_used_at column yet
+        try {
+            this.db.exec(`ALTER TABLE persistent_agents ADD COLUMN last_used_at DATETIME`);
+            // Backfill from created_at for existing rows
+            this.db.exec(`UPDATE persistent_agents SET last_used_at = created_at WHERE last_used_at IS NULL`);
+        } catch {
+            // Column already exists — ignore
+        }
         // Tracks which agent was last used per user (for auto-routing messages)
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS agent_last_used (
@@ -90,8 +100,8 @@ export class AgentDbService {
 
     save(agent: PersistentAgent): void {
         this.db.prepare(`
-            INSERT INTO persistent_agents (id, user_id, name, role, workdir, model, port, session_id, status, created_at, host, is_remote)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO persistent_agents (id, user_id, name, role, workdir, model, port, session_id, status, created_at, last_used_at, host, is_remote)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 role = excluded.role,
@@ -100,6 +110,7 @@ export class AgentDbService {
                 port = excluded.port,
                 session_id = excluded.session_id,
                 status = excluded.status,
+                last_used_at = excluded.last_used_at,
                 host = excluded.host,
                 is_remote = excluded.is_remote
         `).run(
@@ -113,6 +124,7 @@ export class AgentDbService {
             agent.sessionId ?? null,
             agent.status ?? "running",
             agent.createdAt,
+            agent.lastUsedAt ?? agent.createdAt,
             agent.host ?? 'localhost',
             agent.isRemote ? 1 : 0,
         );
@@ -241,8 +253,43 @@ export class AgentDbService {
             sessionId: row.session_id ?? undefined,
             status: (row.status === "stopped" ? "stopped" : "running") as "running" | "stopped",
             createdAt: row.created_at,
+            lastUsedAt: row.last_used_at ?? row.created_at,
             host: row.host ?? 'localhost',
             isRemote: !!row.is_remote,
         };
+    }
+
+    /** Update the lastUsedAt timestamp for an agent. Drives LRU eviction. */
+    touchLastUsed(agentId: string): void {
+        this.db.prepare('UPDATE persistent_agents SET last_used_at = ? WHERE id = ?')
+            .run(new Date().toISOString(), agentId);
+    }
+
+    /** Returns global running agents (excluding remote) ordered by last_used_at ASC (oldest first). */
+    getRunningOrderedByLRU(): PersistentAgent[] {
+        return (this.db.prepare(
+            `SELECT * FROM persistent_agents
+             WHERE status = 'running' AND (is_remote IS NULL OR is_remote = 0)
+             ORDER BY last_used_at ASC`
+        ).all() as any[]).map(this.mapRow);
+    }
+
+    /** Returns count of locally-running (non-remote) agents. */
+    countRunningLocal(): number {
+        const row = this.db.prepare(
+            `SELECT COUNT(*) as c FROM persistent_agents
+             WHERE status = 'running' AND (is_remote IS NULL OR is_remote = 0)`
+        ).get() as any;
+        return row?.c ?? 0;
+    }
+
+    /** Find a local running agent whose workdir matches the given absolute path. */
+    findByWorkdir(workdir: string): PersistentAgent | undefined {
+        const row = this.db.prepare(
+            `SELECT * FROM persistent_agents
+             WHERE workdir = ? AND (is_remote IS NULL OR is_remote = 0)
+             LIMIT 1`
+        ).get(workdir) as any;
+        return row ? this.mapRow(row) : undefined;
     }
 }

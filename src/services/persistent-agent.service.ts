@@ -1701,4 +1701,64 @@ export class PersistentAgentService {
         }
         return failed;
     }
+
+    // ─── LRU slot management ─────────────────────────────────────────────────
+
+    /** Touch the lastUsedAt timestamp of an agent (selection / prompt). */
+    touchLastUsed(agentId: string): void {
+        try { this.agentDb.touchLastUsed(agentId); } catch { /* ignore */ }
+    }
+
+    /**
+     * Ensure there is at least one free slot among the global MAX_OPENCODE_SERVERS
+     * for a brand-new local agent. If the limit is reached, the least-recently-used
+     * running local agent is stopped and deleted (no resumption — irreversible).
+     *
+     * @param maxServers  Hard limit (default 3)
+     * @param protectId   Optional agent.id to never evict (e.g. the one we are about to activate)
+     * @returns The agent that was evicted, or null if nothing needed to be done.
+     */
+    async ensureSlotAvailable(maxServers: number, protectId?: string): Promise<PersistentAgent | null> {
+        const running = this.agentDb.getRunningOrderedByLRU();
+        if (running.length < maxServers) return null;
+
+        const candidate = running.find(a => a.id !== protectId);
+        if (!candidate) return null;
+
+        await this.evictAgent(candidate);
+        return candidate;
+    }
+
+    /** Stop and permanently delete an agent (process + DB row + sticky/last-used cleanup). */
+    async evictAgent(agent: PersistentAgent): Promise<void> {
+        // Best-effort: delete OpenCode sessions that belong to this workdir.
+        try {
+            const baseUrl = `http://${agent.host || "localhost"}:${agent.port}`;
+            const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(3000) });
+            if (sessRes.ok) {
+                const allSessions: any[] = await sessRes.json();
+                const agentDir = resolveDir(agent.workdir);
+                const sessions = allSessions.filter((s: any) => !s.directory || s.directory === agentDir);
+                await Promise.all(sessions.map(s =>
+                    fetch(`${baseUrl}/session/${s.id}`, {
+                        method: "DELETE",
+                        signal: AbortSignal.timeout(5000),
+                    }).catch(() => {})
+                ));
+            }
+        } catch { /* best-effort */ }
+
+        this.stopAgent(agent.id);
+        this.agentDb.delete(agent.id);
+
+        // Clean any sticky/last-used pointers across users
+        for (const [userId, activeId] of this.activeAgentByUser.entries()) {
+            if (activeId === agent.id) this.activeAgentByUser.delete(userId);
+        }
+        try {
+            // Best-effort: clear last-used pointers for users that had this one
+            const lastUsed = this.agentDb.getLastUsed(agent.userId);
+            if (lastUsed?.id === agent.id) this.agentDb.clearLastUsed(agent.userId);
+        } catch { /* ignore */ }
+    }
 }

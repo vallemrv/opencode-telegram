@@ -63,48 +63,31 @@ export class AgentsHandler {
         if (!userId) return;
 
         const agents = this.ctx.agentDb.getByUser(userId);
-        const runningAgents = agents.filter(a => a.status === "running");
         const activeId = this.ctx.persistentAgentService.getActiveAgentId(userId);
         const keyboard = new InlineKeyboard();
 
         for (const agent of agents) {
-            const isStopped = agent.status === "stopped";
             const isActive = agent.id === activeId;
             const displayName = this.getAgentDisplayName(agent.name);
-            const label = isStopped
-                ? `⏸️ ${displayName}`
-                : isActive ? `✅ ${displayName}` : displayName;
-
-            if (isStopped) {
-                keyboard
-                    .text(label, `agent:activate:${agent.id}`)
-                    .text("▶️", `agent:unpark:${agent.id}`)
-                    .text("🗑️", `agent:del:${agent.id}`)
-                    .row();
-            } else {
-                keyboard
-                    .text(label, `agent:activate:${agent.id}`)
-                    .text("⏹️", `agent:park:${agent.id}`)
-                    .text("🗑️", `agent:del:${agent.id}`)
-                    .row();
-            }
+            const label = isActive ? `✅ ${displayName}` : `🤖 ${displayName}`;
+            keyboard
+                .text(label, `agent:activate:${agent.id}`)
+                .text("🗑️", `agent:del:${agent.id}`)
+                .row();
         }
-
-        keyboard.text("➕ Nuevo agente", "agent:new");
 
         const activeAgent = agents.find(a => a.id === activeId);
         const activeInfo = activeId
             ? `\n\n🟢 <b>${escapeHtml(this.getAgentDisplayName(activeAgent?.name ?? ""))}</b> activo — tus mensajes van a él.\n/esc para volver a ninguno.`
             : agents.length === 0
-                ? `\n\n⚪ Aún no tienes agentes.`
-                : `\n\n⚪ Ningún agente activo.`;
+                ? `\n\n⚪ Aún no hay servidores OpenCode activos.`
+                : `\n\n⚪ Ningún servidor activo.`;
 
         const maxAgents = this.ctx.configService.getMaxAgents();
         const header = agents.length === 0
-            ? `🤖 <b>Tus agentes</b>\n\nNo tienes agentes todavía.`
-            : `🤖 <b>Tus agentes (${runningAgents.length}/${maxAgents} activos, ${agents.length} total)</b>\n\n` +
-              `Toca el nombre para activar (sticky), ⏹️ aparcar, ▶️ reanudar, 🗑️ borrar.\n` +
-              `Los agentes aparcados (⏸️) no cuentan para el límite de ${maxAgents}.`;
+            ? `🤖 <b>Servidores OpenCode</b>\n\nNo hay ninguno arrancado.\nUsa /proyectos para abrir un proyecto.`
+            : `🤖 <b>Servidores OpenCode (${agents.length}/${maxAgents})</b>\n\n` +
+              `Toca el nombre para activar (sticky), 🗑️ para parar y borrar (irreversible).`;
 
         await ctx.reply(
             header + activeInfo,
@@ -132,6 +115,7 @@ export class AgentsHandler {
         } else {
             this.ctx.persistentAgentService.setActiveAgent(userId, agentId);
             this.ctx.agentDb.setLastUsed(userId, agentId);
+            this.ctx.persistentAgentService.touchLastUsed(agentId);
             await ctx.answerCallbackQuery({ text: `✅ ${agent.name} activado.` });
         }
 
@@ -214,66 +198,6 @@ export class AgentsHandler {
 
     async handleAgentDeleteCancel(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
-        await ctx.deleteMessage().catch(() => {});
-        await this.handleAgents(ctx);
-    }
-
-    // ── agent:park:ID ─────────────────────────────────────────────────────────
-
-    async handleAgentPark(ctx: Context): Promise<void> {
-        await ctx.answerCallbackQuery();
-        const userId = ctx.from?.id;
-        if (!userId) return;
-
-        const callbackData = ctx.callbackQuery?.data;
-        if (!callbackData?.startsWith("agent:park:")) return;
-        const agentId = callbackData.replace("agent:park:", "");
-        const agent = this.ctx.agentDb.getById(agentId);
-        if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
-
-        if (agent.status === "stopped") {
-            await ctx.answerCallbackQuery({ text: `⏸️ ${agent.name} ya estaba aparcado.` });
-            return;
-        }
-
-        if (this.ctx.persistentAgentService.getActiveAgentId(userId) === agentId) {
-            this.ctx.persistentAgentService.clearActiveAgent(userId);
-        }
-
-        this.ctx.persistentAgentService.parkAgent(agentId);
-        await ctx.answerCallbackQuery({ text: `⏸️ ${agent.name} aparcado.` });
-        await ctx.deleteMessage().catch(() => {});
-        await this.handleAgents(ctx);
-    }
-
-    // ── agent:unpark:ID ───────────────────────────────────────────────────────
-
-    async handleAgentUnpark(ctx: Context): Promise<void> {
-        await ctx.answerCallbackQuery();
-        const userId = ctx.from?.id;
-        if (!userId) return;
-
-        const callbackData = ctx.callbackQuery?.data;
-        if (!callbackData?.startsWith("agent:unpark:")) return;
-        const agentId = callbackData.replace("agent:unpark:", "");
-        const agent = this.ctx.agentDb.getById(agentId);
-        if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
-
-        if (agent.status === "running") {
-            await ctx.answerCallbackQuery({ text: `▶️ ${agent.name} ya estaba activo.` });
-            return;
-        }
-
-        const statusMsg = await ctx.reply(`▶️ Arrancando <b>${escapeHtml(agent.name)}</b>…`, { parse_mode: "HTML" });
-        const result = await this.ctx.persistentAgentService.unparkAgent(agent);
-        await ctx.api.deleteMessage(statusMsg.chat.id, statusMsg.message_id).catch(() => {});
-
-        if (result.success) {
-            await ctx.reply(`✅ <b>${escapeHtml(agent.name)}</b> reanudado.`, { parse_mode: "HTML" });
-        } else {
-            await ctx.reply(`❌ No se pudo arrancar <b>${escapeHtml(agent.name)}</b>: ${result.message}`, { parse_mode: "HTML" });
-        }
-
         await ctx.deleteMessage().catch(() => {});
         await this.handleAgents(ctx);
     }

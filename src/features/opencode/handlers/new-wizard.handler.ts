@@ -284,6 +284,14 @@ export class NewWizardHandler {
                 }
             }
 
+            // Ensure we have a free slot (LRU eviction if needed)
+            const maxAgents = this.ctx.configService.getMaxAgents();
+            const evicted = await this.ctx.persistentAgentService.ensureSlotAvailable(maxAgents);
+            if (evicted) {
+                await edit(`♻️ Liberando slot: parado y borrado <b>${escapeHtml(evicted.name)}</b> (LRU).`);
+                await new Promise(r => setTimeout(r, 800));
+            }
+
             // Pick port and save agent to DB
             const port = pickPort(this.ctx.agentDb.usedPorts());
             const agent: PersistentAgent = {
@@ -296,6 +304,7 @@ export class NewWizardHandler {
                 port,
                 status: "running",
                 createdAt: new Date().toISOString(),
+                lastUsedAt: new Date().toISOString(),
             };
             this.ctx.agentDb.save(agent);
 
