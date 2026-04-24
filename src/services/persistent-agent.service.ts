@@ -19,7 +19,7 @@
 
 import { spawn, ChildProcess, execSync } from "child_process";
 import { access, constants } from "fs/promises";
-import { realpathSync } from "fs";
+import { realpathSync, existsSync, writeFileSync } from "fs";
 import * as path from "path";
 import * as os from "os";
 import { createOpencodeClient } from "@opencode-ai/sdk";
@@ -337,13 +337,23 @@ export class PersistentAgentService {
         const workdir = resolveDir(agent.workdir);
         console.log(`[PersistentAgent.startAgent] Workdir: ${workdir}`);
 
+        // Ensure opencode.json exists in workdir to anchor the workspace root here,
+        // preventing opencode from walking up the directory tree to a parent folder.
+        const opencodeJsonPath = path.join(workdir, "opencode.json");
+        if (!existsSync(opencodeJsonPath)) {
+            try {
+                writeFileSync(opencodeJsonPath, "{}\n", { encoding: "utf-8" });
+                console.log(`[PersistentAgent.startAgent] Created opencode.json in ${workdir} to anchor workspace`);
+            } catch (e: any) {
+                console.warn(`[PersistentAgent.startAgent] Could not create opencode.json in ${workdir}: ${e.message}`);
+            }
+        }
+
         const hostname = process.env.OPENCODE_BIND_HOST || "0.0.0.0";
         console.log(`[PersistentAgent.startAgent] Spawning opencode serve on ${hostname}:${agent.port}`);
-        const child = spawn(cmd, [
-            "serve",
-            "--port", String(agent.port),
-            "--hostname", hostname,
-        ], {
+        const shellCmd = `cd ${workdir} && ${cmd} serve --port ${agent.port} --hostname ${hostname}`;
+        console.log(`[PersistentAgent.startAgent] Shell command: ${shellCmd}`);
+        const child = spawn("sh", ["-c", shellCmd], {
             cwd: workdir,
             detached: false,
             stdio: "ignore",
@@ -396,6 +406,7 @@ export class PersistentAgentService {
         const host = agent.host || 'localhost';
         const baseUrl = `http://${host}:${agent.port}`;
         const cachedId = this.sessionIds.get(agent.id) ?? agent.sessionId;
+        const expectedDir = resolveDir(agent.workdir);
 
         console.log(`[PersistentAgent.ensureSession] Agent "${agent.name}" (${agent.id}), host: ${host}, port: ${agent.port}, cachedSessionId: ${cachedId || 'N/A'}`);
 
@@ -407,10 +418,11 @@ export class PersistentAgentService {
                 });
                 if (res.ok) {
                     const sess: any = await res.json();
-                    // Validate that the session belongs to this agent's workdir
-                    const expectedDir = resolveDir(agent.workdir);
-                    if (sess.directory && sess.directory !== expectedDir) {
-                        console.log(`[PersistentAgent.ensureSession] Session ${cachedId} belongs to a different directory (${sess.directory} vs ${expectedDir}), creating new session`);
+                    // Validate that the session belongs to this agent's workdir.
+                    // Normalize both paths to avoid false mismatches (e.g. symlinks, trailing slash).
+                    const actualDir = typeof sess.directory === "string" ? resolveDir(sess.directory) : "";
+                    if (actualDir && actualDir !== expectedDir) {
+                        console.log(`[PersistentAgent.ensureSession] Session ${cachedId} belongs to a different directory (${actualDir} vs ${expectedDir}), creating new session`);
                     } else {
                         this.sessionIds.set(agent.id, cachedId);
                         console.log(`[PersistentAgent.ensureSession] Existing session ${cachedId} is valid`);
@@ -436,6 +448,7 @@ export class PersistentAgentService {
     private async createSession(agent: PersistentAgent): Promise<string> {
         const host = agent.host || 'localhost';
         const baseUrl = `http://${host}:${agent.port}`;
+        const workdir = resolveDir(agent.workdir);
         console.log(`[PersistentAgent.createSession] Creating session for agent "${agent.name}" at ${baseUrl}`);
 
         let modelConfig: { providerID: string; modelID: string } | undefined;
@@ -452,6 +465,8 @@ export class PersistentAgentService {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 title: `tg-${agent.name}`,
+                // Force exact workspace directory for the session.
+                directory: workdir,
                 system: agent.role || undefined,
                 model: modelConfig,
                 permission: [
@@ -1381,19 +1396,53 @@ export class PersistentAgentService {
 
     /**
      * Cancel the in-flight prompt for an agent (called by /esc).
-     * Resolves the pending promise with a cancellation message and stops the heartbeat.
-     * Queued prompts are also cleared.
+     *
+     * 1. Best-effort: POST /session/{id}/abort so opencode actually stops the
+     *    model call on its side instead of quietly finishing in the background.
+     * 2. Resolve the pending promise locally with a "cancelled" message so the
+     *    Telegram placeholder is edited immediately.
+     * 3. Stop the heartbeat and clear the queue / child-session tracking.
+     *
+     * Returns the Promise of the abort HTTP call so callers that care can
+     * await it; most call-sites (e.g. /esc) fire-and-forget.
      */
-    cancelPendingPrompt(agentId: string): void {
+    cancelPendingPrompt(agentId: string): Promise<void> {
         const pending = this.pendingPrompts.get(agentId);
+        let abortPromise: Promise<void> = Promise.resolve();
+
         if (pending) {
             this.pendingPrompts.delete(agentId);
             this.stopHeartbeat(agentId);
+
+            // Fire the abort request to opencode. We do NOT await it before resolving
+            // the pending promise — the user already decided to cancel, so resolving
+            // locally ensures the Telegram UI updates immediately even if opencode
+            // is unreachable. If abort fails, we log but don't propagate the error.
+            const agent = this.agentDb.getById(agentId);
+            if (agent && pending.sessionId) {
+                const host = agent.host || "localhost";
+                const url = `http://${host}:${agent.port}/session/${pending.sessionId}/abort`;
+                abortPromise = fetch(url, {
+                    method: "POST",
+                    signal: AbortSignal.timeout(5000),
+                }).then(res => {
+                    if (!res.ok) {
+                        console.warn(`[PersistentAgent.cancelPendingPrompt] abort returned HTTP ${res.status} for agent "${agent.name}" session "${pending.sessionId}"`);
+                    } else {
+                        console.log(`[PersistentAgent.cancelPendingPrompt] abort OK for agent "${agent.name}" session "${pending.sessionId}"`);
+                    }
+                }).catch((err: unknown) => {
+                    console.warn(`[PersistentAgent.cancelPendingPrompt] abort failed for agent "${agent.name}" session "${pending.sessionId}":`, err);
+                });
+            }
+
             pending.resolve({ output: "❌ Cancelado por el usuario.", sessionId: pending.sessionId });
         }
         // Also clear the queue and child session tracking so nothing drains after cancellation
         this.promptQueues.delete(agentId);
         this.activeChildSessions.delete(agentId);
+
+        return abortPromise;
     }
 
     /** How many prompts are waiting in the queue for this agent (not counting the in-flight one) */
