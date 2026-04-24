@@ -106,6 +106,28 @@ export type OnAdoptSessionResultCallback = (
     result: AgentSendResult,
 ) => Promise<void>;
 
+/**
+ * Called at startup when a persisted heartbeat placeholder exists for an agent
+ * but the underlying opencode session is no longer busy and cannot be adopted
+ * (server restarted too, session 404'd, etc.). The bot should edit the
+ * placeholder message to let the user know their work was lost and then
+ * drop the heartbeat entry.
+ */
+export type OnLostPromptCallback = (
+    agentId: string,
+    chatId: number,
+    msgId: number,
+) => Promise<void>;
+
+/**
+ * Lookup for persisted heartbeat placeholders. The service does not own the
+ * SQLite connection; the bot injects this lookup so we keep the service
+ * layer unaware of the DB schema.
+ */
+export type HeartbeatLookup = (
+    agentId: string,
+) => { chatId: number; msgId: number } | undefined;
+
 /** Resolve ~ in paths */
 export function resolveDir(p: string): string {
     let resolved = p;
@@ -199,8 +221,14 @@ export class PersistentAgentService {
     /** Callback registered by OpenCodeBot to handle adopted (recovered) sessions after restart */
     private onAdoptSession?: OnAdoptSessionCallback;
 
-    /** Callback registered by OpenCodeBot to deliver result of an adopted session */
+    /** Called when an adopted (recovered) session finally resolves. */
     private onAdoptSessionResult?: OnAdoptSessionResultCallback;
+
+    /** Called when a persisted heartbeat exists but no session can be recovered. */
+    private onLostPrompt?: OnLostPromptCallback;
+
+    /** Lookup for persisted heartbeat placeholder (chatId + msgId) by agentId. */
+    private heartbeatLookup?: HeartbeatLookup;
 
     /** Map of agentId → heartbeat timer handle (only active while prompt is in-flight) */
     private heartbeatTimers: Map<string, NodeJS.Timeout> = new Map();
@@ -276,6 +304,16 @@ export class PersistentAgentService {
     /** Register the adopt-session result callback (called once at startup by OpenCodeBot) */
     setOnAdoptSessionResultCallback(cb: OnAdoptSessionResultCallback): void {
         this.onAdoptSessionResult = cb;
+    }
+
+    /** Callback invoked when a persisted heartbeat cannot be recovered after restart. */
+    setOnLostPromptCallback(cb: OnLostPromptCallback): void {
+        this.onLostPrompt = cb;
+    }
+
+    /** Inject a lookup that returns persisted heartbeat placeholders by agentId. */
+    setHeartbeatLookup(lookup: HeartbeatLookup): void {
+        this.heartbeatLookup = lookup;
     }
 
     // ─── Server lifecycle ─────────────────────────────────────────────────────
@@ -1015,7 +1053,13 @@ export class PersistentAgentService {
         const existing = this.pendingPrompts.get(agent.id);
 
         const sessionId = existing?.sessionId ?? this.sessionIds.get(agent.id) ?? agent.sessionId;
-        if (!sessionId) return;
+        // If there is no session at all and we have a persisted heartbeat, the
+        // previous work is unrecoverable (e.g. the opencode server itself was
+        // also restarted and sessionId was never learned). Notify the user.
+        if (!sessionId) {
+            await this.notifyLostPromptIfAny(agent);
+            return;
+        }
 
         try {
             const host = agent.host || 'localhost';
@@ -1023,7 +1067,14 @@ export class PersistentAgentService {
                 `http://${host}:${agent.port}/session/${sessionId}`,
                 { signal: AbortSignal.timeout(5000) }
             );
-            if (!res.ok) return;
+            if (!res.ok) {
+                // Session does not exist on the server anymore — opencode restarted,
+                // user deleted it, etc. If we had a heartbeat waiting, tell the user.
+                if (!existing) {
+                    await this.notifyLostPromptIfAny(agent);
+                }
+                return;
+            }
 
             const session: any = await res.json();
             const status: string = session?.status ?? session?.info?.status ?? "";
@@ -1037,9 +1088,33 @@ export class PersistentAgentService {
             } else if (status === "busy") {
                 // Case 2: bot restarted while session was busy — adopt it
                 await this.adoptBusySession(agent, sessionId);
+            } else {
+                // Case 3: session exists but is idle and we have no pending prompt.
+                // If there's a persisted heartbeat, the result was produced while the
+                // bot was down and can no longer be correlated — treat as lost.
+                await this.notifyLostPromptIfAny(agent);
             }
         } catch (err) {
             console.debug(`[PersistentAgent] recoverPendingPrompt for "${agent.name}": ${err}`);
+        }
+    }
+
+    /**
+     * If a heartbeat placeholder was persisted for this agent but we could not
+     * recover the prompt (no session / session gone / session idle with no
+     * pending), notify the user that their in-progress work is lost and clear
+     * the heartbeat entry.
+     */
+    private async notifyLostPromptIfAny(agent: PersistentAgent): Promise<void> {
+        if (!this.heartbeatLookup || !this.onLostPrompt) return;
+        const hb = this.heartbeatLookup(agent.id);
+        if (!hb) return;
+
+        try {
+            await this.onLostPrompt(agent.id, hb.chatId, hb.msgId);
+            console.log(`[PersistentAgent] notifyLostPromptIfAny: notified lost prompt for agent "${agent.name}" in chat ${hb.chatId}`);
+        } catch (err) {
+            console.error(`[PersistentAgent] onLostPrompt callback error for "${agent.name}":`, err);
         }
     }
 

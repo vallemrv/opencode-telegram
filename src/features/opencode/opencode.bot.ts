@@ -376,6 +376,33 @@ export class OpenCodeBot implements BotContext {
         };
         this.persistentAgentService.setOnAdoptSessionResultCallback(adoptSessionResultCallback);
 
+        // Notify user when a persisted heartbeat cannot be recovered after a
+        // bot restart (e.g. because opencode itself restarted and lost the
+        // session). We edit the original "working…" placeholder so the user
+        // is not left staring at a spinner forever.
+        this.persistentAgentService.setOnLostPromptCallback(async (agentId, chatId, msgId) => {
+            const agent = this.agentDb.getById(agentId);
+            const label = agent ? escapeHtml(agent.name) : agentId;
+            try {
+                await bot.api.editMessageText(
+                    chatId, msgId,
+                    `⚠️ <b>${label}</b>: trabajo perdido durante el reinicio del bot. Vuelve a enviar el mensaje.`,
+                    { parse_mode: "HTML" }
+                );
+            } catch (err) {
+                console.warn("[OpenCodeBot] onLostPrompt edit failed:", err);
+            }
+            // Drop the persisted entry so we don't re-notify on subsequent restarts
+            this.heartbeatMessages.delete(agentId);
+        });
+
+        // Expose the persisted heartbeat lookup so the agent service can decide
+        // whether to fire the lost-prompt notification.
+        this.persistentAgentService.setHeartbeatLookup((agentId) => {
+            const hb = this.heartbeatMessages.get(agentId);
+            return hb ? { chatId: hb.chatId, msgId: hb.msgId } : undefined;
+        });
+
         // Restore all agents on startup
         this.persistentAgentService.restoreAll(this.agentDb.getAll())
             .then(async (failed) => {
