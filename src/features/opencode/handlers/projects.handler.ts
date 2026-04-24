@@ -21,10 +21,9 @@ function resolveHome(p: string): string {
 }
 
 function workspaceDir(): string {
-    const raw = process.env.WORKSPACE_DIR || "~/proyectos";
-    const resolved = resolveHome(raw);
-    if (!fs.existsSync(resolved)) fs.mkdirSync(resolved, { recursive: true });
-    return resolved;
+    const raw = process.env.WORKSPACE_DIR || process.cwd();
+    if (raw.startsWith("~/") || raw === "~") return nodePath.join(os.homedir(), raw.slice(1));
+    return raw;
 }
 
 export class ProjectsHandler {
