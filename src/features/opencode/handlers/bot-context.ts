@@ -10,6 +10,7 @@ import type { AgentDbService } from "../../../services/agent-db.service.js";
 import type { PersistentAgentService } from "../../../services/persistent-agent.service.js";
 import type { ConfigService } from "../../../services/config.service.js";
 import type { TranscriptionService } from "../../../services/transcription.service.js";
+import type { SessionDbService } from "../../../services/session-db.service.js";
 
 // ─── Wizard / in-memory state types ──────────────────────────────────────────
 
@@ -49,6 +50,7 @@ export interface BotContext {
     readonly persistentAgentService: PersistentAgentService;
     readonly configService: ConfigService;
     readonly transcriptionService: TranscriptionService;
+    readonly sessionDb: SessionDbService;
 
     // Wizard state maps
     readonly newWizard: Map<number, NewAgentWizard>;
@@ -79,4 +81,15 @@ export interface BotContext {
     editOrSendResult(chatId: number, msgId: number, agent: import("../../../services/agent-db.service.js").PersistentAgent, result: import("../../../services/persistent-agent.service.js").AgentSendResult): Promise<void>;
     sendAgentResult(chatId: number, agent: import("../../../services/agent-db.service.js").PersistentAgent, result: import("../../../services/persistent-agent.service.js").AgentSendResult): Promise<void>;
     sendPromptToAgent(ctx: import("grammy").Context, agent: import("../../../services/agent-db.service.js").PersistentAgent, prompt: string): Promise<void>;
+
+    /**
+     * Resolve where agent-initiated messages (questions, session errors,
+     * adopted-session notifications) should be delivered. Prefers the last
+     * chat where the agent was spoken to (persisted in agent_last_chat so it
+     * survives restarts); falls back to the agent creator's DM if unknown.
+     *
+     * This is what makes multi-user / group-chat routing work: the agent no
+     * longer always writes back to its creator.
+     */
+    resolveAgentChat(agentId: string): { chatId: number; userId: number };
 }

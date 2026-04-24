@@ -361,8 +361,9 @@ export class MessageHandler {
         keyboard.text("✏️ Escribir respuesta", `agq:${shortKey}:custom`);
 
         try {
+            const { chatId } = this.ctx.resolveAgentChat(agent.id);
             await bot.api.sendMessage(
-                agent.userId,
+                chatId,
                 `❓ <b>${escapeHtml(agent.name)}</b> tiene una pregunta:\n\n` +
                 `${escapeHtml(questionText)}` +
                 (optionsText ? `\n${optionsText}` : ""),
@@ -539,9 +540,10 @@ export class MessageHandler {
             }
         } else {
             try {
-                const msg = await bot.api.sendMessage(agent.userId, text, { parse_mode: "HTML" });
+                const { chatId, userId } = this.ctx.resolveAgentChat(agentId);
+                const msg = await bot.api.sendMessage(chatId, text, { parse_mode: "HTML" });
                 if (msg) {
-                    this.ctx.heartbeatMessages.set(agentId, { chatId: agent.userId, msgId: msg.message_id });
+                    this.ctx.heartbeatMessages.set(agentId, { chatId, msgId: msg.message_id, userId });
                 }
             } catch (err) {
                 console.error("[MessageHandler] Failed to send heartbeat message:", err);
@@ -562,8 +564,9 @@ export class MessageHandler {
         if (hb) return; // already handled via sendPrompt resolution path
 
         try {
+            const { chatId } = this.ctx.resolveAgentChat(agentId);
             await bot.api.sendMessage(
-                agent.userId,
+                chatId,
                 `⚠️ <b>${escapeHtml(agent.name)}</b> — error del modelo:\n\n<code>${escapeHtml(errorMessage)}</code>`,
                 { parse_mode: "HTML" }
             );

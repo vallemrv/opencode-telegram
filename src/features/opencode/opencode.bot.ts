@@ -165,6 +165,23 @@ export class OpenCodeBot implements BotContext {
         } as PersistentAgent;
     }
 
+    // ── Multi-user routing: where does this agent answer back? ────────────────
+
+    /**
+     * Resolve where agent-initiated messages (questions, session errors,
+     * adopted-session notifications) should be delivered. Prefers the last
+     * chat where the agent was spoken to; falls back to the agent creator's
+     * DM if unknown. See BotContext.resolveAgentChat for details.
+     */
+    resolveAgentChat(agentId: string): { chatId: number; userId: number } {
+        const lastChat = this.sessionDb.getAgentLastChat(agentId);
+        if (lastChat) return lastChat;
+
+        const agent = this.agentDb.getById(agentId);
+        const fallbackUserId = agent?.userId ?? 0;
+        return { chatId: fallbackUserId, userId: fallbackUserId };
+    }
+
     // ── Shared helper: edit placeholder then send new result message ──────────
     async editOrSendResult(
         chatId: number,
@@ -234,6 +251,19 @@ export class OpenCodeBot implements BotContext {
 
     // ── Shared helper: send prompt to agent (with queue support) ─────────────
     async sendPromptToAgent(ctx: Context, agent: PersistentAgent, prompt: string): Promise<void> {
+        // Remember where this agent was last spoken to so that agent-initiated
+        // messages (questions, session errors, adopted-session notifications)
+        // are routed back to this chat instead of the agent creator's DM.
+        const originatorChatId = ctx.chat?.id;
+        const originatorUserId = ctx.from?.id;
+        if (originatorChatId !== undefined && originatorUserId !== undefined) {
+            try {
+                this.sessionDb.setAgentLastChat(agent.id, originatorChatId, originatorUserId);
+            } catch (err) {
+                console.error("[OpenCodeBot.sendPromptToAgent] setAgentLastChat failed:", err);
+            }
+        }
+
         if (this.persistentAgentService.isBusy(agent.id)) {
             const chatId = ctx.chat!.id;
 
@@ -348,15 +378,19 @@ export class OpenCodeBot implements BotContext {
             if (!this.bot) return null;
             const agent = this.agentDb.getById(agentId);
             const agentName = agent?.name ?? agentId;
+            // Prefer the chat where the agent was last used over the creator's
+            // DM so recovered sessions land in the correct group / shared chat.
+            const { chatId } = this.resolveAgentChat(agentId);
+            const targetChatId = chatId || userId;
             try {
                 const msg = await this.bot.api.sendMessage(
-                    userId,
+                    targetChatId,
                     `🔄 <b>${escapeHtml(agentName)}</b> — bot reiniciado, recuperando trabajo en curso…`,
                     { parse_mode: "HTML" }
                 );
                 // Register as heartbeat message so ticks update this placeholder
-                this.heartbeatMessages.set(agentId, { chatId: userId, msgId: msg.message_id });
-                return { chatId: userId, msgId: msg.message_id };
+                this.heartbeatMessages.set(agentId, { chatId: targetChatId, msgId: msg.message_id, userId });
+                return { chatId: targetChatId, msgId: msg.message_id };
             } catch (err) {
                 console.error("[OpenCodeBot] adoptSession notification failed:", err);
                 return null;
@@ -408,8 +442,9 @@ export class OpenCodeBot implements BotContext {
             .then(async (failed) => {
                 for (const agent of failed) {
                     try {
+                        const { chatId } = this.resolveAgentChat(agent.id);
                         await bot.api.sendMessage(
-                            agent.userId,
+                            chatId,
                             `⚠️ <b>Agente "${escapeHtml(agent.name)}" no pudo restaurarse</b>\n\nPuerto: <code>${agent.port}</code>. Arrancará de nuevo al enviarle un mensaje.`,
                             { parse_mode: "HTML" }
                         );
