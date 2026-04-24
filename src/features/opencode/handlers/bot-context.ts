@@ -63,7 +63,7 @@ export interface BotContext {
     readonly pendingAgentQuestions: Map<string, { agentId: string; port: number; req: any }>;
     /** userId → { shortKey, chatId, msgId } — user is typing a custom answer to a question */
     readonly pendingCustomAnswer: Map<number, { shortKey: string; chatId: number; msgId: number }>;
-    readonly heartbeatMessages: Map<string, { chatId: number; msgId: number }>;
+    readonly heartbeatMessages: Map<string, { chatId: number; msgId: number; userId?: number }>;
     readonly queueStatusMessage: Map<string, { chatId: number; msgId: number }>;
     readonly sessIndex: Map<string, { agentId: string; sessionId: string }>;
 

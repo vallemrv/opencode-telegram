@@ -33,6 +33,8 @@ import type { OnAdoptSessionCallback, OnAdoptSessionResultCallback } from "../..
 import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
 import { formatAsHtml, escapeHtml } from "./event-handlers/utils.js";
 import { TranscriptionService } from "../../services/transcription.service.js";
+import { SessionDbService } from "../../services/session-db.service.js";
+import { PersistentHeartbeatMap } from "../../services/persistent-map.js";
 
 // ─── Handler classes ──────────────────────────────────────────────────────────
 import { NewWizardHandler } from "./handlers/new-wizard.handler.js";
@@ -51,6 +53,7 @@ export class OpenCodeBot implements BotContext {
     readonly agentDb: AgentDbService;
     readonly persistentAgentService: PersistentAgentService;
     readonly transcriptionService: TranscriptionService;
+    readonly sessionDb: SessionDbService;
     bot: Bot | undefined;
 
     // ── Wizard state maps ─────────────────────────────────────────────────────
@@ -66,7 +69,7 @@ export class OpenCodeBot implements BotContext {
     readonly pendingAgentQuestions: Map<string, { agentId: string; port: number; req: any }> = new Map();
     /** userId → { shortKey, chatId, msgId } — user is typing a custom answer to a question */
     readonly pendingCustomAnswer:  Map<number, { shortKey: string; chatId: number; msgId: number }> = new Map();
-    readonly heartbeatMessages:    Map<string, { chatId: number; msgId: number }>          = new Map();
+    readonly heartbeatMessages:    PersistentHeartbeatMap;
     readonly queueStatusMessage:   Map<string, { chatId: number; msgId: number }>          = new Map();
     readonly sessIndex:            Map<string, { agentId: string; sessionId: string }>     = new Map();
 
@@ -88,6 +91,8 @@ export class OpenCodeBot implements BotContext {
         this.agentDb               = new AgentDbService();
         this.persistentAgentService = new PersistentAgentService(this.agentDb);
         this.transcriptionService  = new TranscriptionService();
+        this.sessionDb             = new SessionDbService();
+        this.heartbeatMessages     = new PersistentHeartbeatMap(this.sessionDb);
 
         this.newWizardHandler = new NewWizardHandler(this);
         this.agentsHandler    = new AgentsHandler(this);

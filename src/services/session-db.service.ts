@@ -57,6 +57,95 @@ export class SessionDbService {
                 value TEXT NOT NULL
             )
         `);
+
+        // Heartbeat placeholder messages — persisted so that a restart mid-prompt
+        // can still edit / replace the original "working…" message instead of leaving
+        // it orphaned in Telegram.
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS heartbeat_messages (
+                agent_id    TEXT PRIMARY KEY,
+                chat_id     INTEGER NOT NULL,
+                msg_id      INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                updated_at  DATETIME NOT NULL
+            )
+        `);
+
+        // Remembers the chat where each agent was last spoken to. Used to route
+        // agent-initiated messages (questions, session errors, adopted-session
+        // notifications after a restart) back to the right chat instead of the
+        // agent creator's DM — makes group chats and shared agents work correctly.
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS agent_last_chat (
+                agent_id    TEXT PRIMARY KEY,
+                chat_id     INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                updated_at  DATETIME NOT NULL
+            )
+        `);
+    }
+
+    // ── heartbeat_messages ────────────────────────────────────────────────────
+
+    saveHeartbeat(agentId: string, chatId: number, msgId: number, userId: number): void {
+        this.db.prepare(`
+            INSERT INTO heartbeat_messages (agent_id, chat_id, msg_id, user_id, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                chat_id    = excluded.chat_id,
+                msg_id     = excluded.msg_id,
+                user_id    = excluded.user_id,
+                updated_at = excluded.updated_at
+        `).run(agentId, chatId, msgId, userId, new Date().toISOString());
+    }
+
+    getHeartbeat(agentId: string): { chatId: number; msgId: number; userId: number } | undefined {
+        const row = this.db.prepare(
+            'SELECT chat_id, msg_id, user_id FROM heartbeat_messages WHERE agent_id = ?'
+        ).get(agentId) as any;
+        if (!row) return undefined;
+        return { chatId: row.chat_id, msgId: row.msg_id, userId: row.user_id };
+    }
+
+    getAllHeartbeats(): Array<{ agentId: string; chatId: number; msgId: number; userId: number }> {
+        const rows = this.db.prepare(
+            'SELECT agent_id, chat_id, msg_id, user_id FROM heartbeat_messages'
+        ).all() as any[];
+        return rows.map(r => ({
+            agentId: r.agent_id,
+            chatId:  r.chat_id,
+            msgId:   r.msg_id,
+            userId:  r.user_id,
+        }));
+    }
+
+    deleteHeartbeat(agentId: string): void {
+        this.db.prepare('DELETE FROM heartbeat_messages WHERE agent_id = ?').run(agentId);
+    }
+
+    // ── agent_last_chat ───────────────────────────────────────────────────────
+
+    setAgentLastChat(agentId: string, chatId: number, userId: number): void {
+        this.db.prepare(`
+            INSERT INTO agent_last_chat (agent_id, chat_id, user_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                chat_id    = excluded.chat_id,
+                user_id    = excluded.user_id,
+                updated_at = excluded.updated_at
+        `).run(agentId, chatId, userId, new Date().toISOString());
+    }
+
+    getAgentLastChat(agentId: string): { chatId: number; userId: number } | undefined {
+        const row = this.db.prepare(
+            'SELECT chat_id, user_id FROM agent_last_chat WHERE agent_id = ?'
+        ).get(agentId) as any;
+        if (!row) return undefined;
+        return { chatId: row.chat_id, userId: row.user_id };
+    }
+
+    deleteAgentLastChat(agentId: string): void {
+        this.db.prepare('DELETE FROM agent_last_chat WHERE agent_id = ?').run(agentId);
     }
 
     setState(key: string, value: string): void {
