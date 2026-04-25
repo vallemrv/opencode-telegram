@@ -19,7 +19,7 @@
 
 import { spawn, ChildProcess, execSync } from "child_process";
 import { access, constants } from "fs/promises";
-import { realpathSync, existsSync, writeFileSync } from "fs";
+import { realpathSync, existsSync, writeFileSync, readFileSync } from "fs";
 import * as path from "path";
 import * as os from "os";
 import { createOpencodeClient } from "@opencode-ai/sdk";
@@ -346,16 +346,29 @@ export class PersistentAgentService {
         const workdir = resolveDir(agent.workdir);
         console.log(`[PersistentAgent.startAgent] Workdir: ${workdir}`);
 
-        // Ensure opencode.json exists in workdir to anchor the workspace root here,
-        // preventing opencode from walking up the directory tree to a parent folder.
+        // Ensure opencode.json exists in workdir with valid content to anchor workspace.
+        // OpenCode walks up the tree looking for opencode.json, so we must have a valid one
+        // at the exact workdir to prevent it from using a parent directory as workspace.
         const opencodeJsonPath = path.join(workdir, "opencode.json");
-        if (!existsSync(opencodeJsonPath)) {
-            try {
-                writeFileSync(opencodeJsonPath, "{}\n", { encoding: "utf-8" });
+        const opencodeJsonContent = JSON.stringify({
+            "$schema": "https://opencode.ai/config.json"
+        }) + "\n";
+        try {
+            if (!existsSync(opencodeJsonPath)) {
+                writeFileSync(opencodeJsonPath, opencodeJsonContent, { encoding: "utf-8" });
                 console.log(`[PersistentAgent.startAgent] Created opencode.json in ${workdir} to anchor workspace`);
-            } catch (e: any) {
-                console.warn(`[PersistentAgent.startAgent] Could not create opencode.json in ${workdir}: ${e.message}`);
+            } else {
+                // Verify existing file is valid JSON, rewrite if corrupted
+                try {
+                    const existing = JSON.parse(readFileSync(opencodeJsonPath, "utf-8"));
+                    console.log(`[PersistentAgent.startAgent] opencode.json already exists and is valid in ${workdir}`);
+                } catch {
+                    writeFileSync(opencodeJsonPath, opencodeJsonContent, { encoding: "utf-8" });
+                    console.log(`[PersistentAgent.startAgent] Fixed corrupted opencode.json in ${workdir}`);
+                }
             }
+        } catch (e: any) {
+            console.warn(`[PersistentAgent.startAgent] Could not create opencode.json in ${workdir}: ${e.message}`);
         }
 
         const hostname = process.env.OPENCODE_BIND_HOST || "0.0.0.0";
