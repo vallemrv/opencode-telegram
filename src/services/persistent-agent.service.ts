@@ -1530,6 +1530,10 @@ export class PersistentAgentService {
         const next = q.shift()!;
         this.promptQueues.set(agent.id, q);
 
+        // Wait a few seconds so the previous result message has time to appear
+        // in Telegram before the next task's heartbeat is sent.
+        await new Promise(r => setTimeout(r, 3000));
+
         // Notify that this queued prompt is now being processed
         if (next.onDequeue) {
             await next.onDequeue().catch(err =>

@@ -139,7 +139,7 @@ export class OpenCodeBot implements BotContext {
         return { chatId: fallbackUserId, userId: fallbackUserId };
     }
 
-    // ── Shared helper: edit placeholder then send new result message ──────────
+    // ── Shared helper: delete heartbeat then send new result message ───────────
     async editOrSendResult(
         chatId: number,
         msgId: number,
