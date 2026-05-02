@@ -13,10 +13,18 @@ function getAgentBaseUrl(agent: { host?: string; port: number }): string {
     return `http://${agent.host || "localhost"}:${agent.port}`;
 }
 
+/** Normalize a directory path for comparison: resolve symlinks if possible, strip trailing slash. */
+function normalizeDirPath(p: string): string {
+    try { return resolveDir(p).replace(/\/+$/, ""); } catch { return p.replace(/\/+$/, ""); }
+}
+
 /** Filter a list of OpenCode sessions to only those matching the agent's workdir. */
 function filterSessionsByWorkdir(sessions: any[], workdir: string): any[] {
-    const resolved = resolveDir(workdir);
-    return sessions.filter((s: any) => !s.directory || s.directory === resolved);
+    const resolved = normalizeDirPath(workdir);
+    return sessions.filter((s: any) => {
+        if (!s.directory) return true;
+        return normalizeDirPath(s.directory) === resolved;
+    });
 }
 
 export class SessionHandler {

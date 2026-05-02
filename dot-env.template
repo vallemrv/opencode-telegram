@@ -17,21 +17,26 @@ ADMIN_USER_ID=
 AUTO_KILL=false
 
 # ─── OpenCode ────────────────────────────────────────────────────────────────
-# OpenCode server URL (default: http://localhost:4096)
-OPENCODE_SERVER_URL=http://localhost:4096
-
 # Path to the opencode binary. Required when the process manager (systemd/PM2) runs without
 # the user's PATH (e.g. installed via nvm). Run: which opencode  to get the value.
 OPENCODE_CMD=/home/valle/.nvm/versions/node/v22.22.0/bin/opencode
 
-# Default model to use when no model is selected (provider/model-id)
-OPENCODE_DEFAULT_MODEL=alibaba-coding-plan/qwen3.5-plus
+# Default model to use for new agents (provider/model-id)
+OPENCODE_DEFAULT_MODEL=github-copilot/claude-sonnet-4.6
+
+# Host address to bind opencode servers to (default: 0.0.0.0)
+# Use 127.0.0.1 if you don't want the servers reachable outside localhost
+OPENCODE_BIND_HOST=0.0.0.0
 
 # ─── Workspace ───────────────────────────────────────────────────────────────
-# Root directory where new projects are created when you type a plain name in /new.
-# Supports ~ expansion. Created automatically if it doesn't exist.
+# Root directory shown in the /proyectos browser.
+# Supports ~ expansion.
 # Default: ~/proyectos
 WORKSPACE_DIR=~/proyectos
+
+# Maximum number of simultaneous running OpenCode servers.
+# When the limit is reached the least-recently-used server is stopped automatically.
+MAX_OPENCODE_SERVERS=5
 
 # ─── Gitea ───────────────────────────────────────────────────────────────────
 # URL of your Gitea instance
@@ -45,26 +50,10 @@ GITEA_TOKEN=
 # GitHub personal access token (for repo creation and credential injection)
 GITHUB_TOKEN=
 
-# ─── Background Agent (/run command) ────────────────────────────────────────
-# Default model for background opencode run tasks (provider/model-id)
-# If not set, falls back to OPENCODE_DEFAULT_MODEL
-BACKGROUND_MODEL=alibaba-coding-plan/qwen3.5-plus
-
-# Default working directory for /run tasks (optional, the command will ask)
-# Supports ~ expansion. If empty, /run always asks the user.
-BACKGROUND_WORKDIR=
-
-# Maximum number of simultaneous agents (soft limit — bot warns but does not block)
-MAX_AGENTS=10
-
-# Discovery server port for remote agent discovery (multi-node support)
-# This port is used to discover and connect to agents on remote nodes
-DISCOVERY_PORT=17000
-
+# ─── UI & Media ──────────────────────────────────────────────────────────────
 # Auto-delete timeout for confirmation messages in milliseconds (0 = disable)
 MESSAGE_DELETE_TIMEOUT=10000
 
-# ─── Media ───────────────────────────────────────────────────────────────────
 # Temporary directory for uploaded files
 MEDIA_TMP_LOCATION=/tmp/telegramcoder_media
 

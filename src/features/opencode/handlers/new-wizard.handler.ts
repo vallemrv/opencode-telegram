@@ -40,7 +40,6 @@ function resolveProjectPath(nameOrPath: string): string {
     } else {
         resolved = nodePath.join(workspaceDir(), nameOrPath);
     }
-    if (!fs.existsSync(resolved)) fs.mkdirSync(resolved, { recursive: true });
     return resolved;
 }
 

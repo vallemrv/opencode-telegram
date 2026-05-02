@@ -151,7 +151,7 @@ export class ProjectsHandler {
 
         const maxAgents = this.ctx.configService.getMaxAgents();
         const running = this.ctx.agentDb.countRunningLocal();
-        const relPath = this.isRootDir(absPath) ? "/" : nodePath.relative(workspaceDir(), absPath) || "/";
+        const relPath = this.isRootDir(userId, absPath) ? "/" : nodePath.relative(workspaceDir(), absPath) || "/";
 
         const header =
             `📂 <b>${escapeHtml(relPath)}</b>\n` +
