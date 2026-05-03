@@ -29,7 +29,7 @@ import { AgentDbService } from "../../services/agent-db.service.js";
 import type { PersistentAgent } from "../../services/agent-db.service.js";
 import { PersistentAgentService } from "../../services/persistent-agent.service.js";
 import type { AgentSendResult } from "../../services/persistent-agent.service.js";
-import type { OnAdoptSessionCallback, OnAdoptSessionResultCallback } from "../../services/persistent-agent.service.js";
+import type { OnAdoptSessionCallback, OnAdoptSessionResultCallback, OnExternalSessionIdleCallback } from "../../services/persistent-agent.service.js";
 import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
 import { formatAsHtml, escapeHtml } from "./event-handlers/utils.js";
 import { TranscriptionService } from "../../services/transcription.service.js";
@@ -330,6 +330,33 @@ export class OpenCodeBot implements BotContext {
             this.messageHandler.handleAgentHeartbeatClear.bind(this.messageHandler)
         );
 
+        // ── External session idle (web/CLI → push notification to Telegram) ───
+        const externalSessionIdleCallback: OnExternalSessionIdleCallback = async (agentId, output, sessionId) => {
+            if (!this.bot) return;
+            const agent = this.agentDb.getById(agentId);
+            if (!agent) return;
+            const { chatId } = this.resolveAgentChat(agentId);
+            if (!chatId) return;
+            const header = `🌐 <b>${escapeHtml(agent.name)}</b> <i>(web/CLI)</i>\n\n`;
+            const body = output || "(sin salida)";
+            const MAX = 3800;
+            try {
+                if (body.length <= MAX) {
+                    await this.bot.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
+                } else {
+                    const buf = Buffer.from(body, "utf8");
+                    await this.bot.api.sendDocument(
+                        chatId,
+                        new InputFile(buf, `${agent.name}-respuesta.md`),
+                        { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
+                    );
+                }
+            } catch (err) {
+                console.error("[OpenCodeBot] externalSessionIdle notification failed:", err);
+            }
+        };
+        this.persistentAgentService.setOnExternalSessionIdleCallback(externalSessionIdleCallback);
+
         // ── Adopt-session callbacks (post-restart recovery) ───────────────────
         const adoptSessionCallback: OnAdoptSessionCallback = async (agentId, userId) => {
             if (!this.bot) return null;
@@ -421,7 +448,8 @@ export class OpenCodeBot implements BotContext {
         bot.command("esc",     AccessControlMiddleware.requireAccess, this.messageHandler.handleEsc.bind(this.messageHandler));
         bot.command("undo",    AccessControlMiddleware.requireAccess, this.sessionHandler.handleUndo.bind(this.sessionHandler));
         bot.command("redo",    AccessControlMiddleware.requireAccess, this.sessionHandler.handleRedo.bind(this.sessionHandler));
-        bot.command("session", AccessControlMiddleware.requireAccess, this.sessionHandler.handleSession.bind(this.sessionHandler));
+        bot.command("session",  AccessControlMiddleware.requireAccess, this.sessionHandler.handleSession.bind(this.sessionHandler));
+        bot.command("sessions", AccessControlMiddleware.requireAccess, this.sessionHandler.handleSessions.bind(this.sessionHandler));
         bot.command("rename",  AccessControlMiddleware.requireAccess, this.sessionHandler.handleRename.bind(this.sessionHandler));
         bot.command("delete",  AccessControlMiddleware.requireAccess, this.sessionHandler.handleDelete.bind(this.sessionHandler));
         bot.command("deleteall", AccessControlMiddleware.requireAccess, this.sessionHandler.handleDeleteAll.bind(this.sessionHandler));
@@ -501,7 +529,8 @@ export class OpenCodeBot implements BotContext {
             `/new — Crear proyecto nuevo con wizard (${isGitea ? "Gitea ✅" : "Gitea ❌"} / ${isGithub ? "GitHub ✅" : "GitHub ❌"} / local)\n` +
             `/agents — Ver servidores OpenCode activos\n` +
             `/run — Prompt puntual a un agente\n` +
-            `/session — Ver sesiones del agente activo\n` +
+            `/sessions — Ver todas las sesiones de todos los proyectos\n` +
+            `/session — Ver sesiones del proyecto activo\n` +
             `/rename — Renombrar la sesión activa\n` +
             `/delete — Borrar sesión activa y crear nueva\n` +
             `/deleteall — Borrar todas las sesiones y crear nueva\n` +

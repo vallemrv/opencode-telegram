@@ -80,6 +80,18 @@ export type OnHeartbeatCallback = (agentId: string, summary: HeartbeatSummary) =
 export type OnHeartbeatClearCallback = (agentId: string) => Promise<void>;
 
 /**
+ * Called when a session.idle arrives for a session that was NOT initiated
+ * from Telegram (no pendingPrompt). This means the user worked from the web
+ * UI or CLI and the bot should push the final assistant message as a
+ * notification.
+ */
+export type OnExternalSessionIdleCallback = (
+    agentId: string,
+    output: string,
+    sessionId: string,
+) => Promise<void>;
+
+/**
  * Called when the bot reconnects after a restart and finds a busy session
  * already in progress on the opencode server.
  * The bot should:
@@ -218,6 +230,9 @@ export class PersistentAgentService {
     /** Callback registered by OpenCodeBot to clear heartbeat message when prompt completes */
     private onHeartbeatClear?: OnHeartbeatClearCallback;
 
+    /** Callback for session.idle events from sessions not initiated via Telegram (web/CLI) */
+    private onExternalSessionIdle?: OnExternalSessionIdleCallback;
+
     /** Callback registered by OpenCodeBot to handle adopted (recovered) sessions after restart */
     private onAdoptSession?: OnAdoptSessionCallback;
 
@@ -294,6 +309,11 @@ export class PersistentAgentService {
     /** Register the heartbeat clear callback (called once at startup by OpenCodeBot) */
     setOnHeartbeatClearCallback(cb: OnHeartbeatClearCallback): void {
         this.onHeartbeatClear = cb;
+    }
+
+    /** Register callback for session.idle events from sessions not started via Telegram */
+    setOnExternalSessionIdleCallback(cb: OnExternalSessionIdleCallback): void {
+        this.onExternalSessionIdle = cb;
     }
 
     /** Register the adopt-session callback (called once at startup by OpenCodeBot) */
@@ -778,7 +798,13 @@ export class PersistentAgentService {
                                 console.log(`[PersistentAgent] session.idle for PARENT session "${resolveId}" — resolving prompt for agent "${agent.name}"`);
                                 await this.resolvePromptFromIdle(agent, resolveId);
                             } else {
-                                console.log(`[PersistentAgent] session.idle: NO pending prompt to resolve for agent "${agent.name}"`);
+                                // No pending Telegram prompt — session was started from web/CLI.
+                                // Push the final assistant message as a notification.
+                                const resolveId = idleSessionId || mySessionId || "";
+                                console.log(`[PersistentAgent] session.idle: no pending prompt — firing external idle notification for agent "${agent.name}" session "${resolveId}"`);
+                                this.notifyExternalSessionIdle(agent, resolveId).catch(err =>
+                                    console.error(`[PersistentAgent] notifyExternalSessionIdle error:`, err)
+                                );
                             }
                         } else if (pendingPrompt) {
                             // Case 2: event is for a different session — likely a child/sub-agent.
@@ -929,6 +955,46 @@ export class PersistentAgentService {
         );
         
         console.log(`[PersistentAgent.resolvePromptFromIdle] COMPLETE: agent="${agent.name}"`);
+    }
+
+    /**
+     * Called when session.idle arrives but there is no pending Telegram prompt
+     * (the session was initiated from the web UI or CLI).
+     * Fetches the last assistant message and fires onExternalSessionIdle so the
+     * bot can push a notification to the user.
+     */
+    private async notifyExternalSessionIdle(agent: PersistentAgent, sessionId: string): Promise<void> {
+        if (!this.onExternalSessionIdle) return;
+        if (!sessionId) return;
+
+        try {
+            const host = agent.host || "localhost";
+            const msgRes = await fetch(
+                `http://${host}:${agent.port}/session/${sessionId}/message`,
+                { signal: AbortSignal.timeout(10000) }
+            );
+            if (!msgRes.ok) return;
+
+            const messages: any[] = await msgRes.json();
+            const lastAssistant = [...messages]
+                .reverse()
+                .find((m: any) => m.role === "assistant" || m.info?.role === "assistant");
+
+            if (!lastAssistant) return;
+
+            const parts: any[] = lastAssistant.parts || [];
+            const text = parts
+                .filter((p: any) => p.type === "text" && p.text)
+                .map((p: any) => p.text as string)
+                .join("")
+                .trim();
+
+            if (!text) return;
+
+            await this.onExternalSessionIdle(agent.id, text, sessionId);
+        } catch (err) {
+            console.debug(`[PersistentAgent] notifyExternalSessionIdle error for "${agent.name}": ${err}`);
+        }
     }
 
     // ─── Sub-agent (child session) handling ───────────────────────────────────
