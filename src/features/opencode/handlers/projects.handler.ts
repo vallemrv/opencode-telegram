@@ -116,6 +116,7 @@ export class ProjectsHandler {
     // Public helpers for state checking
     isWizardName(userId: number): boolean {
         const wizard = this.wizardState.get(userId);
+        console.log(`[ProjectsHandler.isWizardName] userId=${userId}, wizard exists=${!!wizard}, step=${wizard?.step || 'N/A'}, result=${wizard?.step === "name"}`);
         return wizard?.step === "name";
     }
 
@@ -423,6 +424,8 @@ export class ProjectsHandler {
         const isNewProject = !fs.existsSync(projectPath);
         const existingGit = !isNewProject && fs.existsSync(nodePath.join(projectPath, ".git"));
 
+        console.log(`[ProjectsHandler.startWizard] userId=${userId}, absPath="${absPathResolved}", projectName="${projectName}", isNewProject=${isNewProject}, existingGit=${existingGit}`);
+
         this.wizardState.set(userId, {
             step: "name",
             absPath: absPathResolved,
@@ -430,6 +433,8 @@ export class ProjectsHandler {
             existingGit,
             isNewProject,
         });
+
+        console.log(`[ProjectsHandler.startWizard] Wizard state saved for userId=${userId}, current wizardState.size=${this.wizardState.size}`);
 
         await ctx.deleteMessage().catch(() => {});
 
@@ -482,18 +487,25 @@ export class ProjectsHandler {
 
     async handleWizardNameText(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
+        console.log(`[ProjectsHandler.handleWizardNameText] ENTER: userId=${userId || 'N/A'}`);
         if (!userId) return;
 
         const wizard = this.wizardState.get(userId);
-        if (!wizard || wizard.step !== "name") return;
+        console.log(`[ProjectsHandler.handleWizardNameText] Wizard state: exists=${!!wizard}, step=${wizard?.step || 'N/A'}, wizardState.size=${this.wizardState.size}`);
+        if (!wizard || wizard.step !== "name") {
+            console.log(`[ProjectsHandler.handleWizardNameText] EARLY RETURN: wizard invalid or step not 'name'`);
+            return;
+        }
 
         const name = ctx.message?.text?.trim();
+        console.log(`[ProjectsHandler.handleWizardNameText] User input: "${name || 'N/A'}"`);
         if (!name) {
             await ctx.reply("❌ Nombre vacío.", { parse_mode: "HTML" });
             return;
         }
 
         wizard.projectName = name;
+        console.log(`[ProjectsHandler.handleWizardNameText] Name saved: "${name}", continuing to git step...`);
         
         // Re-check project status with new name
         const projectPath = nodePath.join(wizard.absPath, name);
@@ -514,6 +526,7 @@ export class ProjectsHandler {
             wizard.step = "git";
             await this.askWizardGit(ctx, userId);
         }
+        console.log(`[ProjectsHandler.handleWizardNameText] Wizard step updated to: ${wizard.step}`);
     }
 
     // ─── Wizard Step 2: Git ─────────────────────────────────────────────────────

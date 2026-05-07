@@ -513,10 +513,13 @@ export class OpenCodeBot implements BotContext {
             if (ctx.message?.text?.startsWith("/")) return next();
             if (ctx.message?.text === "⏹️ ESC") return next();
             const userId = ctx.from?.id;
+            console.log(`[OpenCodeBot.message:text] ENTER: userId=${userId || 'N/A'}, text="${ctx.message?.text?.slice(0, 50) || 'N/A'}"`);
             if (!userId) return;
 
             // Projects wizard states
+            console.log(`[OpenCodeBot.message:text] Checking wizard states for userId=${userId}`);
             if (this.projectsHandler.isWizardName(userId)) {
+                console.log(`[OpenCodeBot.message:text] Detected wizard 'name' state for userId=${userId} → delegating to handleWizardNameText`);
                 await this.projectsHandler.handleWizardNameText(ctx);
                 return;
             }
@@ -538,6 +541,7 @@ export class OpenCodeBot implements BotContext {
                 await this.sessionHandler.handleRenameWizardText(ctx);
                 return;
             }
+            console.log(`[OpenCodeBot.message:text] No wizard state detected → delegating to handleMessage`);
             await this.messageHandler.handleMessage(ctx);
         });
 
