@@ -26,12 +26,12 @@ export class ModelsHandler {
             ?? this.ctx.agentDb.getLastUsed(userId)?.id;
 
         if (!activeId) {
-            await this.showAgentPickerForModels(ctx);
+            await this.showServerPickerForModels(ctx);
             return;
         }
 
         const agent = this.ctx.agentDb.getById(activeId);
-        if (!agent) { await ctx.reply("❌ Agente no encontrado."); return; }
+        if (!agent) { await ctx.reply("❌ Servidor no encontrado."); return; }
 
         await this.showProviderPicker(ctx, agent.id, agent.model);
     }
@@ -47,11 +47,11 @@ export class ModelsHandler {
 
         await ctx.answerCallbackQuery();
 
-        if (data.startsWith("mdl_ag_")) {
+        if (data.startsWith("mdl_srv_")) {
             const agentId = this.ctx.modelIndex.get(data);
             if (!agentId) { await ctx.editMessageText("❌ Sesión expirada."); return; }
             const agent = this.ctx.agentDb.getById(agentId);
-            if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
+            if (!agent) { await ctx.editMessageText("❌ Servidor no encontrado."); return; }
             await this.showProviderPicker(ctx, agent.id, agent.model);
             return;
         }
@@ -119,16 +119,24 @@ export class ModelsHandler {
         }
     }
 
-    // ── agent:model:* (re-route to /models) ───────────────────────────────────
+// ── server:model:* (re-route to /models) ───────────────────────────────────
 
-    async handleAgentModelSelect(ctx: Context): Promise<void> {
+    async handleServerModelSelect(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
-        await this.handleModels(ctx);
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const data = ctx.callbackQuery?.data;
+        if (!data?.startsWith("server:model:")) return;
+        const agentId = data.slice("server:model:".length);
+        const agent = this.ctx.agentDb.getById(agentId);
+        if (!agent) { await ctx.reply("❌ Servidor no encontrado."); return; }
+
+        await ctx.deleteMessage().catch(() => {});
+        await this.showProviderPicker(ctx, agent.id, agent.model);
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────────
-
-    private async showAgentPickerForModels(ctx: Context): Promise<void> {
+    private async showServerPickerForModels(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
         if (!userId) return;
 
@@ -140,7 +148,7 @@ export class ModelsHandler {
 
         const keyboard = new InlineKeyboard();
         for (const agent of agents) {
-            const shortKey = this.ctx.makeShortKey("mdl_ag_");
+            const shortKey = this.ctx.makeShortKey("mdl_srv_");
             this.ctx.modelIndex.set(shortKey, agent.id);
             keyboard.text(agent.name, shortKey).row();
         }

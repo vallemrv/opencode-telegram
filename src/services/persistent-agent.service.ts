@@ -502,13 +502,12 @@ export class PersistentAgentService {
             }
         }
 
-        const createRes = await fetch(`${baseUrl}/session`, {
+        // Create session with directory in query parameter (per SDK spec)
+        const createRes = await fetch(`${baseUrl}/session?directory=${encodeURIComponent(workdir)}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 title: `tg-${agent.name}`,
-                // Force exact workspace directory for the session.
-                directory: workdir,
                 system: agent.role || undefined,
                 model: modelConfig,
                 permission: [
@@ -807,27 +806,29 @@ export class PersistentAgentService {
                                 );
                             }
                         } else if (pendingPrompt) {
-                            // Case 2: event is for a different session — likely a child/sub-agent.
-                            // Mark the child as idle in our tracking set.
+                            // Case 2: event is for a different session AND we have a pending Telegram prompt.
+                            // Likely a child/sub-agent spawned by our parent.
                             const children = this.activeChildSessions.get(agent.id);
                             if (children?.has(idleSessionId)) {
                                 children.delete(idleSessionId);
                                 console.log(`[PersistentAgent] session.idle: child "${idleSessionId}" finished. Remaining active children: ${children.size}`);
 
                                 if (children.size === 0) {
-                                    // All tracked children are done. Check if parent is also idle
-                                    // (its own session.idle may not arrive if it delegated everything).
                                     console.log(`[PersistentAgent] All children idle — checking parent "${mySessionId}" status`);
                                     await this.handleChildSessionIdle(agent, idleSessionId, mySessionId ?? "");
                                 }
-                                // If children.size > 0, more sub-agents are still running — wait.
                             } else {
-                                // Unknown session (not tracked as our child) — could be a child
-                                // created before we started tracking or from a previous run.
-                                // Check the parent's status to be safe.
                                 console.log(`[PersistentAgent] session.idle for untracked session "${idleSessionId}" — checking parent "${mySessionId}" status`);
                                 await this.handleChildSessionIdle(agent, idleSessionId, mySessionId ?? "");
                             }
+                        } else {
+                            // Case 3: event is for a different session AND no pending Telegram prompt.
+                            // This is a session created from web/CLI with a different sessionId.
+                            // Treat as external session and notify user.
+                            console.log(`[PersistentAgent] session.idle for UNREGISTERED session "${idleSessionId}" (different from "${mySessionId || 'N/A'}") — treating as external web/CLI session for agent "${agent.name}"`);
+                            this.notifyExternalSessionIdle(agent, idleSessionId).catch(err =>
+                                console.error(`[PersistentAgent] notifyExternalSessionIdle error:`, err)
+                            );
                         }
                     }
                 }
@@ -964,23 +965,43 @@ export class PersistentAgentService {
      * bot can push a notification to the user.
      */
     private async notifyExternalSessionIdle(agent: PersistentAgent, sessionId: string): Promise<void> {
-        if (!this.onExternalSessionIdle) return;
-        if (!sessionId) return;
+        console.log(`[PersistentAgent.notifyExternalSessionIdle] ENTER: agent="${agent.name}", sessionId="${sessionId}"`);
+        
+        if (!this.onExternalSessionIdle) {
+            console.log(`[PersistentAgent.notifyExternalSessionIdle] No callback registered`);
+            return;
+        }
+        if (!sessionId) {
+            console.log(`[PersistentAgent.notifyExternalSessionIdle] No sessionId`);
+            return;
+        }
 
         try {
             const host = agent.host || "localhost";
+            console.log(`[PersistentAgent.notifyExternalSessionIdle] Fetching messages from http://${host}:${agent.port}/session/${sessionId}/message`);
+            
             const msgRes = await fetch(
                 `http://${host}:${agent.port}/session/${sessionId}/message`,
                 { signal: AbortSignal.timeout(10000) }
             );
-            if (!msgRes.ok) return;
+            console.log(`[PersistentAgent.notifyExternalSessionIdle] Fetch response: ${msgRes.status}`);
+            
+            if (!msgRes.ok) {
+                console.log(`[PersistentAgent.notifyExternalSessionIdle] HTTP error ${msgRes.status}`);
+                return;
+            }
 
             const messages: any[] = await msgRes.json();
+            console.log(`[PersistentAgent.notifyExternalSessionIdle] Found ${messages.length} messages`);
+            
             const lastAssistant = [...messages]
                 .reverse()
                 .find((m: any) => m.role === "assistant" || m.info?.role === "assistant");
 
-            if (!lastAssistant) return;
+            if (!lastAssistant) {
+                console.log(`[PersistentAgent.notifyExternalSessionIdle] No assistant message found`);
+                return;
+            }
 
             const parts: any[] = lastAssistant.parts || [];
             const text = parts
@@ -989,11 +1010,18 @@ export class PersistentAgentService {
                 .join("")
                 .trim();
 
-            if (!text) return;
+            console.log(`[PersistentAgent.notifyExternalSessionIdle] Extracted text length: ${text.length}`);
+            
+            if (!text) {
+                console.log(`[PersistentAgent.notifyExternalSessionIdle] Empty text, skipping notification`);
+                return;
+            }
 
+            console.log(`[PersistentAgent.notifyExternalSessionIdle] Calling onExternalSessionIdle callback with ${text.length} chars`);
             await this.onExternalSessionIdle(agent.id, text, sessionId);
+            console.log(`[PersistentAgent.notifyExternalSessionIdle] COMPLETE: notification sent for "${agent.name}"`);
         } catch (err) {
-            console.debug(`[PersistentAgent] notifyExternalSessionIdle error for "${agent.name}": ${err}`);
+            console.error(`[PersistentAgent.notifyExternalSessionIdle] ERROR for "${agent.name}":`, err);
         }
     }
 

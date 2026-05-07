@@ -465,7 +465,7 @@ export class MessageHandler {
 
     // ── Heartbeat callback ────────────────────────────────────────────────────
 
-    async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<void> {
+async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<void> {
         const bot = this.ctx.bot;
         if (!bot) return;
 
@@ -514,10 +514,11 @@ export class MessageHandler {
 
         // Stats line
         const filesEdited = summary.filesModified;
-        text += `\n\n📊 ${summary.messageCount} mensajes · ${filesEdited} edici${filesEdited !== 1 ? "ones" : "ón"}`;
+        text += `\n\n📊 ${summary.messageCount} mensajes · ${filesEdited} edici${filesEdited !== 1 ? "es" : "ón"}`;
 
         const existing = this.ctx.heartbeatMessages.get(agentId);
         if (existing) {
+            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" - editing message ${existing.msgId}`);
             try {
                 await bot.api.editMessageText(existing.chatId, existing.msgId, text, { parse_mode: "HTML" });
             } catch (err: any) {
@@ -530,20 +531,23 @@ export class MessageHandler {
                      desc.includes("MESSAGE_ID_INVALID") ||
                      desc.includes("can't find"));
                 if (messageGone) {
+                    console.warn(`[MessageHandler.handleAgentHeartbeat] Message ${existing.msgId} gone for "${agent.name}" - clearing reference`);
                     this.ctx.heartbeatMessages.delete(agentId);
                 }
                 // For "message is not modified" we keep the reference so the next
                 // tick can still edit the same message when content changes.
             }
         } else {
+            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" - no existing heartbeat, creating new`);
             try {
                 const { chatId, userId } = this.ctx.resolveAgentChat(agentId);
                 const msg = await bot.api.sendMessage(chatId, text, { parse_mode: "HTML" });
                 if (msg) {
                     this.ctx.heartbeatMessages.set(agentId, { chatId, msgId: msg.message_id, userId });
+                    console.log(`[MessageHandler.handleAgentHeartbeat] Created heartbeat message ${msg.message_id} for "${agent.name}"`);
                 }
             } catch (err) {
-                console.error("[MessageHandler] Failed to send heartbeat message:", err);
+                console.error("[MessageHandler.handleAgentHeartbeat] Failed to send heartbeat message:", err);
             }
         }
     }

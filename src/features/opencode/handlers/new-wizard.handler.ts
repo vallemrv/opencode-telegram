@@ -1,7 +1,7 @@
 /**
  * NewWizardHandler — handles the /new multi-step wizard.
  *
- * Steps:  name → git → confirm → create agent
+ * Steps:  directory (browser) → name → git → confirm → create agent
  */
 
 import { Context, InlineKeyboard } from "grammy";
@@ -26,21 +26,13 @@ function resolveHome(p: string): string {
 }
 
 function workspaceDir(): string {
-    const raw = process.env.WORKSPACE_DIR || process.cwd();
+    const raw = process.env.WORKSPACE_DIR || "~/proyectos";
     if (raw.startsWith("~/") || raw === "~") return nodePath.join(os.homedir(), raw.slice(1));
     return raw;
 }
 
-function resolveProjectPath(nameOrPath: string): string {
-    let resolved: string;
-    if (nodePath.isAbsolute(nameOrPath)) {
-        resolved = nameOrPath;
-    } else if (nameOrPath.startsWith("~/") || nameOrPath === "~") {
-        resolved = resolveHome(nameOrPath);
-    } else {
-        resolved = nodePath.join(workspaceDir(), nameOrPath);
-    }
-    return resolved;
+function resolveProjectPath(parentDir: string, name: string): string {
+    return nodePath.join(parentDir, name);
 }
 
 // ─── GitHub helpers ───────────────────────────────────────────────────────────
@@ -110,7 +102,22 @@ async function giteaCreateOrGetRepo(name: string): Promise<{ cloneUrl: string; h
 // ─── Handler class ────────────────────────────────────────────────────────────
 
 export class NewWizardHandler {
+    private readonly dirIndex = new Map<string, string>();
+    private dirIndexCounter = 0;
+    private readonly userRoots = new Map<number, string>();
+
     constructor(private readonly ctx: BotContext) {}
+
+    private makeDirKey(absPath: string): string {
+        const key = `d${this.dirIndexCounter++}`;
+        this.dirIndex.set(key, absPath);
+        return key;
+    }
+
+    private isRootDir(userId: number, absPath: string): boolean {
+        const root = this.userRoots.get(userId) || workspaceDir();
+        return absPath === root;
+    }
 
     // ── /new ─────────────────────────────────────────────────────────────────
 
@@ -125,22 +132,133 @@ export class NewWizardHandler {
         }
 
         const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "github-copilot/claude-sonnet-4.6";
-        const inlineName = ctx.message?.text?.replace(/^\/new\s*/i, "").trim() || "";
+        this.ctx.newWizard.set(userId, { step: "directory", model: defaultModel });
 
-        if (inlineName) {
-            const wizard: NewAgentWizard = { step: "git", name: inlineName, model: defaultModel };
-            wizard.workdir = resolveProjectPath(inlineName);
-            this.ctx.newWizard.set(userId, wizard);
-            await this.sendGitPicker(ctx, wizard);
-        } else {
-            this.ctx.newWizard.set(userId, { step: "name", model: defaultModel });
-            await ctx.reply(
-                `🆕 <b>Nuevo agente</b>\n\nEscribe el nombre o ruta del proyecto:\n` +
-                `<i>· <code>mi-proyecto</code> → crea ${escapeHtml(workspaceDir())}/mi-proyecto\n` +
-                `· <code>/ruta/absoluta</code> → usa esa ruta directamente</i>`,
-                { parse_mode: "HTML" }
-            );
+        const startPath = workspaceDir();
+        this.userRoots.set(userId, startPath);
+        await this.showDirectoryBrowser(ctx, userId, startPath);
+    }
+
+    // ── Directory browser ────────────────────────────────────────────────────
+
+    private async showDirectoryBrowser(ctx: Context, userId: number, absPath: string, editMsgId?: number): Promise<void> {
+        if (!userId) return;
+
+        let entries: fs.Dirent[];
+        try {
+            entries = fs.readdirSync(absPath, { withFileTypes: true });
+        } catch (err) {
+            const msg = `❌ No se pudo leer ${escapeHtml(absPath)}: ${escapeHtml(String(err))}`;
+            if (editMsgId && ctx.chat) {
+                await ctx.api.editMessageText(ctx.chat.id, editMsgId, msg, { parse_mode: "HTML" });
+            } else {
+                await ctx.reply(msg, { parse_mode: "HTML" });
+            }
+            return;
         }
+
+        const dirs = entries
+            .filter(e => e.isDirectory() && !e.name.startsWith("."))
+            .map(e => e.name)
+            .sort((a, b) => a.localeCompare(b));
+
+        const keyboard = new InlineKeyboard();
+
+        keyboard.text(`📁 Crear aquí`, `new:select:${this.makeDirKey(absPath)}`).row();
+
+        for (const name of dirs) {
+            const subPath = nodePath.join(absPath, name);
+            const key = this.makeDirKey(subPath);
+            keyboard.text(`📂 ${name}`, `new:nav:${key}`).row();
+        }
+
+        if (!this.isRootDir(userId, absPath)) {
+            const parentPath = nodePath.dirname(absPath);
+            const parentKey = this.makeDirKey(parentPath);
+            keyboard.text("⬅️ Atrás", `new:nav:${parentKey}`).row();
+        }
+
+        keyboard.text("❌ Cancelar", "new:cancel");
+
+        const relPath = this.isRootDir(userId, absPath) ? "/" : nodePath.relative(workspaceDir(), absPath) || "/";
+
+        const header =
+            `🆕 <b>Nuevo proyecto</b>\n\n` +
+            `📂 <b>${escapeHtml(relPath)}</b>\n\n` +
+            `Selecciona el directorio padre donde crear el proyecto.\n` +
+            `📁 <b>Crear aquí</b> para usar esta carpeta como padre.`;
+
+        if (editMsgId && ctx.chat) {
+            await ctx.api.editMessageText(ctx.chat.id, editMsgId, header, {
+                parse_mode: "HTML",
+                reply_markup: keyboard,
+            });
+        } else {
+            await ctx.reply(header, { parse_mode: "HTML", reply_markup: keyboard });
+        }
+    }
+
+    // ── new:nav:<key> — navigate into directory ───────────────────────────────
+
+    async handleNewNav(ctx: Context): Promise<void> {
+        await ctx.answerCallbackQuery();
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const wizard = this.ctx.newWizard.get(userId);
+        if (!wizard) {
+            await ctx.editMessageText("❌ Sesión expirada. Usa /new.").catch(() => {});
+            return;
+        }
+
+        const data = ctx.callbackQuery?.data;
+        if (!data?.startsWith("new:nav:")) return;
+        const key = data.slice("new:nav:".length);
+        const absPath = this.dirIndex.get(key);
+        if (!absPath) {
+            await ctx.editMessageText("❌ Ruta caducada, ejecuta /new de nuevo.").catch(() => {});
+            return;
+        }
+        if (!fs.existsSync(absPath)) {
+            await ctx.editMessageText(`❌ Ya no existe: <code>${escapeHtml(absPath)}</code>`, { parse_mode: "HTML" }).catch(() => {});
+            return;
+        }
+        const msgId = ctx.callbackQuery?.message?.message_id;
+        await this.showDirectoryBrowser(ctx, userId, absPath, msgId);
+    }
+
+    // ── new:select:<key> — select parent directory ────────────────────────────
+
+    async handleNewSelect(ctx: Context): Promise<void> {
+        await ctx.answerCallbackQuery();
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const wizard = this.ctx.newWizard.get(userId);
+        if (!wizard) {
+            await ctx.editMessageText("❌ Sesión expirada. Usa /new.").catch(() => {});
+            return;
+        }
+
+        const data = ctx.callbackQuery?.data;
+        if (!data?.startsWith("new:select:")) return;
+        const key = data.slice("new:select:".length);
+        const absPath = this.dirIndex.get(key);
+        if (!absPath) {
+            await ctx.editMessageText("❌ Ruta caducada, ejecuta /new de nuevo.").catch(() => {});
+            return;
+        }
+
+        wizard.parentDir = absPath;
+        wizard.step = "name";
+
+        await ctx.deleteMessage().catch(() => {});
+        await ctx.reply(
+            `🆕 <b>Nuevo proyecto en:</b> <code>${escapeHtml(absPath)}</code>\n\n` +
+            `Escribe el nombre del proyecto:\n` +
+            `<i>Se creará en <code>${escapeHtml(nodePath.join(absPath, "<nombre>"))}</code></i>`,
+            { parse_mode: "HTML" }
+        );
     }
 
     // ── Wizard text step ─────────────────────────────────────────────────────
@@ -157,7 +275,7 @@ export class NewWizardHandler {
             case "name": {
                 if (!text) { await ctx.reply("❌ Nombre requerido."); return; }
                 wizard.name = text;
-                wizard.workdir = resolveProjectPath(text);
+                wizard.workdir = resolveProjectPath(wizard.parentDir!, text);
                 wizard.step = "git";
                 await this.sendGitPicker(ctx, wizard);
                 break;
@@ -223,10 +341,9 @@ export class NewWizardHandler {
             ctx.api.editMessageText(chatId, msgId, text, { parse_mode: "HTML" }).catch(() => {});
 
         try {
-            const workdir = wizard.workdir || resolveProjectPath(wizard.name);
+            const workdir = wizard.workdir || resolveProjectPath(wizard.parentDir!, wizard.name);
             if (!fs.existsSync(workdir)) fs.mkdirSync(workdir, { recursive: true });
 
-            // Optional: create/clone remote repo
             if (wizard.gitSource === "gitea" || wizard.gitSource === "github") {
                 const repoName = wizard.repoName || wizard.name;
                 await edit(`⏳ ${wizard.gitSource === "gitea" ? "🟠 Gitea" : "⚫ GitHub"}: creando/obteniendo repo <b>${escapeHtml(repoName)}</b>...`);
@@ -256,7 +373,6 @@ export class NewWizardHandler {
                         }
                     }
                 } else {
-                    // GitHub
                     let repo = await githubGetRepo(repoName);
                     if (!repo) repo = await githubCreateRepo(repoName);
                     if (!repo) {
@@ -280,7 +396,6 @@ export class NewWizardHandler {
                 }
             }
 
-            // Ensure we have a free slot (LRU eviction if needed)
             const maxAgents = this.ctx.configService.getMaxAgents();
             const evicted = await this.ctx.persistentAgentService.ensureSlotAvailable(maxAgents);
             if (evicted) {
@@ -288,7 +403,6 @@ export class NewWizardHandler {
                 await new Promise(r => setTimeout(r, 800));
             }
 
-            // Pick port and save agent to DB
             const port = pickPort(this.ctx.agentDb.usedPorts());
             const agent: PersistentAgent = {
                 id: randomUUID(),
@@ -304,7 +418,6 @@ export class NewWizardHandler {
             };
             this.ctx.agentDb.save(agent);
 
-            // Start the opencode server
             await edit(`⏳ Arrancando servidor OpenCode en puerto <code>${port}</code>...`);
             const startResult = await this.ctx.persistentAgentService.startAgent(agent);
             if (!startResult.success) {
@@ -313,10 +426,8 @@ export class NewWizardHandler {
                 return;
             }
 
-            // Inject git credentials (best-effort)
             await this.injectCredentials(agent.port);
 
-            // Mark as active and save last used
             this.ctx.persistentAgentService.setActiveAgent(userId, agent.id);
             this.ctx.agentDb.setLastUsed(userId, agent.id);
 
@@ -339,23 +450,6 @@ export class NewWizardHandler {
         const userId = ctx.from?.id;
         if (userId) this.ctx.newWizard.delete(userId);
         await ctx.editMessageText("❌ Cancelado.").catch(() => {});
-    }
-
-    // ── "➕ Nuevo agente" button from /agents ─────────────────────────────────
-
-    async handleAgentNew(ctx: Context): Promise<void> {
-        await ctx.answerCallbackQuery();
-        await ctx.deleteMessage().catch(() => {});
-        await ctx.reply(
-            `🆕 <b>Nuevo agente</b>\n\nEscribe el nombre o ruta del proyecto:\n` +
-            `<i>· <code>mi-proyecto</code> → crea ${escapeHtml(workspaceDir())}/mi-proyecto\n` +
-            `· <code>/ruta/absoluta</code> → usa esa ruta directamente</i>`,
-            { parse_mode: "HTML" }
-        );
-        const userId = ctx.from?.id;
-        if (!userId) return;
-        const defaultModel = process.env.OPENCODE_DEFAULT_MODEL || "github-copilot/claude-sonnet-4.6";
-        this.ctx.newWizard.set(userId, { step: "name", model: defaultModel });
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

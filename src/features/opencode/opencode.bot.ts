@@ -3,7 +3,7 @@
  *
  * Comandos:
  *   /proyectos — Navega proyectos del workspace, abre servidor
- *   /new       — Wizard: crea agente (Gitea / GitHub / local) + arranca servidor
+ *   /new       — Wizard: navega carpeta padre → nombre → git opcional → crea agente
  *   /agents    — Lista agentes, activa sticky, borra
  *   /run       — One-shot: prompt puntual a un agente
  *   /models    — Cambia el modelo del agente activo
@@ -37,13 +37,12 @@ import { SessionDbService } from "../../services/session-db.service.js";
 import { PersistentHeartbeatMap } from "../../services/persistent-map.js";
 
 // ─── Handler classes ──────────────────────────────────────────────────────────
-import { NewWizardHandler } from "./handlers/new-wizard.handler.js";
-import { AgentsHandler }    from "./handlers/agents.handler.js";
 import { ProjectsHandler }  from "./handlers/projects.handler.js";
+import { ServersHandler }   from "./handlers/servers.handler.js";
 import { ModelsHandler }    from "./handlers/models.handler.js";
 import { SessionHandler }   from "./handlers/session.handler.js";
 import { MessageHandler }   from "./handlers/message.handler.js";
-import type { BotContext, NewAgentWizard, ModelSelectionState } from "./handlers/bot-context.js";
+import type { BotContext, ModelSelectionState } from "./handlers/bot-context.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -58,7 +57,6 @@ export class OpenCodeBot implements BotContext {
     bot: Bot | undefined;
 
     // ── Wizard state maps ─────────────────────────────────────────────────────
-    readonly newWizard:       Map<number, NewAgentWizard>                    = new Map();
     readonly runWizard:       Map<number, { prompt: string; agentId?: string }> = new Map();
     readonly renameWizard:    Map<number, string>                            = new Map();
     readonly modelSelection:  Map<number, ModelSelectionState>               = new Map();
@@ -78,9 +76,8 @@ export class OpenCodeBot implements BotContext {
     private static readonly MAX_CALLBACK_DATA = 64;
 
     // ── Handler instances ─────────────────────────────────────────────────────
-    private newWizardHandler: NewWizardHandler;
-    private agentsHandler:    AgentsHandler;
     private projectsHandler:  ProjectsHandler;
+    private agentsHandler:    AgentsHandler;
     private modelsHandler:    ModelsHandler;
     private sessionHandler:   SessionHandler;
     private messageHandler:   MessageHandler;
@@ -93,9 +90,8 @@ export class OpenCodeBot implements BotContext {
         this.sessionDb             = new SessionDbService();
         this.heartbeatMessages     = new PersistentHeartbeatMap(this.sessionDb);
 
-        this.newWizardHandler = new NewWizardHandler(this);
+        this.projectsHandler = new ProjectsHandler(this);
         this.agentsHandler    = new AgentsHandler(this);
-        this.projectsHandler  = new ProjectsHandler(this);
         this.modelsHandler    = new ModelsHandler(this);
         this.sessionHandler   = new SessionHandler(this);
         this.messageHandler   = new MessageHandler(this);
@@ -150,28 +146,35 @@ export class OpenCodeBot implements BotContext {
         const body   = result.output || "(sin salida)";
         const MAX    = 3800;
 
+        console.log(`[OpenCodeBot.editOrSendResult] Agent "${agent.name}" - chatId: ${chatId}, msgId: ${msgId}, body length: ${body.length}`);
+
         try {
             await this.bot!.api.deleteMessage(chatId, msgId);
+            console.log(`[OpenCodeBot.editOrSendResult] Deleted placeholder message ${msgId}`);
         } catch (err) {
-            // Message may have been already deleted or edited
+            console.warn(`[OpenCodeBot.editOrSendResult] Failed to delete message ${msgId}:`, err);
         }
 
         if (body.length <= MAX) {
             try {
+                console.log(`[OpenCodeBot.editOrSendResult] Sending text message (length: ${body.length})`);
                 await this.bot!.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
+                console.log(`[OpenCodeBot.editOrSendResult] Text message sent successfully`);
             } catch (err) {
-                console.error("[OpenCodeBot] Failed to send result message:", err);
+                console.error("[OpenCodeBot.editOrSendResult] Failed to send result message:", err);
             }
         } else {
             try {
+                console.log(`[OpenCodeBot.editOrSendResult] Sending as document (length: ${body.length})`);
                 const buf = Buffer.from(body, "utf8");
                 await this.bot!.api.sendDocument(
                     chatId,
                     new InputFile(buf, `${agent.name}-respuesta.md`),
                     { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
                 );
+                console.log(`[OpenCodeBot.editOrSendResult] Document sent successfully`);
             } catch (err) {
-                console.error("[OpenCodeBot] Failed to send result document:", err);
+                console.error("[OpenCodeBot.editOrSendResult] Failed to send result document:", err);
             }
         }
     }
@@ -266,9 +269,11 @@ export class OpenCodeBot implements BotContext {
                 onResult: async (result) => {
                     const hb = this.heartbeatMessages.get(agent.id);
                     this.heartbeatMessages.delete(agent.id);
+                    console.log(`[OpenCodeBot.sendPromptToAgent.queue] Queued result for "${agent.name}" - heartbeat exists: ${!!hb}`);
                     if (hb) {
                         await this.editOrSendResult(hb.chatId, hb.msgId, agent, result);
                     } else {
+                        console.warn(`[OpenCodeBot.sendPromptToAgent.queue] No heartbeat for "${agent.name}", sending new message`);
                         await this.sendAgentResult(chatId, agent, result);
                     }
                 },
@@ -299,9 +304,11 @@ export class OpenCodeBot implements BotContext {
         this.persistentAgentService.sendPrompt(agent, prompt).then(async (result) => {
             const hb = this.heartbeatMessages.get(agent.id);
             this.heartbeatMessages.delete(agent.id);
+            console.log(`[OpenCodeBot.sendPromptToAgent] Result received for "${agent.name}" - heartbeat exists: ${!!hb}, using msgId: ${hb?.msgId ?? placeholderMsgId}`);
             await this.editOrSendResult(chatId, hb?.msgId ?? placeholderMsgId, agent, result);
         }).catch(async (err) => {
             this.heartbeatMessages.delete(agent.id);
+            console.error(`[OpenCodeBot.sendPromptToAgent] Error for "${agent.name}":`, err);
             await this.bot!.api.deleteMessage(chatId, placeholderMsgId).catch(() => {});
             await this.bot!.api.sendMessage(
                 chatId,
@@ -332,15 +339,33 @@ export class OpenCodeBot implements BotContext {
 
         // ── External session idle (web/CLI → push notification to Telegram) ───
         const externalSessionIdleCallback: OnExternalSessionIdleCallback = async (agentId, output, sessionId) => {
-            if (!this.bot) return;
+            console.log(`[OpenCodeBot.externalSessionIdle] ENTER: agentId="${agentId}", sessionId="${sessionId}", output length=${output?.length || 0}`);
+            
+            if (!this.bot) {
+                console.log(`[OpenCodeBot.externalSessionIdle] No bot instance`);
+                return;
+            }
+            
             const agent = this.agentDb.getById(agentId);
-            if (!agent) return;
+            if (!agent) {
+                console.log(`[OpenCodeBot.externalSessionIdle] Agent ${agentId} not found`);
+                return;
+            }
+            
             const { chatId } = this.resolveAgentChat(agentId);
-            if (!chatId) return;
+            console.log(`[OpenCodeBot.externalSessionIdle] Resolved chatId: ${chatId}`);
+            
+            if (!chatId) {
+                console.log(`[OpenCodeBot.externalSessionIdle] No chatId resolved`);
+                return;
+            }
+            
             const header = `🌐 <b>${escapeHtml(agent.name)}</b> <i>(web/CLI)</i>\n\n`;
             const body = output || "(sin salida)";
             const MAX = 3800;
+            
             try {
+                console.log(`[OpenCodeBot.externalSessionIdle] Sending message to chat ${chatId}`);
                 if (body.length <= MAX) {
                     await this.bot.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
                 } else {
@@ -351,8 +376,9 @@ export class OpenCodeBot implements BotContext {
                         { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
                     );
                 }
+                console.log(`[OpenCodeBot.externalSessionIdle] COMPLETE: message sent to ${chatId}`);
             } catch (err) {
-                console.error("[OpenCodeBot] externalSessionIdle notification failed:", err);
+                console.error(`[OpenCodeBot.externalSessionIdle] Error sending message:`, err);
             }
         };
         this.persistentAgentService.setOnExternalSessionIdleCallback(externalSessionIdleCallback);
@@ -440,8 +466,8 @@ export class OpenCodeBot implements BotContext {
         // ─── Commands ────────────────────────────────────────────────────────
         bot.command("start",   AccessControlMiddleware.requireAccess, this.handleStart.bind(this));
         bot.command("help",    AccessControlMiddleware.requireAccess, this.handleStart.bind(this));
-        bot.command("new",     AccessControlMiddleware.requireAccess, this.newWizardHandler.handleNew.bind(this.newWizardHandler));
-        bot.command("agents",  AccessControlMiddleware.requireAccess, (ctx) => this.agentsHandler.handleAgents(ctx));
+        // REMOVED: /new — integrated into /proyectos wizard
+        bot.command("servers",  AccessControlMiddleware.requireAccess, (ctx) => this.serversHandler.handleServers(ctx));
         bot.command("proyectos", AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjects.bind(this.projectsHandler));
         bot.command("run",     AccessControlMiddleware.requireAccess, this.messageHandler.handleRun.bind(this.messageHandler));
         bot.command("models",  AccessControlMiddleware.requireAccess, this.modelsHandler.handleModels.bind(this.modelsHandler));
@@ -449,26 +475,23 @@ export class OpenCodeBot implements BotContext {
         bot.command("undo",    AccessControlMiddleware.requireAccess, this.sessionHandler.handleUndo.bind(this.sessionHandler));
         bot.command("redo",    AccessControlMiddleware.requireAccess, this.sessionHandler.handleRedo.bind(this.sessionHandler));
         bot.command("session",  AccessControlMiddleware.requireAccess, this.sessionHandler.handleSession.bind(this.sessionHandler));
-        bot.command("sessions", AccessControlMiddleware.requireAccess, this.sessionHandler.handleSessions.bind(this.sessionHandler));
         bot.command("rename",  AccessControlMiddleware.requireAccess, this.sessionHandler.handleRename.bind(this.sessionHandler));
         bot.command("delete",  AccessControlMiddleware.requireAccess, this.sessionHandler.handleDelete.bind(this.sessionHandler));
         bot.command("deleteall", AccessControlMiddleware.requireAccess, this.sessionHandler.handleDeleteAll.bind(this.sessionHandler));
         bot.command("restart", AccessControlMiddleware.requireAccess, this.messageHandler.handleRestart.bind(this.messageHandler));
 
         // ─── Callbacks ───────────────────────────────────────────────────────
-        bot.callbackQuery(/^new:source:/,       AccessControlMiddleware.requireAccess, this.newWizardHandler.handleNewSource.bind(this.newWizardHandler));
-        bot.callbackQuery(/^new:confirm$/,      AccessControlMiddleware.requireAccess, this.newWizardHandler.handleNewConfirm.bind(this.newWizardHandler));
-        bot.callbackQuery(/^new:cancel$/,       AccessControlMiddleware.requireAccess, this.newWizardHandler.handleNewCancel.bind(this.newWizardHandler));
-
-        bot.callbackQuery(/^agent:activate:/,   AccessControlMiddleware.requireAccess, this.agentsHandler.handleAgentActivate.bind(this.agentsHandler));
-        bot.callbackQuery(/^agent:del:/,        AccessControlMiddleware.requireAccess, this.agentsHandler.handleAgentDelete.bind(this.agentsHandler));
-        bot.callbackQuery(/^agent:delconfirm:/, AccessControlMiddleware.requireAccess, this.agentsHandler.handleAgentDeleteConfirm.bind(this.agentsHandler));
-        bot.callbackQuery(/^agent:delcancel$/,  AccessControlMiddleware.requireAccess, this.agentsHandler.handleAgentDeleteCancel.bind(this.agentsHandler));
-        bot.callbackQuery(/^agent:model:/,      AccessControlMiddleware.requireAccess, this.modelsHandler.handleAgentModelSelect.bind(this.modelsHandler));
-        bot.callbackQuery("agent:new",          AccessControlMiddleware.requireAccess, this.newWizardHandler.handleAgentNew.bind(this.newWizardHandler));
-        bot.callbackQuery(/^proj:nav:/,        AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectNav.bind(this.projectsHandler));
-        bot.callbackQuery(/^proj:start:/,      AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectStart.bind(this.projectsHandler));
-        bot.callbackQuery(/^proj:open:/,       AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectOpen.bind(this.projectsHandler));
+        // Projects explorer + wizard callbacks
+        bot.callbackQuery(/^proj:nav:/,            AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectNav.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:open:/,           AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectOpen.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:activate:/,       AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectActivate.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:create-folder:/,  AccessControlMiddleware.requireAccess, this.projectsHandler.handleCreateFolder.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:wizard:/,         AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardStart.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:wizard-git:/,     AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardGit.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:wizard-model:/,   AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardModel.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:wizard-confirm/,  AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardConfirm.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:wizard-back:/,    AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardBack.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:cancel$/,         AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardCancel.bind(this.projectsHandler));
 
         bot.callbackQuery(/^run:agent:/,        AccessControlMiddleware.requireAccess, this.messageHandler.handleRunAgentSelected.bind(this.messageHandler));
         bot.callbackQuery(/^run:cancel$/,       AccessControlMiddleware.requireAccess, this.messageHandler.handleRunCancel.bind(this.messageHandler));
@@ -492,10 +515,21 @@ export class OpenCodeBot implements BotContext {
             const userId = ctx.from?.id;
             if (!userId) return;
 
-            if (this.newWizard.has(userId)) {
-                await this.newWizardHandler.handleNewWizardText(ctx);
+            // Projects wizard states
+            if (this.projectsHandler.isWizardName(userId)) {
+                await this.projectsHandler.handleWizardNameText(ctx);
                 return;
             }
+            if (this.projectsHandler.isWizardModel(userId)) {
+                await this.projectsHandler.handleWizardModelText(ctx);
+                return;
+            }
+            if (this.projectsHandler.isCreateFolderPrompt(userId)) {
+                await this.projectsHandler.handleCreateFolderText(ctx);
+                return;
+            }
+
+            // Other wizards
             if (this.runWizard.has(userId)) {
                 await this.messageHandler.handleRunWizardText(ctx);
                 return;
@@ -525,26 +559,23 @@ export class OpenCodeBot implements BotContext {
         await ctx.reply(
             `<b>TelegramCoder</b>\n\n` +
             `<b>Comandos:</b>\n` +
-            `/proyectos — Listar proyectos del workspace y abrir uno\n` +
-            `/new — Crear proyecto nuevo con wizard (${isGitea ? "Gitea ✅" : "Gitea ❌"} / ${isGithub ? "GitHub ✅" : "GitHub ❌"} / local)\n` +
-            `/agents — Ver servidores OpenCode activos\n` +
-            `/run — Prompt puntual a un agente\n` +
-            `/sessions — Ver todas las sesiones de todos los proyectos\n` +
+            `/proyectos — Explorar proyectos, crear folders, abrir/wizard de servers\n` +
+            `/servers — Ver servidores OpenCode activos\n` +
+            `/run — Prompt puntual a un servidor\n` +
             `/session — Ver sesiones del proyecto activo\n` +
             `/rename — Renombrar la sesión activa\n` +
             `/delete — Borrar sesión activa y crear nueva\n` +
             `/deleteall — Borrar todas las sesiones y crear nueva\n` +
-            `/models — Cambiar modelo del agente activo\n` +
-            `/esc — Cancelar / desactivar agente / abortar\n` +
+            `/models — Cambiar modelo del servidor activo\n` +
+            `/esc — Cancelar wizard / desactivar servidor / abortar\n` +
             `/undo — Revertir último cambio\n` +
             `/redo — Restaurar cambio revertido\n` +
             `/restart — Reiniciar (git pull + build + restart)\n\n` +
             `<b>Flujo:</b>\n` +
-            `1. <code>/proyectos</code> → toca un proyecto → servidor listo\n` +
+            `1. <code>/proyectos</code> → explorar folders → abrir server o crear proyecto\n` +
             `2. Escribe tus mensajes directamente\n` +
-            `3. <code>/esc</code> para desactivar el servidor activo\n\n` +
-            `<b>Límite:</b> ${maxAgents} servidores OpenCode simultáneos (MAX_OPENCODE_SERVERS en .env). ` +
-            `Si abres uno nuevo y ya hay ${maxAgents} en marcha, se para automáticamente el menos usado (LRU).`,
+            `3. <code>/esc</code> para desactivar el server activo\n\n` +
+            `<b>Límite:</b> ${maxAgents} servidores OpenCode simultáneos (MAX_OPENCODE_SERVERS en .env).`,
             { parse_mode: "HTML" }
         );
     }

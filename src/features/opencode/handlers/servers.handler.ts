@@ -1,5 +1,5 @@
 /**
- * AgentsHandler — handles /agents, park/unpark/delete callbacks.
+ * ServersHandler — handles /servers, park/unpark/delete callbacks.
  */
 
 import { Context, InlineKeyboard } from "grammy";
@@ -7,10 +7,10 @@ import type { BotContext } from "./bot-context.js";
 import { resolveDir } from "../../../services/persistent-agent.service.js";
 import { escapeHtml } from "../event-handlers/utils.js";
 
-export class AgentsHandler {
+export class ServersHandler {
     constructor(private readonly ctx: BotContext) {}
 
-    async handleAgents(ctx: Context): Promise<void> {
+    async handleServers(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
         if (!userId) return;
 
@@ -23,8 +23,8 @@ export class AgentsHandler {
             const displayName = this.getAgentDisplayName(agent.name);
             const label = isActive ? `✅ ${displayName}` : `🤖 ${displayName}`;
             keyboard
-                .text(label, `agent:activate:${agent.id}`)
-                .text("🗑️", `agent:del:${agent.id}`)
+                .text(label, `server:activate:${agent.id}`)
+                .text("🗑️", `server:del:${agent.id}`)
                 .row();
         }
 
@@ -47,16 +47,16 @@ export class AgentsHandler {
         );
     }
 
-    async handleAgentActivate(ctx: Context): Promise<void> {
+    async handleServerActivate(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         const userId = ctx.from?.id;
         if (!userId) return;
 
         const callbackData = ctx.callbackQuery?.data;
-        if (!callbackData?.startsWith("agent:activate:")) return;
-        const agentId = callbackData.replace("agent:activate:", "");
+        if (!callbackData?.startsWith("server:activate:")) return;
+        const agentId = callbackData.replace("server:activate:", "");
         const agent = this.ctx.agentDb.getById(agentId);
-        if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
+        if (!agent) { await ctx.editMessageText("❌ Servidor no encontrado."); return; }
 
         const currentActive = this.ctx.persistentAgentService.getActiveAgentId(userId);
         if (currentActive === agentId) {
@@ -70,37 +70,37 @@ export class AgentsHandler {
         }
 
         await ctx.deleteMessage().catch(() => {});
-        await this.handleAgents(ctx);
+        await this.handleServers(ctx);
     }
 
-    async handleAgentDelete(ctx: Context): Promise<void> {
+    async handleServerDelete(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         const callbackData = ctx.callbackQuery?.data;
-        if (!callbackData?.startsWith("agent:del:")) return;
-        const agentId = callbackData.replace("agent:del:", "");
+        if (!callbackData?.startsWith("server:del:")) return;
+        const agentId = callbackData.replace("server:del:", "");
         const agent = this.ctx.agentDb.getById(agentId);
-        if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
+        if (!agent) { await ctx.editMessageText("❌ Servidor no encontrado."); return; }
 
         const keyboard = new InlineKeyboard()
-            .text("✅ Sí, borrar", `agent:delconfirm:${agentId}`)
-            .text("❌ Cancelar", "agent:delcancel");
+            .text("✅ Sí, borrar", `server:delconfirm:${agentId}`)
+            .text("❌ Cancelar", "server:delcancel");
 
         await ctx.editMessageText(
-            `🗑️ ¿Borrar agente <b>${escapeHtml(agent.name)}</b>?\n\nSe detendrá su servidor y se eliminará la configuración.`,
+            `🗑️ ¿Borrar servidor <b>${escapeHtml(agent.name)}</b>?\n\nSe detendrá su servidor y se eliminará la configuración.`,
             { parse_mode: "HTML", reply_markup: keyboard }
         );
     }
 
-    async handleAgentDeleteConfirm(ctx: Context): Promise<void> {
+    async handleServerDeleteConfirm(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         const userId = ctx.from?.id;
         if (!userId) return;
 
         const callbackData = ctx.callbackQuery?.data;
-        if (!callbackData?.startsWith("agent:delconfirm:")) return;
-        const agentId = callbackData.replace("agent:delconfirm:", "");
+        if (!callbackData?.startsWith("server:delconfirm:")) return;
+        const agentId = callbackData.replace("server:delconfirm:", "");
         const agent = this.ctx.agentDb.getById(agentId);
-        if (!agent) { await ctx.editMessageText("❌ Agente no encontrado."); return; }
+        if (!agent) { await ctx.editMessageText("❌ Servidor no encontrado."); return; }
 
         const host = agent.host || "localhost";
         const baseUrl = `http://${host}:${agent.port}`;
@@ -133,15 +133,15 @@ export class AgentsHandler {
         }
 
         await ctx.editMessageText(
-            `🗑️ Agente <b>${escapeHtml(agent.name)}</b> eliminado.`,
+            `🗑️ Servidor <b>${escapeHtml(agent.name)}</b> eliminado.`,
             { parse_mode: "HTML" }
         );
     }
 
-    async handleAgentDeleteCancel(ctx: Context): Promise<void> {
+    async handleServerDeleteCancel(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         await ctx.deleteMessage().catch(() => {});
-        await this.handleAgents(ctx);
+        await this.handleServers(ctx);
     }
 
     private getAgentDisplayName(name: string): string {
