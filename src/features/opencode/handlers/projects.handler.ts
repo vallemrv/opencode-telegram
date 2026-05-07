@@ -207,11 +207,9 @@ export class ProjectsHandler {
         const openKey = this.makeKey(absPath);
         keyboard.text(`${openIcon} Abrir aquí`, `proj:open:${openKey}`).row();
 
-        // Botón: Crear folder
-        if (!this.isRoot(userId, absPath) || dirs.length === 0) {
-            const createKey = this.makeKey(absPath);
-            keyboard.text("🆕 Crear folder", `proj:create-folder:${createKey}`).row();
-        }
+        // Botón: Crear folder (siempre disponible)
+        const createKey = this.makeKey(absPath);
+        keyboard.text("🆕 Crear folder", `proj:create-folder:${createKey}`).row();
 
         // Subcarpetas
         for (const name of dirs) {

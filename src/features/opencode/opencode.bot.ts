@@ -77,7 +77,7 @@ export class OpenCodeBot implements BotContext {
 
     // ── Handler instances ─────────────────────────────────────────────────────
     private projectsHandler:  ProjectsHandler;
-    private agentsHandler:    AgentsHandler;
+    private serversHandler:    ServersHandler;
     private modelsHandler:    ModelsHandler;
     private sessionHandler:   SessionHandler;
     private messageHandler:   MessageHandler;
@@ -91,7 +91,7 @@ export class OpenCodeBot implements BotContext {
         this.heartbeatMessages     = new PersistentHeartbeatMap(this.sessionDb);
 
         this.projectsHandler = new ProjectsHandler(this);
-        this.agentsHandler    = new AgentsHandler(this);
+        this.serversHandler    = new ServersHandler(this);
         this.modelsHandler    = new ModelsHandler(this);
         this.sessionHandler   = new SessionHandler(this);
         this.messageHandler   = new MessageHandler(this);

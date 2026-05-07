@@ -86,19 +86,18 @@ async function startBot() {
         // Set bot commands for Telegram UI
         try {
             await bot.api.setMyCommands([
-                { command: 'proyectos', description: 'Listar proyectos del workspace' },
-                { command: 'new',       description: 'Crear nuevo agente' },
-                { command: 'agents',    description: 'Listar / gestionar agentes' },
-                { command: 'run',       description: 'Enviar prompt one-shot a un agente' },
-                { command: 'session',   description: 'Ver sesiones del agente activo' },
+                { command: 'proyectos', description: 'Explorar proyectos y gestionar servidores' },
+                { command: 'servers',   description: 'Ver servidores OpenCode activos' },
+                { command: 'run',       description: 'Prompt puntual a un servidor' },
+                { command: 'session',   description: 'Ver sesiones del proyecto activo' },
                 { command: 'rename',    description: 'Renombrar sesión activa' },
-                { command: 'delete',    description: 'Borrar sesión activa y crear una nueva' },
-                { command: 'deleteall', description: 'Borrar todas las sesiones y crear una nueva' },
-                { command: 'models',    description: 'Cambiar modelo de IA' },
-                { command: 'esc',       description: 'Cancelar operación en curso' },
+                { command: 'delete',    description: 'Borrar sesión activa y crear nueva' },
+                { command: 'deleteall', description: 'Borrar todas las sesiones y crear nueva' },
+                { command: 'models',    description: 'Cambiar modelo del servidor activo' },
+                { command: 'esc',       description: 'Cancelar wizard / desactivar servidor' },
                 { command: 'undo',      description: 'Revertir último cambio' },
                 { command: 'redo',      description: 'Restaurar cambio revertido' },
-                { command: 'restart',   description: 'Reiniciar bot y agentes' },
+                { command: 'restart',   description: 'Reiniciar (git pull + build + restart)' },
                 { command: 'start',     description: 'Mensaje de bienvenida' },
                 { command: 'help',      description: 'Mostrar ayuda' },
             ]);

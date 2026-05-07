@@ -32,12 +32,6 @@ function filterSessionsByWorkdir(sessions: any[], workdir: string): any[] {
     });
 }
 
-/** Short display name for a workdir path (last 2 path segments). */
-function shortWorkdir(workdir: string): string {
-    const parts = workdir.replace(/\/+$/, "").split("/").filter(Boolean);
-    return parts.length >= 2 ? parts.slice(-2).join("/") : parts.join("/") || workdir;
-}
-
 export class SessionHandler {
     constructor(private readonly ctx: BotContext) {}
 
@@ -58,121 +52,6 @@ export class SessionHandler {
         } catch (err) {
             await ctx.reply(ErrorUtils.createErrorMessage("listar sesiones", err));
         }
-    }
-
-    // ── /sessions — vista global por proyecto ─────────────────────────────────
-
-    async handleSessions(ctx: Context): Promise<void> {
-        const userId = ctx.from?.id;
-        if (!userId) return;
-
-        // Gather all running agents and deduplicate by normalized workdir.
-        // For each unique project, we use the first reachable agent as gateway.
-        const allAgents = this.ctx.agentDb.getAll();
-        const runningAgents = allAgents.filter(a => a.status === "running");
-
-        if (runningAgents.length === 0) {
-            await ctx.reply("ℹ️ No hay servidores activos. Arranca un agente con /agents o /proyectos.");
-            return;
-        }
-
-        // Group agents by normalized workdir → pick first as representative
-        const projectMap = new Map<string, PersistentAgent>();
-        for (const agent of runningAgents) {
-            const norm = normalizeDirPath(agent.workdir);
-            if (!projectMap.has(norm)) {
-                projectMap.set(norm, agent);
-            }
-        }
-
-        // For each project, query sessions from its representative agent
-        interface ProjectSessions {
-            workdir: string;
-            agent: PersistentAgent;
-            sessions: any[];
-            error?: string;
-        }
-        const results: ProjectSessions[] = [];
-
-        await Promise.all(
-            Array.from(projectMap.entries()).map(async ([norm, agent]) => {
-                const baseUrl = getAgentBaseUrl(agent);
-                try {
-                    const res = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
-                    if (!res.ok) {
-                        results.push({ workdir: norm, agent, sessions: [], error: `HTTP ${res.status}` });
-                        return;
-                    }
-                    const all: any[] = await res.json();
-                    const sessions = filterSessionsByWorkdir(all, norm);
-                    sessions.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0));
-                    results.push({ workdir: norm, agent, sessions });
-                } catch (err: any) {
-                    results.push({ workdir: norm, agent, sessions: [], error: err.message ?? String(err) });
-                }
-            })
-        );
-
-        // Sort projects: most-recently-updated session first
-        results.sort((a, b) => {
-            const aTime = a.sessions[0]?.time?.updated ?? 0;
-            const bTime = b.sessions[0]?.time?.updated ?? 0;
-            return bTime - aTime;
-        });
-
-        const totalSessions = results.reduce((s, r) => s + r.sessions.length, 0);
-
-        if (totalSessions === 0 && results.every(r => !r.error)) {
-            await ctx.reply("ℹ️ No hay sesiones en ningún proyecto activo.");
-            return;
-        }
-
-        // Build a message + keyboard per project. Telegram limits message size so
-        // we send one combined message with an inline keyboard showing all sessions.
-        const prefix = `s${this.ctx.sessIndexCounter++}`;
-        const keyboard = new InlineKeyboard();
-        const headerLines: string[] = [`📂 <b>Todas las sesiones</b> — ${totalSessions} en ${results.length} proyecto(s)\n`];
-
-        let btnIdx = 0;
-        for (const { workdir, agent, sessions, error } of results) {
-            const label = shortWorkdir(workdir);
-            headerLines.push(`\n📁 <b>${escapeHtml(label)}</b>`);
-
-            if (error) {
-                headerLines.push(`  ⚠️ Sin conexión: ${escapeHtml(error)}`);
-                continue;
-            }
-            if (sessions.length === 0) {
-                headerLines.push(`  <i>Sin sesiones</i>`);
-                continue;
-            }
-
-            const currentSessionId = this.ctx.persistentAgentService.getSessionId(agent.id);
-
-            for (const s of sessions) {
-                const actKey = `sa:${prefix}:${btnIdx}`;
-                const delKey = `sx:${prefix}:${btnIdx}`;
-                this.ctx.sessIndex.set(actKey, { agentId: agent.id, sessionId: s.id });
-                this.ctx.sessIndex.set(delKey, { agentId: agent.id, sessionId: s.id });
-
-                const isCurrent = s.id === currentSessionId;
-                const title = (s.title || s.id.slice(0, 8)).slice(0, 26);
-                const btnLabel = isCurrent ? `🟢 ${title}` : title;
-
-                keyboard.text(btnLabel, actKey).text("🗑️", delKey).row();
-                btnIdx++;
-            }
-
-            // "Nueva sesión" button for this project
-            const newKey = `sn:${prefix}:p${btnIdx}`;
-            this.ctx.sessIndex.set(newKey, { agentId: agent.id, sessionId: "" });
-            keyboard.text(`➕ Nueva — ${escapeHtml(label.split("/").pop() ?? label)}`, newKey).row();
-            btnIdx++;
-        }
-
-        const header = headerLines.join("\n");
-
-        await ctx.reply(header, { parse_mode: "HTML", reply_markup: keyboard });
     }
 
     // ── sa:PREFIX:INDEX — activate session ────────────────────────────────────
@@ -468,10 +347,19 @@ export class SessionHandler {
         }
 
         const allSessions: any[] = await sessRes.json();
-        const sessions = filterSessionsByWorkdir(allSessions, agent.workdir);
+        const candidateSessions = filterSessionsByWorkdir(allSessions, agent.workdir);
+
+        const validSessions: any[] = [];
+        await Promise.all(candidateSessions.map(async (s) => {
+            try {
+                const checkRes = await fetch(`${baseUrl}/session/${s.id}`, { signal: AbortSignal.timeout(3000) });
+                if (checkRes.ok) validSessions.push(s);
+            } catch {}
+        }));
+
         const currentSessionId = this.ctx.persistentAgentService.getSessionId(agent.id);
 
-        sessions.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0));
+        validSessions.sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0));
 
         const prefix = `s${this.ctx.sessIndexCounter++}`;
         const newKey = `sn:${prefix}`;
@@ -481,11 +369,11 @@ export class SessionHandler {
 
         const keyboard = new InlineKeyboard();
 
-        if (sessions.length === 0) {
+        if (validSessions.length === 0) {
             keyboard.text("➕ Nueva sesión", newKey);
         } else {
-            for (let i = 0; i < sessions.length; i++) {
-                const s = sessions[i];
+            for (let i = 0; i < validSessions.length; i++) {
+                const s = validSessions[i];
                 const actKey = `sa:${prefix}:${i}`;
                 const delKey = `sx:${prefix}:${i}`;
                 this.ctx.sessIndex.set(actKey, { agentId: agent.id, sessionId: s.id });
@@ -502,7 +390,7 @@ export class SessionHandler {
         }
 
         const header =
-            `📋 <b>Sesiones de ${escapeHtml(agent.name)}</b> (${sessions.length})\n` +
+            `📋 <b>Sesiones de ${escapeHtml(agent.name)}</b> (${validSessions.length})\n` +
             `🟢 = sesión activa del bot — toca el nombre para cambiar`;
 
         if (edit) {

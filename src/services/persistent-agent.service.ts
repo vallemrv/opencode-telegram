@@ -775,6 +775,18 @@ export class PersistentAgentService {
                         }
                     }
 
+                    // ── session.deleted → clear active session if matches ────────────
+                    if (type === "session.deleted") {
+                        const deletedId: string = props?.sessionID ?? props?.id ?? "";
+                        const mySessionId = this.sessionIds.get(agent.id);
+                        
+                        if (deletedId && mySessionId && deletedId === mySessionId) {
+                            console.log(`[PersistentAgent] session.deleted: active session "${deletedId}" was deleted for agent "${agent.name}" — clearing active session`);
+                            this.sessionIds.delete(agent.id);
+                            this.agentDb.setSessionId(agent.id, "");
+                        }
+                    }
+
                     // ── session.idle → resolve in-flight prompt ───────────
                     if (type === "session.idle") {
                         const idleSessionId: string = props?.sessionID ?? props?.id ?? "";
