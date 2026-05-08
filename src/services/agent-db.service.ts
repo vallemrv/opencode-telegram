@@ -186,7 +186,7 @@ export class AgentDbService {
     private mapRow(row: any): PersistentAgent {
         return {
             id: row.id,
-            userId: row.user_id,
+            userId: Number(row.user_id),
             name: row.name,
             role: row.role,
             workdir: row.workdir,

@@ -107,8 +107,12 @@ async function startBot() {
         }
 
         // Restore active agents state from DB
+        // NOTE: opencodeBot has its own PersistentAgentService instance — we must
+        // use THAT instance, not the standalone one created above (which is unused).
+        // restoreActiveAgentsState() was already called inside registerHandlers(),
+        // so we just read the map again to build the restart notification.
         try {
-            const restoredAgents = persistentAgentService.restoreActiveAgentsState();
+            const restoredAgents = opencodeBot.persistentAgentService.restoreActiveAgentsState();
             
             // Helper: fetch session title with retry until server is ready (max 30s)
             async function fetchSessionTitle(baseUrl: string, sessionId: string): Promise<string> {
@@ -143,9 +147,9 @@ async function startBot() {
                 if (restoredAgents.size > 0) {
                     text += '<b>📌 Agente activo (sticky) restaurado:</b>\n';
                     for (const [userId, agentId] of restoredAgents.entries()) {
-                        const agent = agentDb.getById(agentId);
+                        const agent = opencodeBot.agentDb.getById(agentId);
                         if (agent) {
-                            const sessionId = persistentAgentService.getSessionId(agentId);
+                            const sessionId = opencodeBot.persistentAgentService.getSessionId(agentId);
                             const baseUrl = `http://${agent.host || 'localhost'}:${agent.port}`;
                             const sessionTitle = sessionId
                                 ? await fetchSessionTitle(baseUrl, sessionId)

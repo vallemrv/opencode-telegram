@@ -155,28 +155,7 @@ export class OpenCodeBot implements BotContext {
             console.warn(`[OpenCodeBot.editOrSendResult] Failed to delete message ${msgId}:`, err);
         }
 
-        if (body.length <= MAX) {
-            try {
-                console.log(`[OpenCodeBot.editOrSendResult] Sending text message (length: ${body.length})`);
-                await this.bot!.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
-                console.log(`[OpenCodeBot.editOrSendResult] Text message sent successfully`);
-            } catch (err) {
-                console.error("[OpenCodeBot.editOrSendResult] Failed to send result message:", err);
-            }
-        } else {
-            try {
-                console.log(`[OpenCodeBot.editOrSendResult] Sending as document (length: ${body.length})`);
-                const buf = Buffer.from(body, "utf8");
-                await this.bot!.api.sendDocument(
-                    chatId,
-                    new InputFile(buf, `${agent.name}-respuesta.md`),
-                    { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
-                );
-                console.log(`[OpenCodeBot.editOrSendResult] Document sent successfully`);
-            } catch (err) {
-                console.error("[OpenCodeBot.editOrSendResult] Failed to send result document:", err);
-            }
-        }
+        await this.sendResultMessage(chatId, header, body, agent.name, MAX);
     }
 
     // ── Shared helper: send result as a new message (no placeholder) ──────────
@@ -189,23 +168,44 @@ export class OpenCodeBot implements BotContext {
         const body   = result.output || "(sin salida)";
         const MAX    = 3800;
 
+        await this.sendResultMessage(chatId, header, body, agent.name, MAX);
+    }
+
+    // ── Core send helper: HTML → fallback plain text → fallback document ───────
+    private async sendResultMessage(
+        chatId: number,
+        header: string,
+        body: string,
+        agentName: string,
+        MAX: number,
+    ): Promise<void> {
         if (body.length <= MAX) {
+            // 1st attempt: formatted HTML
             try {
                 await this.bot!.api.sendMessage(chatId, `${header}${formatAsHtml(body)}`, { parse_mode: "HTML" });
+                return;
             } catch (err) {
-                console.error("[OpenCodeBot] Failed to send result message:", err);
+                console.warn(`[OpenCodeBot.sendResultMessage] HTML send failed for "${agentName}", retrying as plain text:`, err);
             }
-        } else {
+            // 2nd attempt: plain text (no parse_mode) — Telegram never rejects this
             try {
-                const buf = Buffer.from(body, "utf8");
-                await this.bot!.api.sendDocument(
-                    chatId,
-                    new InputFile(buf, `${agent.name}-respuesta.md`),
-                    { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
-                );
+                await this.bot!.api.sendMessage(chatId, `🤖 ${agentName}\n\n${body}`);
+                return;
             } catch (err) {
-                console.error("[OpenCodeBot] Failed to send result document:", err);
+                console.error(`[OpenCodeBot.sendResultMessage] Plain text send also failed for "${agentName}":`, err);
             }
+        }
+
+        // Large response or both text attempts failed → send as .md document
+        try {
+            const buf = Buffer.from(body, "utf8");
+            await this.bot!.api.sendDocument(
+                chatId,
+                new InputFile(buf, `${agentName}-respuesta.md`),
+                { caption: `${header}(resultado adjunto)`, parse_mode: "HTML" }
+            );
+        } catch (err) {
+            console.error(`[OpenCodeBot.sendResultMessage] Document send failed for "${agentName}":`, err);
         }
     }
 
@@ -448,6 +448,10 @@ export class OpenCodeBot implements BotContext {
         });
 
         // Restore all agents on startup
+        // First restore the sticky active-agent state (must happen before restoreAll
+        // so that the activeAgentByUser map is populated for the correct service instance).
+        this.persistentAgentService.restoreActiveAgentsState();
+
         this.persistentAgentService.restoreAll(this.agentDb.getAll())
             .then(async (failed) => {
                 for (const agent of failed) {
@@ -505,6 +509,12 @@ export class OpenCodeBot implements BotContext {
         bot.callbackQuery(/^sn:/,               AccessControlMiddleware.requireAccess, this.sessionHandler.handleSessionNew.bind(this.sessionHandler));
         bot.callbackQuery(/^sd:/,               AccessControlMiddleware.requireAccess, this.sessionHandler.handleSessionDeleteAll.bind(this.sessionHandler));
         bot.callbackQuery(/^sx:/,               AccessControlMiddleware.requireAccess, this.sessionHandler.handleSessionDelete.bind(this.sessionHandler));
+
+        // ─── Server callbacks ────────────────────────────────────────────────
+        bot.callbackQuery(/^server:activate:/,  AccessControlMiddleware.requireAccess, this.serversHandler.handleServerActivate.bind(this.serversHandler));
+        bot.callbackQuery(/^server:del:/,       AccessControlMiddleware.requireAccess, this.serversHandler.handleServerDelete.bind(this.serversHandler));
+        bot.callbackQuery(/^server:delconfirm:/, AccessControlMiddleware.requireAccess, this.serversHandler.handleServerDeleteConfirm.bind(this.serversHandler));
+        bot.callbackQuery(/^server:delcancel$/, AccessControlMiddleware.requireAccess, this.serversHandler.handleServerDeleteCancel.bind(this.serversHandler));
 
         // ─── ESC keyboard button ─────────────────────────────────────────────
         bot.hears("⏹️ ESC", AccessControlMiddleware.requireAccess, this.messageHandler.handleEsc.bind(this.messageHandler));

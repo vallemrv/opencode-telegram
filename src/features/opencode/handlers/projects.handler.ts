@@ -323,8 +323,10 @@ export class ProjectsHandler {
             return;
         }
 
-        // No server → start wizard
-        await this.startWizard(ctx, userId, absPath, projectName);
+        // No server → start wizard.
+        // Pass openExisting=true: the user pressed "Abrir aquí" so absPath IS the
+        // project folder, we must not treat it as a parent to create sub-folders in.
+        await this.startWizard(ctx, userId, absPath, projectName, true);
     }
 
     // ─── proj:activate:<agentId> — Activate existing server ──────────────────────
@@ -419,13 +421,58 @@ export class ProjectsHandler {
 
     // ─── Wizard: Start (no existing server) ─────────────────────────────────────
 
-    private async startWizard(ctx: Context, userId: number, absPath: string, projectName: string): Promise<void> {
+    /**
+     * Start the creation wizard.
+     *
+     * @param openExisting  When true, `absPath` is the project folder itself (user
+     *                      pressed "Abrir aquí" on an existing directory). When false
+     *                      (default) we are creating a new sub-folder inside `absPath`.
+     */
+    private async startWizard(
+        ctx: Context,
+        userId: number,
+        absPath: string,
+        projectName: string,
+        openExisting = false,
+    ): Promise<void> {
         const absPathResolved = resolveDir(absPath);
-        const projectPath = projectName !== "workspace" ? nodePath.join(absPathResolved, projectName) : absPathResolved;
+
+        // When opening an existing directory the project path IS absPath.
+        // When creating a new project we place it as a sub-folder.
+        const projectPath = openExisting
+            ? absPathResolved
+            : projectName !== "workspace"
+                ? nodePath.join(absPathResolved, projectName)
+                : absPathResolved;
+
         const isNewProject = !fs.existsSync(projectPath);
         const existingGit = !isNewProject && fs.existsSync(nodePath.join(projectPath, ".git"));
 
-        // Use folder name directly if available, skip name step
+        await ctx.deleteMessage().catch(() => {});
+
+        if (openExisting) {
+            // We already know the name and path — skip directly to the right step.
+            const wizard: ProjectWizard = {
+                step: "git",
+                absPath: projectPath,   // store the resolved project path directly
+                projectName,
+                existingGit,
+                isNewProject: false,    // it exists — we are opening it
+            };
+            this.wizardState.set(userId, wizard);
+
+            if (existingGit) {
+                // Skip git step too
+                wizard.gitSource = "existing";
+                wizard.step = "model";
+                await this.askWizardModel(ctx, userId);
+            } else {
+                await this.askWizardGit(ctx, userId);
+            }
+            return;
+        }
+
+        // ── Creating a new project (sub-folder flow) ──────────────────────────
         const finalName = projectName !== "workspace" ? projectName : undefined;
 
         if (finalName) {
@@ -438,18 +485,11 @@ export class ProjectsHandler {
                 isNewProject,
             });
 
-            await ctx.deleteMessage().catch(() => {});
-            
             if (!isNewProject && existingGit) {
                 // Skip git too, go to model
                 const wizard = this.wizardState.get(userId)!;
                 wizard.gitSource = "existing";
                 wizard.step = "model";
-                await ctx.reply(
-                    `✅ Proyecto: <b>${escapeHtml(finalName)}</b>\n` +
-                    `Git ya configurado.\n\nContinuando...`,
-                    { parse_mode: "HTML" }
-                );
                 await this.askWizardModel(ctx, userId);
             } else {
                 await this.askWizardGit(ctx, userId);
@@ -463,7 +503,6 @@ export class ProjectsHandler {
                 isNewProject,
             });
 
-            await ctx.deleteMessage().catch(() => {});
             await this.askWizardName(ctx, userId);
         }
     }
@@ -485,7 +524,9 @@ export class ProjectsHandler {
         }
 
         const projectName = nodePath.basename(absPath) || "workspace";
-        await this.startWizard(ctx, userId, absPath, projectName);
+        // absPath is the existing directory — openExisting=true so we don't
+        // append the name as a sub-folder inside itself.
+        await this.startWizard(ctx, userId, absPath, projectName, true);
     }
 
     // ─── Wizard Step 1: Name ────────────────────────────────────────────────────

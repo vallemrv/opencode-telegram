@@ -14,7 +14,19 @@ export class ServersHandler {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        const agents = this.ctx.agentDb.getByUser(userId);
+        let agents = this.ctx.agentDb.getByUser(userId);
+
+        // Fallback: if getByUser returned nothing but there is an active agent in
+        // memory (restored after restart), show all agents so the user is not left
+        // with an empty list.  This can happen when user_id type coercion differs
+        // between the SQLite driver and the Telegram userId at query time.
+        if (agents.length === 0) {
+            const activeId = this.ctx.persistentAgentService.getActiveAgentId(userId);
+            if (activeId) {
+                agents = this.ctx.agentDb.getAll().filter(a => Number(a.userId) === Number(userId));
+            }
+        }
+
         const activeId = this.ctx.persistentAgentService.getActiveAgentId(userId);
         const keyboard = new InlineKeyboard();
 
@@ -48,15 +60,18 @@ export class ServersHandler {
     }
 
     async handleServerActivate(ctx: Context): Promise<void> {
-        await ctx.answerCallbackQuery();
         const userId = ctx.from?.id;
-        if (!userId) return;
+        if (!userId) { await ctx.answerCallbackQuery(); return; }
 
         const callbackData = ctx.callbackQuery?.data;
-        if (!callbackData?.startsWith("server:activate:")) return;
+        if (!callbackData?.startsWith("server:activate:")) { await ctx.answerCallbackQuery(); return; }
         const agentId = callbackData.replace("server:activate:", "");
         const agent = this.ctx.agentDb.getById(agentId);
-        if (!agent) { await ctx.editMessageText("❌ Servidor no encontrado."); return; }
+        if (!agent) {
+            await ctx.answerCallbackQuery({ text: "❌ Servidor no encontrado." });
+            await ctx.editMessageText("❌ Servidor no encontrado.");
+            return;
+        }
 
         const currentActive = this.ctx.persistentAgentService.getActiveAgentId(userId);
         if (currentActive === agentId) {
