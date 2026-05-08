@@ -292,13 +292,17 @@ export class MessageHandler {
                 { parse_mode: "HTML" }
             );
 
-            // 3. Restart via systemd or pm2
+            // 3. Restart via systemd, pm2, or SIGTERM (systemd will relaunch)
+            let restarted = false;
             try {
-                execSync("systemctl restart opencode-telegram", { encoding: "utf-8" });
-            } catch {
+                execSync("sudo systemctl restart opencode-telegram", { encoding: "utf-8" });
+                restarted = true;
+            } catch { /* no sudo — try pm2 */ }
+            if (!restarted) {
                 try {
                     execSync("pm2 restart opencode-telegram", { encoding: "utf-8" });
-                } catch { /* fall through — exit below will trigger restart */ }
+                    restarted = true;
+                } catch { /* fall through — process.exit below + systemd Restart=always will relaunch */ }
             }
 
             // 4. Save state for post-restart notification

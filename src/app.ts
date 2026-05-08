@@ -197,11 +197,11 @@ async function startBot() {
         console.log('[TelegramCoder] ✅ Bot started successfully');
     } catch (error: any) {
         // 409 Conflict = another instance already running with this token.
-        // Exit with 0 so systemd (Restart=always) does NOT loop forever.
+        // Exit with 3 so systemd (RestartPreventExitStatus=3) does NOT loop forever.
         if (error?.error_code === 409 || String(error?.description ?? "").includes("409") || String(error?.message ?? "").includes("409")) {
             console.error('[TelegramCoder] FATAL: Another bot instance is already running with this token (409 Conflict).');
             console.error('[TelegramCoder] Make sure each server uses a DIFFERENT BOT TOKEN. Exiting without restart.');
-            process.exit(0); // exit 0 → systemd will not restart (Restart=on-failure) or use RestartPreventExitStatus=0
+            process.exit(3);
         }
         console.error('[TelegramCoder] Failed to start:', error);
         process.exit(1);
