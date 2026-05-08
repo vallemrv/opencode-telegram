@@ -96,14 +96,12 @@ async function giteaCreateOrGetRepo(name: string): Promise<{ cloneUrl: string; h
 // ─── Wizard state ─────────────────────────────────────────────────────────────
 
 interface ProjectWizard {
-    step: "name" | "git" | "model" | "confirm";
-    absPath: string;
-    projectName?: string;
-    defaultFolderName?: string;
-    gitSource?: "none" | "github" | "gitea" | "existing";
+    step: "git" | "model" | "server";
+    absPath: string;          // resolved absolute path to the project folder
+    projectName: string;      // basename of the folder
+    gitSource?: "none" | "github" | "gitea" | "local" | "existing";
     model?: string;
-    existingGit?: boolean;
-    isNewProject?: boolean;
+    existingGit: boolean;
 }
 
 export class ProjectsHandler {
@@ -115,12 +113,6 @@ export class ProjectsHandler {
     constructor(private readonly ctx: BotContext) {}
 
     // Public helpers for state checking
-    isWizardName(userId: number): boolean {
-        const wizard = this.wizardState.get(userId);
-        console.log(`[ProjectsHandler.isWizardName] userId=${userId}, wizard=${wizard ? `exists(step=${wizard.step})` : 'null'}, result=${wizard?.step === "name"}`);
-        return wizard?.step === "name";
-    }
-
     isWizardModel(userId: number): boolean {
         const wizard = this.wizardState.get(userId);
         return wizard?.step === "model";
@@ -323,10 +315,8 @@ export class ProjectsHandler {
             return;
         }
 
-        // No server → start wizard.
-        // Pass openExisting=true: the user pressed "Abrir aquí" so absPath IS the
-        // project folder, we must not treat it as a parent to create sub-folders in.
-        await this.startWizard(ctx, userId, absPath, projectName, true);
+        // No server → start wizard directly with this folder
+        await this.startWizard(ctx, userId, absPath);
     }
 
     // ─── proj:activate:<agentId> — Activate existing server ──────────────────────
@@ -422,88 +412,35 @@ export class ProjectsHandler {
     // ─── Wizard: Start (no existing server) ─────────────────────────────────────
 
     /**
-     * Start the creation wizard.
-     *
-     * @param openExisting  When true, `absPath` is the project folder itself (user
-     *                      pressed "Abrir aquí" on an existing directory). When false
-     *                      (default) we are creating a new sub-folder inside `absPath`.
+     * Start the wizard for a given folder.
+     * absPath must be the resolved project folder (already chosen by the user).
      */
     private async startWizard(
         ctx: Context,
         userId: number,
         absPath: string,
-        projectName: string,
-        openExisting = false,
     ): Promise<void> {
-        const absPathResolved = resolveDir(absPath);
-
-        // When opening an existing directory the project path IS absPath.
-        // When creating a new project we place it as a sub-folder.
-        const projectPath = openExisting
-            ? absPathResolved
-            : projectName !== "workspace"
-                ? nodePath.join(absPathResolved, projectName)
-                : absPathResolved;
-
-        const isNewProject = !fs.existsSync(projectPath);
-        const existingGit = !isNewProject && fs.existsSync(nodePath.join(projectPath, ".git"));
+        const projectPath = resolveDir(absPath);
+        const projectName = nodePath.basename(projectPath) || "project";
+        const existingGit = fs.existsSync(nodePath.join(projectPath, ".git"));
 
         await ctx.deleteMessage().catch(() => {});
 
-        if (openExisting) {
-            // We already know the name and path — skip directly to the right step.
-            const wizard: ProjectWizard = {
-                step: "git",
-                absPath: projectPath,   // store the resolved project path directly
-                projectName,
-                existingGit,
-                isNewProject: false,    // it exists — we are opening it
-            };
-            this.wizardState.set(userId, wizard);
+        const wizard: ProjectWizard = {
+            step: "git",
+            absPath: projectPath,
+            projectName,
+            existingGit,
+        };
+        this.wizardState.set(userId, wizard);
 
-            if (existingGit) {
-                // Skip git step too
-                wizard.gitSource = "existing";
-                wizard.step = "model";
-                await this.askWizardModel(ctx, userId);
-            } else {
-                await this.askWizardGit(ctx, userId);
-            }
-            return;
-        }
-
-        // ── Creating a new project (sub-folder flow) ──────────────────────────
-        const finalName = projectName !== "workspace" ? projectName : undefined;
-
-        if (finalName) {
-            // Skip name step, go directly to git
-            this.wizardState.set(userId, {
-                step: "git",
-                absPath: absPathResolved,
-                projectName: finalName,
-                existingGit,
-                isNewProject,
-            });
-
-            if (!isNewProject && existingGit) {
-                // Skip git too, go to model
-                const wizard = this.wizardState.get(userId)!;
-                wizard.gitSource = "existing";
-                wizard.step = "model";
-                await this.askWizardModel(ctx, userId);
-            } else {
-                await this.askWizardGit(ctx, userId);
-            }
+        if (existingGit) {
+            // Skip git step — already has git
+            wizard.gitSource = "existing";
+            wizard.step = "model";
+            await this.askWizardModel(ctx, userId);
         } else {
-            // No folder name, ask for name
-            this.wizardState.set(userId, {
-                step: "name",
-                absPath: absPathResolved,
-                existingGit,
-                isNewProject,
-            });
-
-            await this.askWizardName(ctx, userId);
+            await this.askWizardGit(ctx, userId);
         }
     }
 
@@ -523,128 +460,11 @@ export class ProjectsHandler {
             return;
         }
 
-        const projectName = nodePath.basename(absPath) || "workspace";
-        // absPath is the existing directory — openExisting=true so we don't
-        // append the name as a sub-folder inside itself.
-        await this.startWizard(ctx, userId, absPath, projectName, true);
+        // absPath is the chosen directory — start wizard directly
+        await this.startWizard(ctx, userId, absPath);
     }
 
-    // ─── Wizard Step 1: Name ────────────────────────────────────────────────────
-
-    private async askWizardName(ctx: Context, userId: number, defaultName?: string): Promise<void> {
-        const wizard = this.wizardState.get(userId);
-        if (!wizard) return;
-
-        const keyboard = new InlineKeyboard();
-
-        if (defaultName) {
-            keyboard.text(`✅ Usar "${escapeHtml(defaultName.slice(0, 20))}"`, `proj:wizard-use-default`).row();
-        }
-        keyboard.text("❌ Cancelar", `proj:cancel`);
-
-        const msg = defaultName
-            ? `📝 <b>Step 1/4: Nombre del proyecto</b>\n\n` +
-              `Nombre sugerido: <b>${escapeHtml(defaultName)}</b>\n\n` +
-              `Pulsa ✅ para usarlo o escribe otro:`
-            : `📝 <b>Step 1/4: Nombre del proyecto</b>\n\n` +
-              `Escribe el nombre del proyecto:`;
-
-        await ctx.reply(msg, { parse_mode: "HTML", reply_markup: keyboard });
-    }
-
-    async handleWizardNameText(ctx: Context): Promise<void> {
-        console.log(`[ProjectsHandler.handleWizardNameText] ENTER`);
-        const userId = ctx.from?.id;
-        console.log(`[ProjectsHandler.handleWizardNameText] userId=${userId || 'N/A'}`);
-        if (!userId) return;
-
-        const wizard = this.wizardState.get(userId);
-        console.log(`[ProjectsHandler.handleWizardNameText] wizard=${wizard ? `exists(step=${wizard.step})` : 'null'}`);
-        if (!wizard || wizard.step !== "name") {
-            console.log(`[ProjectsHandler.handleWizardNameText] RETURN: wizard invalid or step not 'name'`);
-            return;
-        }
-
-        const name = ctx.message?.text?.trim();
-        console.log(`[ProjectsHandler.handleWizardNameText] name="${name || 'N/A'}"`);
-        if (!name) {
-            await ctx.reply("❌ Nombre vacío.", { parse_mode: "HTML" });
-            return;
-        }
-
-        wizard.projectName = name;
-        console.log(`[ProjectsHandler.handleWizardNameText] projectName set to "${name}"`);
-        
-        // Re-check project status with new name
-        const projectPath = nodePath.join(wizard.absPath, name);
-        wizard.isNewProject = !fs.existsSync(projectPath);
-        wizard.existingGit = !wizard.isNewProject && fs.existsSync(nodePath.join(projectPath, ".git"));
-        console.log(`[ProjectsHandler.handleWizardNameText] projectPath="${projectPath}", isNewProject=${wizard.isNewProject}, existingGit=${wizard.existingGit}`);
-
-        // Skip Git step if project already exists with git
-        if (!wizard.isNewProject && wizard.existingGit) {
-            console.log(`[ProjectsHandler.handleWizardNameText] Git exists → skipping to model`);
-            wizard.gitSource = "existing";
-            wizard.step = "model";
-            await ctx.reply(
-                `✅ Git ya configurado en proyecto existente.\n` +
-                `Continuando sin modificar repo...`,
-                { parse_mode: "HTML" }
-            );
-            await this.askWizardModel(ctx, userId);
-        } else {
-            console.log(`[ProjectsHandler.handleWizardNameText] → going to git step`);
-            wizard.step = "git";
-            await this.askWizardGit(ctx, userId);
-        }
-    }
-
-    // ─── proj:wizard-use-default — Use default folder name ────────────────────
-
-    async handleWizardUseDefaultName(ctx: Context): Promise<void> {
-        console.log(`[ProjectsHandler.handleWizardUseDefaultName] ENTER`);
-        await ctx.answerCallbackQuery();
-        const userId = ctx.from?.id;
-        console.log(`[ProjectsHandler.handleWizardUseDefaultName] userId=${userId || 'N/A'}`);
-        if (!userId) return;
-
-        const wizard = this.wizardState.get(userId);
-        console.log(`[ProjectsHandler.handleWizardUseDefaultName] wizard exists=${!!wizard}, defaultFolderName="${wizard?.defaultFolderName || 'N/A'}"`);
-        if (!wizard || !wizard.defaultFolderName) {
-            await ctx.reply("❌ Error: nombre no disponible.", { parse_mode: "HTML" });
-            return;
-        }
-
-        console.log(`[ProjectsHandler.handleWizardUseDefaultName] Using default name: "${wizard.defaultFolderName}"`);
-        wizard.projectName = wizard.defaultFolderName;
-        
-        // Re-check project status
-        const projectPath = nodePath.join(wizard.absPath, wizard.projectName);
-        wizard.isNewProject = !fs.existsSync(projectPath);
-        wizard.existingGit = !wizard.isNewProject && fs.existsSync(nodePath.join(projectPath, ".git"));
-        console.log(`[ProjectsHandler.handleWizardUseDefaultName] projectPath="${projectPath}", isNewProject=${wizard.isNewProject}, existingGit=${wizard.existingGit}`);
-
-        await ctx.deleteMessage().catch(() => {});
-
-        // Skip Git step if project already exists with git
-        if (!wizard.isNewProject && wizard.existingGit) {
-            console.log(`[ProjectsHandler.handleWizardUseDefaultName] Git exists → skipping to model step`);
-            wizard.gitSource = "existing";
-            wizard.step = "model";
-            await ctx.reply(
-                `✅ Git ya configurado en proyecto existente.\n` +
-                `Continuando sin modificar repo...`,
-                { parse_mode: "HTML" }
-            );
-            await this.askWizardModel(ctx, userId);
-        } else {
-            console.log(`[ProjectsHandler.handleWizardUseDefaultName] → going to git step`);
-            wizard.step = "git";
-            await this.askWizardGit(ctx, userId);
-        }
-    }
-
-    // ─── Wizard Step 2: Git ─────────────────────────────────────────────────────
+    // ─── Wizard Step 1: Git ─────────────────────────────────────────────────────
 
     private async askWizardGit(ctx: Context, userId: number): Promise<void> {
         const wizard = this.wizardState.get(userId);
@@ -652,37 +472,33 @@ export class ProjectsHandler {
 
         const isGitea = !!process.env.GITEA_URL && !!process.env.GITEA_TOKEN;
         const isGithub = !!process.env.GITHUB_TOKEN;
+        const folderExists = fs.existsSync(wizard.absPath);
 
-        // Different options based on project state
         const keyboard = new InlineKeyboard();
-        
-        let msg: string;
 
-        if (!wizard.isNewProject && !wizard.existingGit) {
-            // Existing project WITHOUT git → only local init
+        let msg: string;
+        if (folderExists && !wizard.existingGit) {
+            // Existing folder without git
             keyboard.text("✅ Inicializar git local", `proj:wizard-git:local`).row();
             keyboard.text("❌ Sin git", `proj:wizard-git:none`).row();
-            msg = 
-                `🔀 <b>Step 2/4: Git (Proyecto existente)</b>\n\n` +
-                `Nombre: <b>${escapeHtml(wizard.projectName!)}</b>\n` +
-                `Folder ya existe SIN git.\n\n` +
+            msg =
+                `🔀 <b>Step 1/3: Git</b>\n\n` +
+                `Carpeta: <b>${escapeHtml(wizard.projectName)}</b>\n` +
+                `La carpeta ya existe sin git.\n\n` +
                 `¿Inicializar git localmente?`;
-        } else if (wizard.isNewProject) {
-            // New project → full options
+        } else {
+            // New folder or no git
             keyboard.text("❌ Sin git", `proj:wizard-git:none`).row();
             if (isGithub) keyboard.text("🐙 GitHub", `proj:wizard-git:github`).row();
             if (isGitea) keyboard.text("☕ Gitea", `proj:wizard-git:gitea`).row();
-            msg = 
-                `🔀 <b>Step 2/4: Repositorio Git</b>\n\n` +
-                `Nombre: <b>${escapeHtml(wizard.projectName!)}</b>\n\n` +
-                `¿Crear repositorio remoto?`;
-        } else {
-            // Fallback (shouldn't happen)
-            keyboard.text("❌ Sin git", `proj:wizard-git:none`).row();
-            msg = `🔀 <b>Step 2/4: Repositorio Git</b>\n\n¿Configurar git?`;
+            keyboard.text("✅ Git local", `proj:wizard-git:local`).row();
+            msg =
+                `🔀 <b>Step 1/3: Git</b>\n\n` +
+                `Carpeta: <b>${escapeHtml(wizard.projectName)}</b>\n\n` +
+                `¿Configurar repositorio?`;
         }
-        
-        keyboard.text("⬅️ Atrás", `proj:wizard-back:name`);
+
+        keyboard.text("❌ Cancelar", `proj:cancel`);
 
         await ctx.reply(msg, { parse_mode: "HTML", reply_markup: keyboard });
     }
@@ -694,13 +510,14 @@ export class ProjectsHandler {
 
         const data = ctx.callbackQuery?.data;
         if (!data?.startsWith("proj:wizard-git:")) return;
-        const source = data.slice("proj:wizard-git:".length) as "none" | "github" | "gitea" | "local";
+        const source = data.slice("proj:wizard-git:".length) as ProjectWizard["gitSource"];
 
         const wizard = this.wizardState.get(userId);
         if (!wizard) return;
 
         wizard.gitSource = source;
         wizard.step = "model";
+        await ctx.deleteMessage().catch(() => {});
         await this.askWizardModel(ctx, userId);
     }
 
@@ -710,7 +527,7 @@ export class ProjectsHandler {
         const wizard = this.wizardState.get(userId);
         if (!wizard) return;
 
-        // Fetch models from opencode CLI (same approach as ModelsHandler)
+        // Fetch models from opencode CLI
         let modelsCache: Record<string, string[]> = {};
         try {
             const opencodeCmd = await findOpencodeCmd();
@@ -730,7 +547,6 @@ export class ProjectsHandler {
 
         const providers = Object.keys(modelsCache).sort();
 
-        // Store selection state reusing modelSelection map with sentinel agentId
         this.ctx.modelSelection.set(userId, {
             agentId: `wizard:${userId}`,
             modelsCache,
@@ -743,20 +559,12 @@ export class ProjectsHandler {
             this.ctx.modelIndex.set(shortKey, provider);
             keyboard.text(provider, shortKey).row();
         }
-
-        keyboard.text("📝 Escribir manualmente", `proj:wizard-model-custom`).row();
-
-        // Back button
-        if (wizard.existingGit && !wizard.isNewProject) {
-            keyboard.text("⬅️ Atrás", `proj:wizard-back:name`);
-        } else {
-            keyboard.text("⬅️ Atrás", `proj:wizard-back:git`);
-        }
+        keyboard.text("❌ Cancelar", `proj:cancel`);
 
         const gitStatus = wizard.gitSource === "existing"
-            ? "✅ Git existente (sin cambios)"
+            ? "✅ Git existente"
             : wizard.gitSource === "local"
-            ? "✅ Inicializar git local"
+            ? "✅ Git local"
             : wizard.gitSource === "none"
             ? "❌ Sin git"
             : wizard.gitSource === "github"
@@ -764,8 +572,8 @@ export class ProjectsHandler {
             : "☕ Gitea";
 
         await ctx.reply(
-            `🤖 <b>Step 3/4: Modelo</b>\n\n` +
-            `Nombre: <b>${escapeHtml(wizard.projectName!)}</b>\n` +
+            `🤖 <b>Step 2/3: Modelo</b>\n\n` +
+            `Carpeta: <b>${escapeHtml(wizard.projectName)}</b>\n` +
             `Git: ${gitStatus}\n\n` +
             `Elige proveedor:`,
             { parse_mode: "HTML", reply_markup: keyboard }
@@ -820,156 +628,87 @@ export class ProjectsHandler {
                 this.ctx.modelIndex.set(shortKey, provider);
                 keyboard.text(provider, shortKey).row();
             }
-            keyboard.text("📝 Escribir manualmente", `proj:wizard-model-custom`).row();
+            keyboard.text("❌ Cancelar", `proj:cancel`).row();
             await ctx.editMessageText(
-                `🤖 <b>Step 3/4: Modelo</b>\n\nElige proveedor:`,
+                `🤖 <b>Step 2/3: Modelo</b>\n\nElige proveedor:`,
                 { parse_mode: "HTML", reply_markup: keyboard }
             );
             return;
         }
 
-        // Model selected
+        // Model selected → go to server step
         if (data.startsWith("wmdl_mo_")) {
             const model = this.ctx.modelIndex.get(data);
             if (!model) { await ctx.editMessageText("❌ Modelo no encontrado."); return; }
 
             this.ctx.modelSelection.delete(userId);
             wizard.model = model;
-            wizard.step = "confirm";
-            await this.askWizardConfirm(ctx, userId);
+            wizard.step = "server";
+            await this.askWizardServer(ctx, userId);
             return;
         }
     }
 
-    async handleWizardModel(ctx: Context): Promise<void> {
-        await ctx.answerCallbackQuery();
-        const userId = ctx.from?.id;
-        if (!userId) return;
+    // ─── Wizard Step 3: Server selector ────────────────────────────────────────
 
-        const data = ctx.callbackQuery?.data;
-        if (!data?.startsWith("proj:wizard-model:")) return;
-
+    private async askWizardServer(ctx: Context, userId: number): Promise<void> {
         const wizard = this.wizardState.get(userId);
         if (!wizard) return;
 
-        if (data === "proj:wizard-model-custom") {
-            await ctx.reply("📝 Escribe el modelo (formato: provider/model):", { parse_mode: "HTML" });
-            return;
+        const allServers = this.ctx.agentDb.getAll();
+        const keyboard = new InlineKeyboard();
+
+        for (const server of allServers) {
+            const activeId = this.ctx.persistentAgentService.getActiveAgentId(userId);
+            const icon = server.id === activeId ? "✅" : server.status === "running" ? "🟢" : "🔴";
+            keyboard.text(
+                `${icon} ${server.name} [${server.model.split("/").slice(-1)[0]}]`,
+                `proj:wizard-server:${server.id}`
+            ).row();
         }
 
-        const model = data.slice("proj:wizard-model:".length);
-        wizard.model = model;
-        wizard.step = "confirm";
-        await this.askWizardConfirm(ctx, userId);
-    }
+        keyboard.text("🆕 Nuevo servidor", `proj:wizard-server:new`).row();
+        keyboard.text("❌ Cancelar", `proj:cancel`);
 
-    async handleWizardModelText(ctx: Context): Promise<void> {
-        const userId = ctx.from?.id;
-        if (!userId) return;
-
-        const wizard = this.wizardState.get(userId);
-        if (!wizard || wizard.step !== "model") return;
-
-        const model = ctx.message?.text?.trim();
-        if (!model) {
-            await ctx.reply("❌ Modelo vacío.", { parse_mode: "HTML" });
-            return;
-        }
-
-        wizard.model = model;
-        wizard.step = "confirm";
-        await this.askWizardConfirm(ctx, userId);
-    }
-
-    // ─── Wizard Step 4: Confirm ────────────────────────────────────────────────
-
-    private async askWizardConfirm(ctx: Context, userId: number): Promise<void> {
-        const wizard = this.wizardState.get(userId);
-        if (!wizard) return;
-
-        const keyboard = new InlineKeyboard()
-            .text("✅ Crear proyecto", `proj:wizard-confirm`)
-            .text("❌ Cancelar", `proj:cancel`).row();
-        
-        // Adjust back button based on wizard flow
-        if (wizard.existingGit && !wizard.isNewProject) {
-            keyboard.text("⬅️ Atrás", `proj:wizard-back:model-to-name`);
-        } else {
-            keyboard.text("⬅️ Atrás", `proj:wizard-back:model`);
-        }
-
-        const gitStatus = wizard.gitSource === "existing" 
-            ? "✅ Git existente (sin cambios)"
+        const gitStatus = wizard.gitSource === "existing"
+            ? "✅ Git existente"
             : wizard.gitSource === "local"
-            ? "✅ Inicializar git local"
+            ? "✅ Git local"
             : wizard.gitSource === "none"
             ? "❌ Sin git"
             : wizard.gitSource === "github"
             ? "🐙 GitHub"
             : "☕ Gitea";
 
-        const projectStatus = wizard.isNewProject 
-            ? "🆕 Proyecto nuevo"
-            : "📁 Proyecto existente";
-
         await ctx.reply(
-            `✅ <b>Step 4/4: Confirmar</b>\n\n` +
-            `${projectStatus}\n` +
-            `Nombre: <b>${escapeHtml(wizard.projectName!)}</b>\n` +
+            `🖥️ <b>Step 3/3: Servidor</b>\n\n` +
+            `Carpeta: <b>${escapeHtml(wizard.projectName)}</b>\n` +
             `Git: ${gitStatus}\n` +
             `Modelo: <code>${escapeHtml(wizard.model!)}</code>\n\n` +
-            `¿Crear server?`,
+            `Elige un servidor existente para reasignar o crea uno nuevo:`,
             { parse_mode: "HTML", reply_markup: keyboard }
         );
     }
 
-    async handleWizardConfirm(ctx: Context): Promise<void> {
-        await ctx.answerCallbackQuery();
-        const userId = ctx.from?.id;
-        if (!userId) return;
-
-        const wizard = this.wizardState.get(userId);
-        if (!wizard) return;
-
-        await this.createProject(ctx, userId, wizard);
-    }
-
-    // ─── Wizard: Back navigation ───────────────────────────────────────────────
-
-    async handleWizardBack(ctx: Context): Promise<void> {
+    async handleWizardServer(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         const userId = ctx.from?.id;
         if (!userId) return;
 
         const data = ctx.callbackQuery?.data;
-        if (!data?.startsWith("proj:wizard-back:")) return;
-        const backTo = data.slice("proj:wizard-back:".length);
+        if (!data?.startsWith("proj:wizard-server:")) return;
 
         const wizard = this.wizardState.get(userId);
-        if (!wizard) return;
+        if (!wizard) { await ctx.reply("❌ Sesión expirada."); return; }
 
-        switch (backTo) {
-            case "name":
-                wizard.step = "name";
-                await ctx.deleteMessage().catch(() => {});
-                await this.askWizardName(ctx, userId, wizard.projectName);
-                break;
-            case "git":
-                wizard.step = "git";
-                await ctx.deleteMessage().catch(() => {});
-                await this.askWizardGit(ctx, userId);
-                break;
-            case "model":
-                wizard.step = "model";
-                await ctx.deleteMessage().catch(() => {});
-                await this.askWizardModel(ctx, userId);
-                break;
-            case "model-to-name":
-                // Special case: skip git step, go back to name
-                wizard.step = "name";
-                await ctx.deleteMessage().catch(() => {});
-                await this.askWizardName(ctx, userId, wizard.projectName);
-                break;
+        const choice = data.slice("proj:wizard-server:".length);
+
+        if (choice === "new") {
+            await this.launchProject(ctx, userId, wizard, null);
+        } else {
+            const existing = this.ctx.agentDb.getById(choice);
+            if (!existing) { await ctx.reply("❌ Servidor no encontrado."); return; }
+            await this.launchProject(ctx, userId, wizard, existing);
         }
     }
 
@@ -987,149 +726,170 @@ export class ProjectsHandler {
         await ctx.reply("❌ Wizard cancelado.", { parse_mode: "HTML" });
     }
 
-    // ─── Project Creation ───────────────────────────────────────────────────────
+    // ─── Project Launch ─────────────────────────────────────────────────────────
 
-    private async createProject(ctx: Context, userId: number, wizard: ProjectWizard): Promise<void> {
-        const absPath = resolveDir(wizard.absPath);
-        const projectName = wizard.projectName || nodePath.basename(absPath) || "project";
-        const projectPath = wizard.isNewProject 
-            ? nodePath.join(absPath, projectName) 
-            : absPath;
+    private async launchProject(
+        ctx: Context,
+        userId: number,
+        wizard: ProjectWizard,
+        reuseAgent: PersistentAgent | null,
+    ): Promise<void> {
+        const projectPath = wizard.absPath;
+        const projectName = wizard.projectName;
 
-        // Create folder ONLY if new project
-        if (wizard.isNewProject && !fs.existsSync(projectPath)) {
+        await ctx.deleteMessage().catch(() => {});
+
+        // Ensure folder exists
+        if (!fs.existsSync(projectPath)) {
             try {
                 fs.mkdirSync(projectPath, { recursive: true });
             } catch (err) {
-                await ctx.reply(`❌ Error creando folder: ${escapeHtml(String(err))}`, { parse_mode: "HTML" });
+                await ctx.reply(`❌ Error creando carpeta: ${escapeHtml(String(err))}`, { parse_mode: "HTML" });
                 this.wizardState.delete(userId);
                 return;
             }
         }
 
-        // Git setup - ONLY for new projects or local init
-        if (!wizard.existingGit && wizard.gitSource !== "none" && wizard.gitSource !== "existing") {
+        // Git setup
+        if (wizard.gitSource !== "none" && wizard.gitSource !== "existing") {
             const statusMsg = await ctx.reply(`⏳ Configurando git...`, { parse_mode: "HTML" });
-
             try {
-                if (wizard.gitSource === "github" && wizard.isNewProject) {
-                    // Create GitHub repo ONLY for new projects
+                if (wizard.gitSource === "github") {
                     const repo = await githubCreateRepo(projectName);
                     if (repo) {
-                        // Clone into new folder
                         execSync(`git clone ${repo.cloneUrl} "${projectPath}"`, { stdio: "ignore" });
                         await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
                             `✅ GitHub: <a href="${repo.htmlUrl}">${escapeHtml(projectName)}</a>`,
-                            { parse_mode: "HTML" }
-                        );
+                            { parse_mode: "HTML" });
                     }
-                } else if (wizard.gitSource === "gitea" && wizard.isNewProject) {
-                    // Create Gitea repo ONLY for new projects
+                } else if (wizard.gitSource === "gitea") {
                     const repo = await giteaCreateOrGetRepo(projectName);
                     if (repo) {
-                        // Clone into new folder
                         execSync(`git clone ${repo.cloneUrl} "${projectPath}"`, { stdio: "ignore" });
                         await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
                             `✅ Gitea: <a href="${repo.htmlUrl}">${escapeHtml(projectName)}</a>`,
-                            { parse_mode: "HTML" }
-                        );
+                            { parse_mode: "HTML" });
                     }
                 } else if (wizard.gitSource === "local") {
-                    // Initialize git locally (for existing projects without git)
                     if (!fs.existsSync(nodePath.join(projectPath, ".git"))) {
                         execSync(`git init "${projectPath}"`, { stdio: "ignore" });
-                        await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
-                            `✅ Git inicializado localmente`,
-                            { parse_mode: "HTML" }
-                        );
                     }
+                    await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
+                        `✅ Git inicializado`, { parse_mode: "HTML" });
                 }
             } catch (err) {
                 await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
-                    `⚠️ Git falló: ${escapeHtml(String(err))}\nContinuando sin git.`,
-                    { parse_mode: "HTML" }
-                );
+                    `⚠️ Git falló: ${escapeHtml(String(err))}\nContinuando...`, { parse_mode: "HTML" });
             }
         }
 
-        // Ensure AGENTS.md exists
+        // Ensure AGENTS.md
         const agentsPath = nodePath.join(projectPath, "AGENTS.md");
         if (!fs.existsSync(agentsPath)) {
-            try {
-                fs.writeFileSync(agentsPath, `# ${projectName}\n\nProject created via TelegramCoder.\n`, "utf8");
-            } catch { /* ignore */ }
+            try { fs.writeFileSync(agentsPath, `# ${projectName}\n\nProject created via TelegramCoder.\n`, "utf8"); } catch { /* ignore */ }
         }
 
         // Ensure opencode.json
         const opencodeJsonPath = nodePath.join(projectPath, "opencode.json");
         if (!fs.existsSync(opencodeJsonPath)) {
-            try {
-                fs.writeFileSync(opencodeJsonPath, JSON.stringify({ "$schema": "https://opencode.ai/config.json" }) + "\n", "utf8");
-            } catch { /* ignore */ }
+            try { fs.writeFileSync(opencodeJsonPath, JSON.stringify({ "$schema": "https://opencode.ai/config.json" }) + "\n", "utf8"); } catch { /* ignore */ }
         }
 
-        // Check slots availability
-        const maxAgents = this.ctx.configService.getMaxAgents();
-        const runningCount = this.ctx.agentDb.countRunningLocal();
+        if (reuseAgent) {
+            // ── Reasignar servidor existente ─────────────────────────────────
+            const statusMsg = await ctx.reply(
+                `⏳ Parando <b>${escapeHtml(reuseAgent.name)}</b>...`,
+                { parse_mode: "HTML" }
+            );
 
-        if (runningCount >= maxAgents) {
-            const lruCandidates = this.ctx.agentDb.getRunningOrderedByLRU();
-            const evictCandidate = lruCandidates[0];
-            if (!evictCandidate) {
-                await ctx.reply("❌ Error: no se encontró servidor a evictar.", { parse_mode: "HTML" });
+            await this.ctx.persistentAgentService.evictAgent(reuseAgent);
+
+            // Update agent in DB
+            reuseAgent.workdir = projectPath;
+            reuseAgent.model   = wizard.model!;
+            reuseAgent.name    = projectName;
+            reuseAgent.status  = "running";
+            reuseAgent.lastUsedAt = new Date().toISOString();
+            this.ctx.agentDb.save(reuseAgent);
+
+            await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
+                `⏳ Arrancando <b>${escapeHtml(projectName)}</b>...`, { parse_mode: "HTML" });
+
+            const result = await this.ctx.persistentAgentService.startAgent(reuseAgent);
+            if (!result.success) {
+                this.ctx.agentDb.delete(reuseAgent.id);
+                await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
+                    `❌ No se pudo arrancar: ${escapeHtml(result.message)}`, { parse_mode: "HTML" });
                 this.wizardState.delete(userId);
                 return;
             }
 
-            await ctx.reply(
-                `♻️ Todos los slots ocupados (${runningCount}/${maxAgents})\n` +
-                `Parando <b>${escapeHtml(evictCandidate.name)}</b> para crear nuevo...`,
-                { parse_mode: "HTML" }
-            );
-            await this.ctx.persistentAgentService.evictAgent(evictCandidate);
-        }
-
-        // Create agent
-        const port = pickPort(this.ctx.agentDb.usedPorts());
-        const agent: PersistentAgent = {
-            id: randomUUID(),
-            userId,
-            name: projectName,
-            role: "",
-            workdir: projectPath,
-            model: wizard.model!,
-            port,
-            status: "running",
-            createdAt: new Date().toISOString(),
-            lastUsedAt: new Date().toISOString(),
-        };
-        this.ctx.agentDb.save(agent);
-
-        // Start server
-        const statusMsg = await ctx.reply(`⏳ Arrancando servidor en puerto <code>${port}</code>...`, { parse_mode: "HTML" });
-        const result = await this.ctx.persistentAgentService.startAgent(agent);
-        if (!result.success) {
-            this.ctx.agentDb.delete(agent.id);
-            await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
-                `❌ No se pudo arrancar: ${escapeHtml(result.message)}`,
-                { parse_mode: "HTML" }
-            );
+            this.ctx.persistentAgentService.setActiveAgent(userId, reuseAgent.id);
+            this.ctx.agentDb.setLastUsed(userId, reuseAgent.id);
             this.wizardState.delete(userId);
-            return;
+
+            await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
+                `✅ <b>${escapeHtml(projectName)}</b> listo (servidor reasignado).\n` +
+                `Modelo: <code>${escapeHtml(wizard.model!)}</code>\n\n` +
+                `Tus mensajes van a este servidor. /esc para desactivar.`,
+                { parse_mode: "HTML" });
+
+        } else {
+            // ── Nuevo servidor ────────────────────────────────────────────────
+            const maxAgents = this.ctx.configService.getMaxAgents();
+            const runningCount = this.ctx.agentDb.countRunningLocal();
+
+            if (runningCount >= maxAgents) {
+                const lruCandidates = this.ctx.agentDb.getRunningOrderedByLRU();
+                const evictCandidate = lruCandidates[0];
+                if (!evictCandidate) {
+                    await ctx.reply("❌ Error: no se encontró servidor a evictar.", { parse_mode: "HTML" });
+                    this.wizardState.delete(userId);
+                    return;
+                }
+                await ctx.reply(
+                    `♻️ Todos los slots ocupados (${runningCount}/${maxAgents})\n` +
+                    `Parando <b>${escapeHtml(evictCandidate.name)}</b>...`,
+                    { parse_mode: "HTML" }
+                );
+                await this.ctx.persistentAgentService.evictAgent(evictCandidate);
+            }
+
+            const port = pickPort(this.ctx.agentDb.usedPorts());
+            const agent: PersistentAgent = {
+                id: randomUUID(),
+                userId,
+                name: projectName,
+                role: "",
+                workdir: projectPath,
+                model: wizard.model!,
+                port,
+                status: "running",
+                createdAt: new Date().toISOString(),
+                lastUsedAt: new Date().toISOString(),
+            };
+            this.ctx.agentDb.save(agent);
+
+            const statusMsg = await ctx.reply(`⏳ Arrancando servidor en puerto <code>${port}</code>...`, { parse_mode: "HTML" });
+            const result = await this.ctx.persistentAgentService.startAgent(agent);
+            if (!result.success) {
+                this.ctx.agentDb.delete(agent.id);
+                await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
+                    `❌ No se pudo arrancar: ${escapeHtml(result.message)}`, { parse_mode: "HTML" });
+                this.wizardState.delete(userId);
+                return;
+            }
+
+            this.ctx.persistentAgentService.setActiveAgent(userId, agent.id);
+            this.ctx.agentDb.setLastUsed(userId, agent.id);
+            this.wizardState.delete(userId);
+
+            await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
+                `✅ <b>${escapeHtml(projectName)}</b> listo (nuevo servidor).\n` +
+                `Modelo: <code>${escapeHtml(wizard.model!)}</code>\n` +
+                `Puerto: <code>${port}</code>\n\n` +
+                `Tus mensajes van a este servidor. /esc para desactivar.`,
+                { parse_mode: "HTML" });
         }
-
-        // Activate and finish
-        this.ctx.persistentAgentService.setActiveAgent(userId, agent.id);
-        this.ctx.agentDb.setLastUsed(userId, agent.id);
-        this.wizardState.delete(userId);
-
-        const projectStatus = wizard.isNewProject ? "🆕 Nuevo" : "📁 Existente";
-        await ctx.api.editMessageText(statusMsg.chat.id, statusMsg.message_id,
-            `✅ <b>${escapeHtml(projectName)}</b> listo (${projectStatus}).\n` +
-            `Modelo: <code>${escapeHtml(wizard.model!)}</code>\n` +
-            `Puerto: <code>${port}</code>\n\n` +
-            `Tus mensajes van a este servidor. /esc para desactivar.`,
-            { parse_mode: "HTML" }
-        );
     }
 }

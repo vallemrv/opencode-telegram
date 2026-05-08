@@ -491,12 +491,9 @@ export class OpenCodeBot implements BotContext {
         bot.callbackQuery(/^proj:activate:/,       AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectActivate.bind(this.projectsHandler));
         bot.callbackQuery(/^proj:create-folder:/,  AccessControlMiddleware.requireAccess, this.projectsHandler.handleCreateFolder.bind(this.projectsHandler));
         bot.callbackQuery(/^proj:wizard:/,         AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardStart.bind(this.projectsHandler));
-        bot.callbackQuery(/^proj:wizard-use-default$/, AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardUseDefaultName.bind(this.projectsHandler));
         bot.callbackQuery(/^proj:wizard-git:/,     AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardGit.bind(this.projectsHandler));
-        bot.callbackQuery(/^proj:wizard-model:/,   AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardModel.bind(this.projectsHandler));
         bot.callbackQuery(/^wmdl_/,                AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardModelPicker.bind(this.projectsHandler));
-        bot.callbackQuery(/^proj:wizard-confirm/,  AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardConfirm.bind(this.projectsHandler));
-        bot.callbackQuery(/^proj:wizard-back:/,    AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardBack.bind(this.projectsHandler));
+        bot.callbackQuery(/^proj:wizard-server:/,  AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardServer.bind(this.projectsHandler));
         bot.callbackQuery(/^proj:cancel$/,         AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardCancel.bind(this.projectsHandler));
 
         bot.callbackQuery(/^run:agent:/,        AccessControlMiddleware.requireAccess, this.messageHandler.handleRunAgentSelected.bind(this.messageHandler));
@@ -528,12 +525,8 @@ export class OpenCodeBot implements BotContext {
             if (!userId) return;
 
             // Projects wizard states
-            if (this.projectsHandler.isWizardName(userId)) {
-                await this.projectsHandler.handleWizardNameText(ctx);
-                return;
-            }
             if (this.projectsHandler.isWizardModel(userId)) {
-                await this.projectsHandler.handleWizardModelText(ctx);
+                // No text input in wizard — model step uses inline picker only
                 return;
             }
             if (this.projectsHandler.isCreateFolderPrompt(userId)) {
