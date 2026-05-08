@@ -99,6 +99,7 @@ interface ProjectWizard {
     step: "name" | "git" | "model" | "confirm";
     absPath: string;
     projectName?: string;
+    defaultFolderName?: string;
     gitSource?: "none" | "github" | "gitea" | "existing";
     model?: string;
     existingGit?: boolean;
@@ -116,7 +117,7 @@ export class ProjectsHandler {
     // Public helpers for state checking
     isWizardName(userId: number): boolean {
         const wizard = this.wizardState.get(userId);
-        console.log(`[ProjectsHandler.isWizardName] userId=${userId}, wizard exists=${!!wizard}, step=${wizard?.step || 'N/A'}, result=${wizard?.step === "name"}`);
+        console.log(`[ProjectsHandler.isWizardName] userId=${userId}, wizard=${wizard ? `exists(step=${wizard.step})` : 'null'}, result=${wizard?.step === "name"}`);
         return wizard?.step === "name";
     }
 
@@ -424,24 +425,45 @@ export class ProjectsHandler {
         const isNewProject = !fs.existsSync(projectPath);
         const existingGit = !isNewProject && fs.existsSync(nodePath.join(projectPath, ".git"));
 
-        console.log(`[ProjectsHandler.startWizard] userId=${userId}, absPath="${absPathResolved}", projectName="${projectName}", isNewProject=${isNewProject}, existingGit=${existingGit}`);
+        // Use folder name directly if available, skip name step
+        const finalName = projectName !== "workspace" ? projectName : undefined;
 
-        this.wizardState.set(userId, {
-            step: "name",
-            absPath: absPathResolved,
-            projectName: projectName !== "workspace" ? projectName : undefined,
-            existingGit,
-            isNewProject,
-        });
+        if (finalName) {
+            // Skip name step, go directly to git
+            this.wizardState.set(userId, {
+                step: "git",
+                absPath: absPathResolved,
+                projectName: finalName,
+                existingGit,
+                isNewProject,
+            });
 
-        console.log(`[ProjectsHandler.startWizard] Wizard state saved for userId=${userId}, current wizardState.size=${this.wizardState.size}`);
-
-        await ctx.deleteMessage().catch(() => {});
-
-        if (projectName !== "workspace") {
-            // Use existing folder name as default
-            await this.askWizardName(ctx, userId, projectName);
+            await ctx.deleteMessage().catch(() => {});
+            
+            if (!isNewProject && existingGit) {
+                // Skip git too, go to model
+                const wizard = this.wizardState.get(userId)!;
+                wizard.gitSource = "existing";
+                wizard.step = "model";
+                await ctx.reply(
+                    `✅ Proyecto: <b>${escapeHtml(finalName)}</b>\n` +
+                    `Git ya configurado.\n\nContinuando...`,
+                    { parse_mode: "HTML" }
+                );
+                await this.askWizardModel(ctx, userId);
+            } else {
+                await this.askWizardGit(ctx, userId);
+            }
         } else {
+            // No folder name, ask for name
+            this.wizardState.set(userId, {
+                step: "name",
+                absPath: absPathResolved,
+                existingGit,
+                isNewProject,
+            });
+
+            await ctx.deleteMessage().catch(() => {});
             await this.askWizardName(ctx, userId);
         }
     }
@@ -472,13 +494,17 @@ export class ProjectsHandler {
         const wizard = this.wizardState.get(userId);
         if (!wizard) return;
 
-        const keyboard = new InlineKeyboard()
-            .text("❌ Cancelar", `proj:cancel`);
+        const keyboard = new InlineKeyboard();
+
+        if (defaultName) {
+            keyboard.text(`✅ Usar "${escapeHtml(defaultName.slice(0, 20))}"`, `proj:wizard-use-default`).row();
+        }
+        keyboard.text("❌ Cancelar", `proj:cancel`);
 
         const msg = defaultName
             ? `📝 <b>Step 1/4: Nombre del proyecto</b>\n\n` +
-              `Usar nombre del folder: <b>${escapeHtml(defaultName)}</b>\n\n` +
-              `O escribir otro nombre:`
+              `Nombre sugerido: <b>${escapeHtml(defaultName)}</b>\n\n` +
+              `Pulsa ✅ para usarlo o escribe otro:`
             : `📝 <b>Step 1/4: Nombre del proyecto</b>\n\n` +
               `Escribe el nombre del proyecto:`;
 
@@ -486,34 +512,37 @@ export class ProjectsHandler {
     }
 
     async handleWizardNameText(ctx: Context): Promise<void> {
+        console.log(`[ProjectsHandler.handleWizardNameText] ENTER`);
         const userId = ctx.from?.id;
-        console.log(`[ProjectsHandler.handleWizardNameText] ENTER: userId=${userId || 'N/A'}`);
+        console.log(`[ProjectsHandler.handleWizardNameText] userId=${userId || 'N/A'}`);
         if (!userId) return;
 
         const wizard = this.wizardState.get(userId);
-        console.log(`[ProjectsHandler.handleWizardNameText] Wizard state: exists=${!!wizard}, step=${wizard?.step || 'N/A'}, wizardState.size=${this.wizardState.size}`);
+        console.log(`[ProjectsHandler.handleWizardNameText] wizard=${wizard ? `exists(step=${wizard.step})` : 'null'}`);
         if (!wizard || wizard.step !== "name") {
-            console.log(`[ProjectsHandler.handleWizardNameText] EARLY RETURN: wizard invalid or step not 'name'`);
+            console.log(`[ProjectsHandler.handleWizardNameText] RETURN: wizard invalid or step not 'name'`);
             return;
         }
 
         const name = ctx.message?.text?.trim();
-        console.log(`[ProjectsHandler.handleWizardNameText] User input: "${name || 'N/A'}"`);
+        console.log(`[ProjectsHandler.handleWizardNameText] name="${name || 'N/A'}"`);
         if (!name) {
             await ctx.reply("❌ Nombre vacío.", { parse_mode: "HTML" });
             return;
         }
 
         wizard.projectName = name;
-        console.log(`[ProjectsHandler.handleWizardNameText] Name saved: "${name}", continuing to git step...`);
+        console.log(`[ProjectsHandler.handleWizardNameText] projectName set to "${name}"`);
         
         // Re-check project status with new name
         const projectPath = nodePath.join(wizard.absPath, name);
         wizard.isNewProject = !fs.existsSync(projectPath);
         wizard.existingGit = !wizard.isNewProject && fs.existsSync(nodePath.join(projectPath, ".git"));
+        console.log(`[ProjectsHandler.handleWizardNameText] projectPath="${projectPath}", isNewProject=${wizard.isNewProject}, existingGit=${wizard.existingGit}`);
 
         // Skip Git step if project already exists with git
         if (!wizard.isNewProject && wizard.existingGit) {
+            console.log(`[ProjectsHandler.handleWizardNameText] Git exists → skipping to model`);
             wizard.gitSource = "existing";
             wizard.step = "model";
             await ctx.reply(
@@ -523,10 +552,55 @@ export class ProjectsHandler {
             );
             await this.askWizardModel(ctx, userId);
         } else {
+            console.log(`[ProjectsHandler.handleWizardNameText] → going to git step`);
             wizard.step = "git";
             await this.askWizardGit(ctx, userId);
         }
-        console.log(`[ProjectsHandler.handleWizardNameText] Wizard step updated to: ${wizard.step}`);
+    }
+
+    // ─── proj:wizard-use-default — Use default folder name ────────────────────
+
+    async handleWizardUseDefaultName(ctx: Context): Promise<void> {
+        console.log(`[ProjectsHandler.handleWizardUseDefaultName] ENTER`);
+        await ctx.answerCallbackQuery();
+        const userId = ctx.from?.id;
+        console.log(`[ProjectsHandler.handleWizardUseDefaultName] userId=${userId || 'N/A'}`);
+        if (!userId) return;
+
+        const wizard = this.wizardState.get(userId);
+        console.log(`[ProjectsHandler.handleWizardUseDefaultName] wizard exists=${!!wizard}, defaultFolderName="${wizard?.defaultFolderName || 'N/A'}"`);
+        if (!wizard || !wizard.defaultFolderName) {
+            await ctx.reply("❌ Error: nombre no disponible.", { parse_mode: "HTML" });
+            return;
+        }
+
+        console.log(`[ProjectsHandler.handleWizardUseDefaultName] Using default name: "${wizard.defaultFolderName}"`);
+        wizard.projectName = wizard.defaultFolderName;
+        
+        // Re-check project status
+        const projectPath = nodePath.join(wizard.absPath, wizard.projectName);
+        wizard.isNewProject = !fs.existsSync(projectPath);
+        wizard.existingGit = !wizard.isNewProject && fs.existsSync(nodePath.join(projectPath, ".git"));
+        console.log(`[ProjectsHandler.handleWizardUseDefaultName] projectPath="${projectPath}", isNewProject=${wizard.isNewProject}, existingGit=${wizard.existingGit}`);
+
+        await ctx.deleteMessage().catch(() => {});
+
+        // Skip Git step if project already exists with git
+        if (!wizard.isNewProject && wizard.existingGit) {
+            console.log(`[ProjectsHandler.handleWizardUseDefaultName] Git exists → skipping to model step`);
+            wizard.gitSource = "existing";
+            wizard.step = "model";
+            await ctx.reply(
+                `✅ Git ya configurado en proyecto existente.\n` +
+                `Continuando sin modificar repo...`,
+                { parse_mode: "HTML" }
+            );
+            await this.askWizardModel(ctx, userId);
+        } else {
+            console.log(`[ProjectsHandler.handleWizardUseDefaultName] → going to git step`);
+            wizard.step = "git";
+            await this.askWizardGit(ctx, userId);
+        }
     }
 
     // ─── Wizard Step 2: Git ─────────────────────────────────────────────────────
@@ -541,11 +615,13 @@ export class ProjectsHandler {
         // Different options based on project state
         const keyboard = new InlineKeyboard();
         
+        let msg: string;
+
         if (!wizard.isNewProject && !wizard.existingGit) {
             // Existing project WITHOUT git → only local init
             keyboard.text("✅ Inicializar git local", `proj:wizard-git:local`).row();
             keyboard.text("❌ Sin git", `proj:wizard-git:none`).row();
-            const msg = 
+            msg = 
                 `🔀 <b>Step 2/4: Git (Proyecto existente)</b>\n\n` +
                 `Nombre: <b>${escapeHtml(wizard.projectName!)}</b>\n` +
                 `Folder ya existe SIN git.\n\n` +
@@ -555,10 +631,14 @@ export class ProjectsHandler {
             keyboard.text("❌ Sin git", `proj:wizard-git:none`).row();
             if (isGithub) keyboard.text("🐙 GitHub", `proj:wizard-git:github`).row();
             if (isGitea) keyboard.text("☕ Gitea", `proj:wizard-git:gitea`).row();
-            const msg = 
+            msg = 
                 `🔀 <b>Step 2/4: Repositorio Git</b>\n\n` +
                 `Nombre: <b>${escapeHtml(wizard.projectName!)}</b>\n\n` +
                 `¿Crear repositorio remoto?`;
+        } else {
+            // Fallback (shouldn't happen)
+            keyboard.text("❌ Sin git", `proj:wizard-git:none`).row();
+            msg = `🔀 <b>Step 2/4: Repositorio Git</b>\n\n¿Configurar git?`;
         }
         
         keyboard.text("⬅️ Atrás", `proj:wizard-back:name`);

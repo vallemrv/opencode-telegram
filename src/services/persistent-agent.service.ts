@@ -493,12 +493,12 @@ export class PersistentAgentService {
         const workdir = resolveDir(agent.workdir);
         console.log(`[PersistentAgent.createSession] Creating session for agent "${agent.name}" at ${baseUrl}`);
 
-        let modelConfig: { providerID: string; modelID: string } | undefined;
+        let modelConfig: { id: string; providerID: string; modelID: string } | undefined;
         if (agent.model) {
             const parts = agent.model.split("/");
             if (parts.length === 2) {
-                modelConfig = { providerID: parts[0], modelID: parts[1] };
-                console.log(`[PersistentAgent.createSession] Using model: ${modelConfig.providerID}/${modelConfig.modelID}`);
+                modelConfig = { id: agent.model, providerID: parts[0], modelID: parts[1] };
+                console.log(`[PersistentAgent.createSession] Using model: ${modelConfig.id}`);
             }
         }
 
@@ -1179,10 +1179,53 @@ export class PersistentAgentService {
                 // Case 2: bot restarted while session was busy — adopt it
                 await this.adoptBusySession(agent, sessionId);
             } else {
-                // Case 3: session exists but is idle and we have no pending prompt.
-                // If there's a persisted heartbeat, the result was produced while the
-                // bot was down and can no longer be correlated — treat as lost.
-                await this.notifyLostPromptIfAny(agent);
+                // Case 3: session exists and is idle, no pending prompt.
+                // The bot restarted while opencode was working and finished before we reconnected.
+                // If there's a persisted heartbeat, try to recover the last assistant message
+                // and deliver it instead of reporting it as lost.
+                const hb = this.heartbeatLookup ? this.heartbeatLookup(agent.id) : undefined;
+                if (hb && this.onAdoptSessionResult) {
+                    try {
+                        console.log(`[PersistentAgent] recoverPendingPrompt: session "${sessionId}" finished while bot was down — recovering result for agent "${agent.name}"`);
+                        const host = agent.host || 'localhost';
+                        const msgRes = await fetch(
+                            `http://${host}:${agent.port}/session/${sessionId}/message`,
+                            { signal: AbortSignal.timeout(10000) }
+                        );
+                        if (msgRes.ok) {
+                            const messages: any[] = await msgRes.json();
+                            const lastAssistant = [...messages]
+                                .reverse()
+                                .find((m: any) => m.role === "assistant" || m.info?.role === "assistant");
+                            if (lastAssistant) {
+                                const parts: any[] = lastAssistant.parts || [];
+                                const text = parts
+                                    .filter((p: any) => p.type === "text" && p.text)
+                                    .map((p: any) => p.text as string)
+                                    .join("").trim();
+                                const hasTools = parts.some((p: any) => p.type === "tool-invocation");
+                                const output = text
+                                    ? text
+                                    : hasTools
+                                        ? "✅ Completado (ejecutó herramientas pero no generó texto)"
+                                        : "⚠️ Sin salida";
+                                // Clear heartbeat entry before delivering result
+                                if (this.onHeartbeatClear) await this.onHeartbeatClear(agent.id).catch(() => {});
+                                await this.onAdoptSessionResult(agent.id, hb.chatId, hb.msgId, { output, sessionId }).catch((err: unknown) =>
+                                    console.error(`[PersistentAgent] recoverPendingPrompt: onAdoptSessionResult error for "${agent.name}":`, err)
+                                );
+                                console.log(`[PersistentAgent] recoverPendingPrompt: recovered and delivered result for agent "${agent.name}"`);
+                                return;
+                            }
+                        }
+                    } catch (err) {
+                        console.error(`[PersistentAgent] recoverPendingPrompt: failed to recover result for "${agent.name}":`, err);
+                    }
+                    // Could not recover — fall back to "lost" notification
+                    await this.notifyLostPromptIfAny(agent);
+                } else {
+                    await this.notifyLostPromptIfAny(agent);
+                }
             }
         } catch (err) {
             console.debug(`[PersistentAgent] recoverPendingPrompt for "${agent.name}": ${err}`);
@@ -1490,12 +1533,12 @@ export class PersistentAgentService {
         }
 
         // Build model config
-        let modelConfig: { providerID: string; modelID: string } | undefined;
+        let modelConfig: { id: string; providerID: string; modelID: string } | undefined;
         if (agent.model) {
             const parts = agent.model.split("/");
             if (parts.length === 2) {
-                modelConfig = { providerID: parts[0], modelID: parts[1] };
-                console.log(`[PersistentAgent] Using model from agent: ${modelConfig.providerID}/${modelConfig.modelID}`);
+                modelConfig = { id: agent.model, providerID: parts[0], modelID: parts[1] };
+                console.log(`[PersistentAgent] Using model from agent: ${modelConfig.id}`);
             } else {
                 console.warn(`[PersistentAgent] Invalid model format: ${agent.model}`);
             }
