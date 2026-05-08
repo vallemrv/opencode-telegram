@@ -12,7 +12,7 @@ import * as nodePath from "path";
 import * as os from "os";
 import { randomUUID } from "crypto";
 import type { PersistentAgent } from "../../../services/agent-db.service.js";
-import { pickPort, resolveDir } from "../../../services/persistent-agent.service.js";
+import { pickPort, resolveDir, findOpencodeCmd } from "../../../services/persistent-agent.service.js";
 import { escapeHtml } from "../event-handlers/utils.js";
 import type { BotContext } from "./bot-context.js";
 
@@ -710,30 +710,50 @@ export class ProjectsHandler {
         const wizard = this.wizardState.get(userId);
         if (!wizard) return;
 
-        const models = this.ctx.configService.getAvailableModels();
-        const keyboard = new InlineKeyboard();
-
-        // Show top 5 models
-        const topModels = models.slice(0, 5);
-        for (const model of topModels) {
-            const parts = model.split("/");
-            const providerName = parts[0] || "";
-            const modelName = parts.slice(1).join("/") || model;
-            const shortModel = modelName.length > 20 ? modelName.slice(0, 17) + "..." : modelName;
-            keyboard.text(`${providerName}/${shortModel}`, `proj:wizard-model:${model}`).row();
+        // Fetch models from opencode CLI (same approach as ModelsHandler)
+        let modelsCache: Record<string, string[]> = {};
+        try {
+            const opencodeCmd = await findOpencodeCmd();
+            const output = execSync(`"${opencodeCmd}" models 2>/dev/null`, { encoding: "utf-8" });
+            for (const line of output.trim().split("\n")) {
+                const trimmed = line.trim();
+                if (trimmed && trimmed.includes("/")) {
+                    const [provider, ...modelParts] = trimmed.split("/");
+                    const model = modelParts.join("/");
+                    if (!modelsCache[provider]) modelsCache[provider] = [];
+                    modelsCache[provider].push(`${provider}/${model}`);
+                }
+            }
+        } catch (err) {
+            console.error("askWizardModel: error fetching models", err);
         }
 
-        keyboard.text("📝 Otro modelo", `proj:wizard-model-custom`).row();
-        
-        // Adjust back button based on wizard flow
+        const providers = Object.keys(modelsCache).sort();
+
+        // Store selection state reusing modelSelection map with sentinel agentId
+        this.ctx.modelSelection.set(userId, {
+            agentId: `wizard:${userId}`,
+            modelsCache,
+            providers,
+        });
+
+        const keyboard = new InlineKeyboard();
+        for (const provider of providers) {
+            const shortKey = this.ctx.makeShortKey("wmdl_pr_");
+            this.ctx.modelIndex.set(shortKey, provider);
+            keyboard.text(provider, shortKey).row();
+        }
+
+        keyboard.text("📝 Escribir manualmente", `proj:wizard-model-custom`).row();
+
+        // Back button
         if (wizard.existingGit && !wizard.isNewProject) {
-            // Git was skipped, back goes to name
             keyboard.text("⬅️ Atrás", `proj:wizard-back:name`);
         } else {
             keyboard.text("⬅️ Atrás", `proj:wizard-back:git`);
         }
 
-        const gitStatus = wizard.gitSource === "existing" 
+        const gitStatus = wizard.gitSource === "existing"
             ? "✅ Git existente (sin cambios)"
             : wizard.gitSource === "local"
             ? "✅ Inicializar git local"
@@ -747,9 +767,78 @@ export class ProjectsHandler {
             `🤖 <b>Step 3/4: Modelo</b>\n\n` +
             `Nombre: <b>${escapeHtml(wizard.projectName!)}</b>\n` +
             `Git: ${gitStatus}\n\n` +
-            `Elige modelo:`,
+            `Elige proveedor:`,
             { parse_mode: "HTML", reply_markup: keyboard }
         );
+    }
+
+    // ─── Wizard Model picker callbacks (wmdl_*) ────────────────────────────────
+
+    async handleWizardModelPicker(ctx: Context): Promise<void> {
+        await ctx.answerCallbackQuery();
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const data = ctx.callbackQuery?.data;
+        if (!data) return;
+
+        const wizard = this.wizardState.get(userId);
+        if (!wizard) { await ctx.editMessageText("❌ Sesión expirada. Reinicia el wizard."); return; }
+
+        const state = this.ctx.modelSelection.get(userId);
+
+        // Provider selected — show model list
+        if (data.startsWith("wmdl_pr_")) {
+            if (!state) { await ctx.editMessageText("❌ Sesión expirada. Reinicia el wizard."); return; }
+            const provider = this.ctx.modelIndex.get(data);
+            if (!provider) { await ctx.editMessageText("❌ Proveedor no encontrado."); return; }
+
+            const models = state.modelsCache[provider] || [];
+            const keyboard = new InlineKeyboard();
+            for (const model of models) {
+                const modelName = model.split("/").slice(1).join("/");
+                const shortKey = this.ctx.makeShortKey("wmdl_mo_");
+                this.ctx.modelIndex.set(shortKey, model);
+                keyboard.text(modelName, shortKey).row();
+            }
+            keyboard.text("← Volver", "wmdl_back").row();
+
+            state.currentProvider = provider;
+            await ctx.editMessageText(
+                `🧠 <b>${escapeHtml(provider)}</b> — elige modelo:`,
+                { parse_mode: "HTML", reply_markup: keyboard }
+            );
+            return;
+        }
+
+        // Back to provider list
+        if (data === "wmdl_back") {
+            if (!state) { await ctx.editMessageText("❌ Sesión expirada. Reinicia el wizard."); return; }
+            const keyboard = new InlineKeyboard();
+            for (const provider of state.providers) {
+                const shortKey = this.ctx.makeShortKey("wmdl_pr_");
+                this.ctx.modelIndex.set(shortKey, provider);
+                keyboard.text(provider, shortKey).row();
+            }
+            keyboard.text("📝 Escribir manualmente", `proj:wizard-model-custom`).row();
+            await ctx.editMessageText(
+                `🤖 <b>Step 3/4: Modelo</b>\n\nElige proveedor:`,
+                { parse_mode: "HTML", reply_markup: keyboard }
+            );
+            return;
+        }
+
+        // Model selected
+        if (data.startsWith("wmdl_mo_")) {
+            const model = this.ctx.modelIndex.get(data);
+            if (!model) { await ctx.editMessageText("❌ Modelo no encontrado."); return; }
+
+            this.ctx.modelSelection.delete(userId);
+            wizard.model = model;
+            wizard.step = "confirm";
+            await this.askWizardConfirm(ctx, userId);
+            return;
+        }
     }
 
     async handleWizardModel(ctx: Context): Promise<void> {

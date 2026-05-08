@@ -494,6 +494,7 @@ export class OpenCodeBot implements BotContext {
         bot.callbackQuery(/^proj:wizard-use-default$/, AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardUseDefaultName.bind(this.projectsHandler));
         bot.callbackQuery(/^proj:wizard-git:/,     AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardGit.bind(this.projectsHandler));
         bot.callbackQuery(/^proj:wizard-model:/,   AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardModel.bind(this.projectsHandler));
+        bot.callbackQuery(/^wmdl_/,                AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardModelPicker.bind(this.projectsHandler));
         bot.callbackQuery(/^proj:wizard-confirm/,  AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardConfirm.bind(this.projectsHandler));
         bot.callbackQuery(/^proj:wizard-back:/,    AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardBack.bind(this.projectsHandler));
         bot.callbackQuery(/^proj:cancel$/,         AccessControlMiddleware.requireAccess, this.projectsHandler.handleWizardCancel.bind(this.projectsHandler));
