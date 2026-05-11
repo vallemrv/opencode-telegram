@@ -893,11 +893,15 @@ export class PersistentAgentService {
                             // Case 3: event is for a different session AND no pending Telegram prompt.
                             // This is a session created from web/CLI with a different sessionId.
                             // Treat as external session and notify user.
-                            console.log(`[PersistentAgent] session.idle for UNREGISTERED session "${idleSessionId}" (different from "${mySessionId || 'N/A'}") — treating as external web/CLI session for agent "${agent.name}"`);
+                            console.log(`[PersistentAgent] session.idle for UNREGISTERED session "${idleSessionId}" (different from "${mySessionId || 'N/A'}') — treating as external web/CLI session for agent "${agent.name}"`);
                             this.notifyExternalSessionIdle(agent, idleSessionId).catch(err =>
                                 console.error(`[PersistentAgent] notifyExternalSessionIdle error:`, err)
                             );
                         }
+                    } else if (type === "message.updated") {
+                        // Log message.updated events for debugging
+                        const msgSessionId = props?.sessionID ?? props?.id ?? "";
+                        console.log(`[PersistentAgent] message.updated event: session="${msgSessionId}"`);
                     }
                 }
             } catch (err) {
