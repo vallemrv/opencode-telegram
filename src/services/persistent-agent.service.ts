@@ -206,6 +206,7 @@ interface PendingPrompt {
     resolve: (result: AgentSendResult) => void;
     reject: (err: Error) => void;
     startedAt: number;
+    safetyTimeout?: NodeJS.Timeout; // Safety timeout to prevent indefinite hanging
 }
 
 export class PersistentAgentService {
@@ -247,6 +248,9 @@ export class PersistentAgentService {
 
     /** Map of agentId → heartbeat timer handle (only active while prompt is in-flight) */
     private heartbeatTimers: Map<string, NodeJS.Timeout> = new Map();
+
+    /** Map of agentId → safety timeout handle (prevents indefinite hanging) */
+    private safetyTimers: Map<string, NodeJS.Timeout> = new Map();
 
     /** Map of agentId → timestamp (ms) of last SSE event received */
     private lastSseEventAt: Map<string, number> = new Map();
@@ -934,12 +938,20 @@ export class PersistentAgentService {
         }
         if (sessionId && pending.sessionId && sessionId !== pending.sessionId) {
             console.log(`[PersistentAgent.resolvePromptFromIdle] SessionId mismatch: event="${sessionId}", pending="${pending.sessionId}"`);
+            // CRITICAL FIX: Resolve the pending prompt even if sessionId doesn't match
+            // This prevents the bot from getting stuck when opencode reports a different sessionId
+            console.log(`[PersistentAgent.resolvePromptFromIdle] Resolving pending prompt anyway to prevent bot lock`);
+            this.clearSafetyTimer(agent.id);
+            this.stopHeartbeat(agent.id);
+            this.pendingPrompts.delete(agent.id);
+            pending.resolve({ output: "⚠️ Session ID mismatch - task may have completed", sessionId: pending.sessionId || sessionId });
             return;
         }
 
         console.log(`[PersistentAgent.resolvePromptFromIdle] Resolving prompt for agent "${agent.name}"`);
 
-        // Stop heartbeat — response arrived
+        // Clear safety timer and stop heartbeat — response arrived
+        this.clearSafetyTimer(agent.id);
         this.stopHeartbeat(agent.id);
         this.pendingPrompts.delete(agent.id);
         // Clear child session tracking — the whole task is done
@@ -1382,6 +1394,14 @@ export class PersistentAgentService {
         }
     }
 
+    private clearSafetyTimer(agentId: string): void {
+        const timer = this.safetyTimers.get(agentId);
+        if (timer) {
+            clearTimeout(timer);
+            this.safetyTimers.delete(agentId);
+        }
+    }
+
     private async fireHeartbeat(agent: PersistentAgent): Promise<void> {
         if (!this.onHeartbeat) return;
 
@@ -1611,12 +1631,29 @@ export class PersistentAgentService {
             requestBody.model = modelConfig;
         }
 
+        const SAFETY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+        
         const result = await new Promise<AgentSendResult>((resolve, reject) => {
+            // SAFETY TIMEOUT: Maximum time to wait for session.idle before auto-resolving
+            const safetyTimeout = setTimeout(() => {
+                const pending = this.pendingPrompts.get(agent.id);
+                if (pending) {
+                    console.error(`[PersistentAgent] SAFETY TIMEOUT triggered for agent "${agent.name}" after ${SAFETY_TIMEOUT_MS / 60000} minutes - auto-resolving`);
+                    this.stopHeartbeat(agent.id);
+                    this.pendingPrompts.delete(agent.id);
+                    pending.resolve({ 
+                        output: `⚠️ Timeout: No se recibió respuesta de OpenCode después de ${SAFETY_TIMEOUT_MS / 60000} minutos. El prompt puede haberse completado pero el evento no llegó. Usa /esc para cancelar y reintentar.`, 
+                        sessionId 
+                    });
+                }
+            }, SAFETY_TIMEOUT_MS);
+
             this.pendingPrompts.set(agent.id, {
                 sessionId,
                 resolve,
                 reject,
                 startedAt: Date.now(),
+                safetyTimeout,
             });
 
             // Send prompt async (fire and forget) — response comes via SSE session.idle
@@ -1627,6 +1664,8 @@ export class PersistentAgentService {
                 signal: AbortSignal.timeout(10000),
             }).then(res => {
                 if (!res.ok) {
+                    const pending = this.pendingPrompts.get(agent.id);
+                    if (pending?.safetyTimeout) clearTimeout(pending.safetyTimeout);
                     this.pendingPrompts.delete(agent.id);
                     this.stopHeartbeat(agent.id);
                     console.error(`[PersistentAgent] prompt_async HTTP error ${res.status} for agent "${agent.name}"`);
@@ -1637,6 +1676,8 @@ export class PersistentAgentService {
                     this.startHeartbeat(agent);
                 }
             }).catch(err => {
+                const pending = this.pendingPrompts.get(agent.id);
+                if (pending?.safetyTimeout) clearTimeout(pending.safetyTimeout);
                 this.pendingPrompts.delete(agent.id);
                 this.stopHeartbeat(agent.id);
                 console.error(`[PersistentAgent] prompt_async fetch error for agent "${agent.name}":`, err);
@@ -1672,6 +1713,7 @@ export class PersistentAgentService {
 
         if (pending) {
             this.pendingPrompts.delete(agentId);
+            this.clearSafetyTimer(agentId);
             this.stopHeartbeat(agentId);
 
             // Fire the abort request to opencode. We do NOT await it before resolving
