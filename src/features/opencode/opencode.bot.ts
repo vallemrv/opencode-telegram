@@ -148,11 +148,29 @@ export class OpenCodeBot implements BotContext {
 
         console.log(`[OpenCodeBot.editOrSendResult] Agent "${agent.name}" - chatId: ${chatId}, msgId: ${msgId}, body length: ${body.length}`);
 
+        let deleted = false;
         try {
             await this.bot!.api.deleteMessage(chatId, msgId);
             console.log(`[OpenCodeBot.editOrSendResult] Deleted placeholder message ${msgId}`);
+            deleted = true;
         } catch (err) {
             console.warn(`[OpenCodeBot.editOrSendResult] Failed to delete message ${msgId}:`, err);
+        }
+
+        // If deletion failed, try to edit the message to show completion status
+        // This ensures the user doesn't see a stale "working..." message
+        if (!deleted) {
+            try {
+                await this.bot!.api.editMessageText(
+                    chatId,
+                    msgId,
+                    `✅ <b>${escapeHtml(agent.name)}</b> — completado`,
+                    { parse_mode: "HTML" }
+                );
+                console.log(`[OpenCodeBot.editOrSendResult] Updated message ${msgId} to show completion`);
+            } catch (editErr) {
+                console.warn(`[OpenCodeBot.editOrSendResult] Failed to edit message ${msgId}:`, editErr);
+            }
         }
 
         await this.sendResultMessage(chatId, header, body, agent.name, MAX);
