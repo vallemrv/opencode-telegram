@@ -4,7 +4,7 @@ import { AgentDbService } from './services/agent-db.service.js';
 import { PersistentAgentService } from './services/persistent-agent.service.js';
 import { OpenCodeBot } from './features/opencode/opencode.bot.js';
 import { AccessControlMiddleware } from './middleware/access-control.middleware.js';
-import { escapeHtml } from './features/opencode/event-handlers/utils.js';
+import { escapeHtml } from './features/opencode/utils.js';
 import dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';

@@ -273,6 +273,13 @@ export class PersistentAgentService {
     private sessionIds: Map<string, string> = new Map();
 
     /**
+     * Per-agent mutex to prevent concurrent ensureSession calls.
+     * Each agent has a Promise that resolves when the current ensureSession completes.
+     * This prevents race conditions where multiple callers create duplicate sessions.
+     */
+    private ensureSessionLocks: Map<string, Promise<string>> = new Map();
+
+    /**
      * Set of question IDs already forwarded to the bot.
      * Prevents duplicate question messages when the SSE stream reconnects.
      */
@@ -443,8 +450,33 @@ export class PersistentAgentService {
 
     /**
      * Ensures the agent has a live long-lived OpenCode session.
+     * Uses a per-agent mutex to prevent concurrent calls that could create duplicate sessions.
      */
     private async ensureSession(agent: PersistentAgent): Promise<string> {
+        // Check if there's already an in-progress ensureSession call for this agent
+        const existingLock = this.ensureSessionLocks.get(agent.id);
+        if (existingLock) {
+            console.log(`[PersistentAgent.ensureSession] Waiting for existing ensureSession call for agent "${agent.name}"`);
+            return existingLock;
+        }
+
+        // Create a new lock promise
+        const lockPromise = this.ensureSessionInternal(agent);
+        this.ensureSessionLocks.set(agent.id, lockPromise);
+
+        try {
+            const sessionId = await lockPromise;
+            return sessionId;
+        } finally {
+            // Clear the lock when done
+            this.ensureSessionLocks.delete(agent.id);
+        }
+    }
+
+    /**
+     * Internal implementation of ensureSession (called after acquiring lock).
+     */
+    private async ensureSessionInternal(agent: PersistentAgent): Promise<string> {
         const host = agent.host || 'localhost';
         const baseUrl = `http://${host}:${agent.port}`;
         const cachedId = this.sessionIds.get(agent.id) ?? agent.sessionId;
@@ -453,30 +485,49 @@ export class PersistentAgentService {
         console.log(`[PersistentAgent.ensureSession] Agent "${agent.name}" (${agent.id}), host: ${host}, port: ${agent.port}, cachedSessionId: ${cachedId || 'N/A'}`);
 
         if (cachedId) {
-            try {
-                console.log(`[PersistentAgent.ensureSession] Checking if existing session ${cachedId} is still valid`);
-                const res = await fetch(`${baseUrl}/session/${cachedId}`, {
-                    signal: AbortSignal.timeout(5000),
-                });
-                if (res.ok) {
-                    const sess: any = await res.json();
-                    // Validate that the session belongs to this agent's workdir.
-                    // Normalize both paths to avoid false mismatches (e.g. symlinks, trailing slash).
-                    const actualDir = typeof sess.directory === "string" ? resolveDir(sess.directory) : "";
-                    if (actualDir && actualDir !== expectedDir) {
-                        console.log(`[PersistentAgent.ensureSession] Session ${cachedId} belongs to a different directory (${actualDir} vs ${expectedDir}), creating new session`);
+            // Try to validate the session with retries on network errors
+            const maxRetries = 2;
+            for (let attempt = 0; attempt < maxRetries; attempt++) {
+                try {
+                    console.log(`[PersistentAgent.ensureSession] Checking if existing session ${cachedId} is still valid (attempt ${attempt + 1}/${maxRetries})`);
+                    const res = await fetch(`${baseUrl}/session/${cachedId}`, {
+                        signal: AbortSignal.timeout(5000),
+                    });
+                    if (res.ok) {
+                        const sess: any = await res.json();
+                        // Validate that the session belongs to this agent's workdir.
+                        // Normalize both paths to avoid false mismatches (e.g. symlinks, trailing slash).
+                        const actualDir = typeof sess.directory === "string" ? resolveDir(sess.directory) : "";
+                        if (actualDir && actualDir !== expectedDir) {
+                            console.log(`[PersistentAgent.ensureSession] Session ${cachedId} belongs to a different directory (${actualDir} vs ${expectedDir}), creating new session`);
+                            break; // Exit retry loop to create new session
+                        } else {
+                            this.sessionIds.set(agent.id, cachedId);
+                            console.log(`[PersistentAgent.ensureSession] Existing session ${cachedId} is valid`);
+                            return cachedId;
+                        }
+                    } else if (res.status === 404) {
+                        // Session truly doesn't exist - no need to retry
+                        console.log(`[PersistentAgent.ensureSession] Session ${cachedId} not found (404), creating new session`);
+                        break;
                     } else {
-                        this.sessionIds.set(agent.id, cachedId);
-                        console.log(`[PersistentAgent.ensureSession] Existing session ${cachedId} is valid`);
-                        return cachedId;
+                        // Other HTTP error - retry if we have attempts left
+                        console.log(`[PersistentAgent.ensureSession] Session ${cachedId} returned status ${res.status}, retrying...`);
+                        if (attempt < maxRetries - 1) {
+                            await new Promise(r => setTimeout(r, 1000));
+                            continue;
+                        }
                     }
-                } else {
-                    console.log(`[PersistentAgent.ensureSession] Existing session ${cachedId} returned status ${res.status}, creating new session`);
+                } catch (err: any) {
+                    // Network/timeout error - retry if we have attempts left
+                    console.log(`[PersistentAgent.ensureSession] Error checking session ${cachedId} (attempt ${attempt + 1}): ${err.message || err}`);
+                    if (attempt < maxRetries - 1) {
+                        await new Promise(r => setTimeout(r, 1000));
+                        continue;
+                    }
                 }
-            } catch (err: any) {
-                console.log(`[PersistentAgent.ensureSession] Error checking session ${cachedId}: ${err.message || err}`);
             }
-            console.log(`[PersistentAgent.ensureSession] Session ${cachedId} for agent "${agent.name}" is gone or mismatched, creating a new one`);
+            console.log(`[PersistentAgent.ensureSession] Session ${cachedId} for agent "${agent.name}" is gone or mismatched after ${maxRetries} attempts, creating a new one`);
         }
 
         const sessionId = await this.createSession(agent);
@@ -503,11 +554,12 @@ export class PersistentAgentService {
         }
 
         // Create session with directory in query parameter (per SDK spec)
+        // Don't set initial title - let OpenCode/opencode auto-generate based on conversation
         const createRes = await fetch(`${baseUrl}/session?directory=${encodeURIComponent(workdir)}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                title: `tg-${agent.name}`,
+                title: "", // Empty title - OpenCode will auto-generate from conversation content
                 system: agent.role || undefined,
                 model: modelConfig,
                 permission: [
@@ -1802,14 +1854,40 @@ export class PersistentAgentService {
     /**
      * Create a new OpenCode session for the given agent and return its ID.
      * Does NOT set it as active — caller decides.
+     * Uses the same lock as ensureSession to prevent concurrent session creation.
      */
     async createNewSession(agent: PersistentAgent): Promise<string> {
+        // Check if there's already an in-progress session creation call for this agent
+        const existingLock = this.ensureSessionLocks.get(agent.id);
+        if (existingLock) {
+            console.log(`[PersistentAgent.createNewSession] Waiting for existing session operation for agent "${agent.name}"`);
+            // Wait for it to complete but then create a new session anyway
+            // (the existing lock might be ensureSession which reuses, we want a fresh one)
+            try {
+                await existingLock;
+            } catch {}
+        }
+
         const running = await this.isServerRunning(agent);
         if (!running) {
             const started = await this.startAgent(agent);
             if (!started.success) throw new Error(`Agent server not running: ${started.message}`);
         }
-        return this.createSession(agent);
+
+        // Create a lock for this operation
+        const lockPromise = this.createSession(agent).then(sessionId => {
+            this.sessionIds.set(agent.id, sessionId);
+            this.agentDb.setSessionId(agent.id, sessionId);
+            console.log(`[PersistentAgent.createNewSession] Created new session ${sessionId} for agent "${agent.name}"`);
+            return sessionId;
+        });
+        this.ensureSessionLocks.set(agent.id, lockPromise);
+
+        try {
+            return await lockPromise;
+        } finally {
+            this.ensureSessionLocks.delete(agent.id);
+        }
     }
 
     // ─── Startup restore ──────────────────────────────────────────────────────

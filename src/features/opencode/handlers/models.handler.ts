@@ -5,7 +5,7 @@
 import { Context, InlineKeyboard } from "grammy";
 import { execSync } from "child_process";
 import { findOpencodeCmd } from "../../../services/persistent-agent.service.js";
-import { escapeHtml } from "../event-handlers/utils.js";
+import { escapeHtml } from "../utils.js";
 import type { BotContext } from "./bot-context.js";
 
 function getAgentBaseUrl(agent: { host?: string; port: number }): string {

@@ -11,7 +11,7 @@ import { Context, InlineKeyboard } from "grammy";
 import type { PersistentAgent } from "../../../services/agent-db.service.js";
 import { resolveDir } from "../../../services/persistent-agent.service.js";
 import { ErrorUtils } from "../../../utils/error.utils.js";
-import { escapeHtml } from "../event-handlers/utils.js";
+import { escapeHtml } from "../utils.js";
 import type { BotContext } from "./bot-context.js";
 
 function getAgentBaseUrl(agent: { host?: string; port: number }): string {
@@ -380,7 +380,13 @@ export class SessionHandler {
                 this.ctx.sessIndex.set(delKey, { agentId: agent.id, sessionId: s.id });
 
                 const isCurrent = s.id === currentSessionId;
-                const title = (s.title || s.id.slice(0, 8)).slice(0, 28);
+                // OpenCode/opencode stores auto-generated titles in different places:
+                // - s.title (basic title, may be "tg-xxx" from bot)
+                // - s.summary?.title (auto-generated from conversation)
+                // - s.info?.summary?.title (SDK structure)
+                const autoTitle = s.summary?.title || s.info?.summary?.title;
+                const baseTitle = autoTitle || s.title;
+                const title = (baseTitle || s.id.slice(0, 8)).slice(0, 28);
                 const label = isCurrent ? `🟢 ${title}` : title;
                 keyboard.text(label, actKey).text("🗑️", delKey).row();
             }

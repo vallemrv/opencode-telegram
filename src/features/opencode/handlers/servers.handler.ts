@@ -5,7 +5,7 @@
 import { Context, InlineKeyboard } from "grammy";
 import type { BotContext } from "./bot-context.js";
 import { resolveDir } from "../../../services/persistent-agent.service.js";
-import { escapeHtml } from "../event-handlers/utils.js";
+import { escapeHtml } from "../utils.js";
 
 export class ServersHandler {
     constructor(private readonly ctx: BotContext) {}

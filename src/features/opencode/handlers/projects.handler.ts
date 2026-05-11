@@ -13,7 +13,7 @@ import * as os from "os";
 import { randomUUID } from "crypto";
 import type { PersistentAgent } from "../../../services/agent-db.service.js";
 import { pickPort, resolveDir, findOpencodeCmd } from "../../../services/persistent-agent.service.js";
-import { escapeHtml } from "../event-handlers/utils.js";
+import { escapeHtml } from "../utils.js";
 import type { BotContext } from "./bot-context.js";
 
 // ─── Path helpers ─────────────────────────────────────────────────────────────

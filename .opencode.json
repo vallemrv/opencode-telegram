@@ -1,0 +1,31 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "data": {
+    "directory": ".opencode"
+  },
+  "providers": {
+    "openrouter": {
+      "apiKey": "${OPENROUTER_API_KEY}",
+      "disabled": false
+    }
+  },
+  "agents": {
+    "coder": {
+      "model": "openrouter/anthropic/claude-sonnet-4",
+      "maxTokens": 8000
+    },
+    "task": {
+      "model": "openrouter/anthropic/claude-sonnet-4",
+      "maxTokens": 8000
+    },
+    "title": {
+      "model": "openrouter/anthropic/claude-haiku-4",
+      "maxTokens": 100
+    }
+  },
+  "shell": {
+    "path": "/bin/bash",
+    "args": ["-l"]
+  },
+  "autoCompact": true
+}

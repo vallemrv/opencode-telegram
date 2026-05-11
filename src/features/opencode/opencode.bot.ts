@@ -31,7 +31,7 @@ import { PersistentAgentService } from "../../services/persistent-agent.service.
 import type { AgentSendResult } from "../../services/persistent-agent.service.js";
 import type { OnAdoptSessionCallback, OnAdoptSessionResultCallback, OnExternalSessionIdleCallback } from "../../services/persistent-agent.service.js";
 import { AccessControlMiddleware } from "../../middleware/access-control.middleware.js";
-import { formatAsHtml, escapeHtml } from "./event-handlers/utils.js";
+import { formatAsHtml, escapeHtml } from "./utils.js";
 import { TranscriptionService } from "../../services/transcription.service.js";
 import { SessionDbService } from "../../services/session-db.service.js";
 import { PersistentHeartbeatMap } from "../../services/persistent-map.js";
@@ -596,11 +596,30 @@ export class OpenCodeBot implements BotContext {
             const res = await fetch(`${baseUrl}/session/${sessionId}`, { signal: AbortSignal.timeout(5000) });
             if (!res.ok) return;
             const sess: any = await res.json();
-            if (!sess.title?.startsWith("tg-")) return;
+            
+            // Check if session has a meaningful title already (from OpenCode auto-generation)
+            // OpenCode stores auto-generated titles in: sess.summary?.title or sess.info?.summary?.title
+            const autoTitle = sess.summary?.title || sess.info?.summary?.title;
+            const currentTitle = sess.title || "";
+            
+            // Only rename if:
+            // 1. No auto-generated title exists (OpenCode hasn't processed yet)
+            // 2. Current title is empty or very short placeholder (< 5 chars)
+            if (autoTitle && autoTitle.length >= 5) {
+                console.log(`[OpenCodeBot] Session "${sessionId}" already has auto-generated title: "${autoTitle}"`);
+                return;
+            }
+            
+            if (currentTitle.length >= 5 && !currentTitle.startsWith("tg-")) {
+                console.log(`[OpenCodeBot] Session "${sessionId}" has meaningful title: "${currentTitle}"`);
+                return;
+            }
 
+            // Use first prompt as title if no meaningful title exists
             const newTitle = prompt.replace(/\s+/g, " ").trim().slice(0, 50);
             if (!newTitle) return;
 
+            console.log(`[OpenCodeBot] Setting initial title for session "${sessionId}": "${newTitle}"`);
             await fetch(`${baseUrl}/session/${sessionId}`, {
                 method: "PATCH",
                 headers: { "Content-Type": "application/json" },

@@ -11,7 +11,7 @@ import type { PersistentAgent } from "../../../services/agent-db.service.js";
 import type { AgentSendResult, HeartbeatSummary } from "../../../services/persistent-agent.service.js";
 import { ErrorUtils } from "../../../utils/error.utils.js";
 import { MessageUtils } from "../../../utils/message.utils.js";
-import { formatAsHtml, escapeHtml } from "../event-handlers/utils.js";
+import { formatAsHtml, escapeHtml } from "../utils.js";
 import type { BotContext } from "./bot-context.js";
 
 function getAgentBaseUrl(agent: { host?: string; port: number }): string {
@@ -518,7 +518,7 @@ async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<
 
         // Stats line
         const filesEdited = summary.filesModified;
-        text += `\n\n📊 ${summary.messageCount} mensajes · ${filesEdited} edici${filesEdited !== 1 ? "es" : "ón"}`;
+        text += `\n\n📊 ${summary.messageCount} mensajes · ${filesEdited} edici${filesEdited !== 1 ? "ones" : "ón"}`;
 
         const existing = this.ctx.heartbeatMessages.get(agentId);
         if (existing) {
