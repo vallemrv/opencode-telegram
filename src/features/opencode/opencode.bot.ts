@@ -35,6 +35,8 @@ import { formatAsHtml, escapeHtml } from "./utils.js";
 import { TranscriptionService } from "../../services/transcription.service.js";
 import { SessionDbService } from "../../services/session-db.service.js";
 import { PersistentHeartbeatMap } from "../../services/persistent-map.js";
+import { SessionInstanceService, type HeartbeatSummary } from "../../services/session-instance.service.js";
+import { MultiSessionHandler } from "./handlers/multi-session.handler.js";
 
 // ─── Handler classes ──────────────────────────────────────────────────────────
 import { ProjectsHandler }  from "./handlers/projects.handler.js";
@@ -81,6 +83,10 @@ export class OpenCodeBot implements BotContext {
     private modelsHandler:    ModelsHandler;
     private sessionHandler:   SessionHandler;
     private messageHandler:   MessageHandler;
+    private multiSessionHandler: MultiSessionHandler;
+    
+    // ── Multi-session service (NEW) ─────────────────────────────────────────────
+    readonly sessionInstanceService: SessionInstanceService;
 
     constructor(configService: ConfigService) {
         this.configService         = configService;
@@ -89,12 +95,18 @@ export class OpenCodeBot implements BotContext {
         this.transcriptionService  = new TranscriptionService();
         this.sessionDb             = new SessionDbService();
         this.heartbeatMessages     = new PersistentHeartbeatMap(this.sessionDb);
+        this.sessionInstanceService  = new SessionInstanceService(this.agentDb);
 
         this.projectsHandler = new ProjectsHandler(this);
         this.serversHandler    = new ServersHandler(this);
         this.modelsHandler    = new ModelsHandler(this);
         this.sessionHandler   = new SessionHandler(this);
         this.messageHandler   = new MessageHandler(this);
+        this.multiSessionHandler = new MultiSessionHandler(
+            this.sessionInstanceService,
+            this.persistentAgentService,
+            this.agentDb
+        );
     }
 
     // ── Shared helper: make a short callback key ──────────────────────────────
@@ -341,6 +353,9 @@ export class OpenCodeBot implements BotContext {
     registerHandlers(bot: Bot): void {
         this.bot = bot;
 
+        // Pass bot instance to MultiSessionHandler
+        this.multiSessionHandler.setBot(bot);
+
         // Wire persistent agent callbacks to MessageHandler methods
         this.persistentAgentService.setOnQuestionCallback(
             this.messageHandler.handleAgentQuestion.bind(this.messageHandler)
@@ -502,6 +517,30 @@ export class OpenCodeBot implements BotContext {
         bot.command("deleteall", AccessControlMiddleware.requireAccess, this.sessionHandler.handleDeleteAll.bind(this.sessionHandler));
         bot.command("restart", AccessControlMiddleware.requireAccess, this.messageHandler.handleRestart.bind(this.messageHandler));
 
+        // ─── Multi-session commands (NEW) ─────────────────────────────────────────
+        bot.command("sessions", AccessControlMiddleware.requireAccess, (ctx) => this.multiSessionHandler.handleListSessions(ctx));
+        bot.command("newsession", AccessControlMiddleware.requireAccess, (ctx) => {
+            const args = ctx.message?.text?.split(" ").slice(1);
+            this.multiSessionHandler.handleNewSession(ctx, args?.[0]);
+        });
+        bot.command("switch", AccessControlMiddleware.requireAccess, (ctx) => {
+            const args = ctx.message?.text?.split(" ").slice(1);
+            const sessionIdOrName = args?.join(" ");
+            if (!sessionIdOrName) {
+                ctx.reply("❌ Usa: /switch <id_sesión> o /switch <nombre_servidor>");
+                return;
+            }
+            this.multiSessionHandler.handleSwitchSession(ctx, sessionIdOrName);
+        });
+        bot.command("closesession", AccessControlMiddleware.requireAccess, (ctx) => {
+            const args = ctx.message?.text?.split(" ").slice(1);
+            this.multiSessionHandler.handleCloseSession(ctx, args?.[0]);
+        });
+        bot.command("cancel", AccessControlMiddleware.requireAccess, (ctx) => {
+            const args = ctx.message?.text?.split(" ").slice(1);
+            this.multiSessionHandler.handleCancel(ctx, args?.[0]);
+        });
+
         // ─── Callbacks ───────────────────────────────────────────────────────
         // Projects explorer + wizard callbacks
         bot.callbackQuery(/^proj:nav:/,            AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectNav.bind(this.projectsHandler));
@@ -561,6 +600,15 @@ export class OpenCodeBot implements BotContext {
                 await this.sessionHandler.handleRenameWizardText(ctx);
                 return;
             }
+            
+            // Check if user has an active multi-session
+            const activeSession = this.multiSessionHandler.getActiveSession(userId);
+            if (activeSession) {
+                // Use multi-session handler for messages
+                await this.multiSessionHandler.handleMessage(ctx, ctx.message.text);
+                return;
+            }
+            
             await this.messageHandler.handleMessage(ctx);
         });
 
@@ -581,10 +629,14 @@ export class OpenCodeBot implements BotContext {
 
         await ctx.reply(
             `<b>TelegramCoder</b>\n\n` +
-            `<b>Comandos:</b>\n` +
+            `<b>Comandos principales:</b>\n` +
             `/proyectos — Explorar proyectos, crear folders, abrir/wizard de servers\n` +
             `/servers — Ver servidores OpenCode activos\n` +
             `/run — Prompt puntual a un servidor\n` +
+            `/sessions — Ver mis sesiones paralelas\n` +
+            `/newsession — Crear nueva sesión paralela\n` +
+            `/switch — Cambiar a otra sesión\n` +
+            `/closesession — Cerrar una sesión\n` +
             `/session — Ver sesiones del proyecto activo\n` +
             `/rename — Renombrar la sesión activa\n` +
             `/delete — Borrar sesión activa y crear nueva\n` +
@@ -594,10 +646,12 @@ export class OpenCodeBot implements BotContext {
             `/undo — Revertir último cambio\n` +
             `/redo — Restaurar cambio revertido\n` +
             `/restart — Reiniciar (git pull + build + restart)\n\n` +
-            `<b>Flujo:</b>\n` +
-            `1. <code>/proyectos</code> → explorar folders → abrir server o crear proyecto\n` +
-            `2. Escribe tus mensajes directamente\n` +
-            `3. <code>/esc</code> para desactivar el server activo\n\n` +
+            `<b>Flujo Multi-Sesión:</b>\n` +
+            `1. <code>/sessions</code> → ver tus sesiones activas\n` +
+            `2. <code>/newsession</code> → crear nueva sesión paralela\n` +
+            `3. <code>/switch &lt;id&gt;</code> → cambiar entre sesiones\n` +
+            `4. Escribe mensajes → van a la sesión activa\n` +
+            `5. Cada sesión tiene su propio SSE y heartbeat independiente\n\n` +
             `<b>Límite:</b> ${maxAgents} servidores OpenCode simultáneos (MAX_OPENCODE_SERVERS en .env).`,
             { parse_mode: "HTML" }
         );
