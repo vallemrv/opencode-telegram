@@ -727,7 +727,11 @@ export class PersistentAgentService {
                     const type = (event as any).type;
                     const props = (event as any).properties;
 
+                    // Log all events for debugging
+                    console.log(`[PersistentAgent.SSE] Event received: type="${type}", agent="${agent.name}"`);
+
                     if (type === "server.connected" || type === "server.heartbeat") {
+                        console.log(`[PersistentAgent.SSE] Skipping ${type} event`);
                         continue;
                     }
 
@@ -737,6 +741,7 @@ export class PersistentAgentService {
                             statusType === "busy" || statusType === "retry" || statusType === "idle"
                                 ? (statusType as "busy" | "retry" | "idle")
                                 : undefined;
+                        console.log(`[PersistentAgent.SSE] session.status: statusType="${statusType}", sessionId="${props?.sessionID || props?.id || 'N/A'}"`);
                         if (sessionStatus) {
                             this.lastSessionStatus.set(agent.id, sessionStatus);
                         }
