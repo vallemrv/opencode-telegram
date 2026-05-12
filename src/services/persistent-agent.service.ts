@@ -49,8 +49,8 @@ export type OnSessionErrorCallback = (agentId: string, errorMessage: string) => 
 
 /** Summary sent to the bot on each heartbeat tick */
 export interface HeartbeatSummary {
-    /** Seconds elapsed since the prompt was sent */
-    secondsRunning: number;
+    /** Minutes elapsed since the prompt was sent */
+    minutesRunning: number;
     /** Name of the last tool called (e.g. "edit", "bash", "read") — best-effort */
     lastToolName: string;
     /** Last snippet of assistant text (up to 300 chars) — best-effort */
@@ -59,14 +59,10 @@ export interface HeartbeatSummary {
     messageCount: number;
     /** Number of file-modifying tool calls (edit / write / patch) seen so far */
     filesModified: number;
-    /** True if approaching hard timeout (80% of TIMEOUT_MS) */
-    isNearTimeout?: boolean;
     /** List of recently modified file paths (up to 5) */
     recentFiles: string[];
     /** Last bash command executed, if any */
     lastBashCmd: string;
-    /** True when stream received events recently */
-    streamConnected?: boolean;
     /** Seconds since the last SSE event seen for this agent */
     secondsSinceLastEvent?: number;
     /** Last known session status from session.status events */

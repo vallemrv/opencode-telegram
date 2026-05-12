@@ -21,10 +21,6 @@ function getAgentBaseUrl(agent: { host?: string; port: number }): string {
 export class MessageHandler {
     constructor(private readonly ctx: BotContext) {}
 
-    // Track last heartbeat time per session to prevent Telegram rate limiting (min 5s between updates)
-    private lastHeartbeatTime: Map<string, number> = new Map();
-    private readonly MIN_HEARTBEAT_INTERVAL_MS = 5000;
-
     // ── Regular text message routing ──────────────────────────────────────────
 
     async handleMessage(ctx: Context): Promise<void> {
@@ -480,109 +476,57 @@ async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<
         const agent = this.ctx.agentDb.getById(agentId);
         if (!agent) return;
 
-        // Rate limiting: ensure minimum interval between heartbeats to avoid Telegram limits
         const hbKey = `${agentId}:${summary.sessionId}`;
-        const now = Date.now();
-        const lastTime = this.lastHeartbeatTime.get(hbKey) ?? 0;
-        const timeSinceLast = now - lastTime;
-        
-        if (timeSinceLast < this.MIN_HEARTBEAT_INTERVAL_MS) {
-            console.log(`[MessageHandler.handleAgentHeartbeat] Skipping update for "${agent.name}" - too soon (${timeSinceLast}ms < ${this.MIN_HEARTBEAT_INTERVAL_MS}ms)`);
-            return;
-        }
 
-        const elapsed = summary.minutesRunning === 0
+        const elapsed = summary.minutesRunning < 1
             ? "< 1 min"
-            : `${summary.minutesRunning} min`;
+            : `${Math.floor(summary.minutesRunning)} min`;
 
-        // Header
-        let text = `⏳ <b>${escapeHtml(agent.name)}</b> — trabajando (${elapsed})\n`;
+        let text = `⏳ <b>${escapeHtml(agent.name)}</b> — ${elapsed}`;
 
-        const streamLabel = summary.streamConnected ? "🟢 SSE" : "🔴 SSE";
-        const age = summary.secondsSinceLastEvent;
-        const ageText = typeof age === "number" ? `${age}s` : "n/d";
-        const statusLabel = summary.sessionStatus ? summary.sessionStatus.toUpperCase() : "N/D";
-        text += `\n📡 ${streamLabel} · ⏱️ último evento: ${ageText} · estado: <code>${escapeHtml(statusLabel)}</code>`;
-
-        // Last tool / action
         if (summary.lastToolName) {
-            text += `\n🔧 <b>Herramienta:</b> <code>${escapeHtml(summary.lastToolName)}</code>`;
-            if (summary.lastBashCmd && summary.lastToolName === "bash") {
-                text += `\n   <code>${escapeHtml(summary.lastBashCmd)}</code>`;
-            }
+            text += `\n🔧 <code>${escapeHtml(summary.lastToolName)}</code>`;
         }
 
-        // What it's thinking / saying
         if (summary.lastText) {
-            const snippet = summary.lastText.length > 200
-                ? summary.lastText.slice(0, 200) + "…"
+            const snippet = summary.lastText.length > 150
+                ? summary.lastText.slice(0, 150) + "…"
                 : summary.lastText;
-            text += `\n\n💭 <i>${escapeHtml(snippet)}</i>`;
+            text += `\n\n${escapeHtml(snippet)}`;
         }
 
-        // Recently modified files
-        if (summary.recentFiles.length > 0) {
-            text += `\n\n📝 <b>Archivos modificados:</b>`;
-            for (const f of summary.recentFiles) {
-                // Show only the last 2 path segments to keep it short
-                const parts = f.replace(/\\/g, "/").split("/");
-                const short = parts.length > 2 ? "…/" + parts.slice(-2).join("/") : f;
-                text += `\n  • <code>${escapeHtml(short)}</code>`;
-            }
-        }
-
-        // Stats line
         const filesEdited = summary.filesModified;
-        text += `\n\n📊 ${summary.messageCount} mensajes · ${filesEdited} edici${filesEdited !== 1 ? "ones" : "ón"}`;
+        text += `\n\n📊 ${summary.messageCount} msgs · ${filesEdited} edit${filesEdited !== 1 ? "s" : ""}`;
 
         // Use composite key for session-specific heartbeat tracking (hbKey already defined above)
         const existing = this.ctx.heartbeatMessages.get(hbKey);
-        let success = false;
         if (existing) {
-            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" session ${summary.sessionId} - editing message ${existing.msgId}`);
+            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" - editing message ${existing.msgId}`);
             try {
                 await bot.api.editMessageText(existing.chatId, existing.msgId, text, { parse_mode: "HTML" });
-                success = true;
             } catch (err: any) {
-                // "message is not modified" (400) is benign — the text didn't change this tick.
-                // Only clear the reference if the message truly no longer exists (deleted/too old).
                 const desc: string = err?.description ?? "";
-                const messageNotModified = desc.includes("message is not modified");
                 const messageGone =
                     err?.error_code === 400 &&
                     (desc.includes("message to edit not found") ||
                      desc.includes("MESSAGE_ID_INVALID") ||
                      desc.includes("can't find"));
-                
-                if (messageNotModified) {
-                    // Message content hasn't changed - still count as successful update
-                    // to maintain the rate limiting schedule
-                    success = true;
-                    console.log(`[MessageHandler.handleAgentHeartbeat] Message ${existing.msgId} not modified for "${agent.name}" - content unchanged`);
-                } else if (messageGone) {
-                    console.warn(`[MessageHandler.handleAgentHeartbeat] Message ${existing.msgId} gone for "${agent.name}" session ${summary.sessionId} - clearing reference`);
+                if (messageGone) {
+                    console.warn(`[MessageHandler.handleAgentHeartbeat] Message gone for "${agent.name}" - clearing`);
                     this.ctx.heartbeatMessages.delete(hbKey);
                 }
-                // For other errors, we don't update lastHeartbeatTime so it can retry sooner
             }
         } else {
-            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" session ${summary.sessionId} - no existing heartbeat, creating new`);
+            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" - creating new heartbeat`);
             try {
                 const { chatId, userId } = this.ctx.resolveAgentChat(agentId);
                 const msg = await bot.api.sendMessage(chatId, text, { parse_mode: "HTML" });
                 if (msg) {
                     this.ctx.heartbeatMessages.set(hbKey, { chatId, msgId: msg.message_id, userId });
-                    console.log(`[MessageHandler.handleAgentHeartbeat] Created heartbeat message ${msg.message_id} for "${agent.name}" session ${summary.sessionId}`);
-                    success = true;
                 }
             } catch (err) {
-                console.error("[MessageHandler.handleAgentHeartbeat] Failed to send heartbeat message:", err);
+                console.error("[MessageHandler.handleAgentHeartbeat] Failed to send:", err);
             }
-        }
-        
-        // Update last heartbeat time on successful update
-        if (success) {
-            this.lastHeartbeatTime.set(hbKey, Date.now());
         }
     }
 

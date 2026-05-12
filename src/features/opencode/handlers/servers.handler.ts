@@ -41,7 +41,6 @@ export class ServersHandler {
                 : `http://${host}:${agent.port}`;
             keyboard
                 .text(label, `server:activate:${agent.id}`)
-                .url("🌐", webUrl)
                 .text("🗑️", `server:del:${agent.id}`)
                 .row();
         }
@@ -57,7 +56,13 @@ export class ServersHandler {
         const header = agents.length === 0
             ? `🤖 <b>Servidores OpenCode</b>\n\nNo hay ninguno arrancado.\nUsa /proyectos para abrir un proyecto.`
             : `🤖 <b>Servidores OpenCode (${agents.length}/${maxAgents})</b>\n\n` +
-              `Toca el nombre para activar (sticky), 🗑️ para parar y borrar (irreversible).`;
+              agents.map(a => {
+                  const h = a.host || "localhost";
+                  const sid = this.ctx.persistentAgentService.getSessionId(a.id);
+                  const url = sid ? `http://${h}:${a.port}/session/${sid}` : `http://${h}:${a.port}`;
+                  return `• <a href="${url}">${h}:${a.port}</a>`;
+              }).join("\n") +
+              `\n\nToca el nombre para activar (sticky), 🗑️ para parar y borrar.`;
 
         await ctx.reply(
             header + activeInfo,
