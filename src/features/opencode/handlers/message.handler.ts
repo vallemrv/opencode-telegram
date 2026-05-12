@@ -482,7 +482,10 @@ async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<
             ? "< 1 min"
             : `${Math.floor(summary.minutesRunning)} min`;
 
-        let text = `⏳ <b>${escapeHtml(agent.name)}</b> — ${elapsed}`;
+        const now = new Date();
+        const timeStr = now.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+        let text = `⏳ <b>${escapeHtml(agent.name)}</b> — ${elapsed} · ${timeStr}`;
 
         if (summary.lastToolName) {
             text += `\n🔧 <code>${escapeHtml(summary.lastToolName)}</code>`;
@@ -501,23 +504,19 @@ async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<
         // Use composite key for session-specific heartbeat tracking (hbKey already defined above)
         const existing = this.ctx.heartbeatMessages.get(hbKey);
         if (existing) {
-            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" - editing message ${existing.msgId}`);
             try {
                 await bot.api.editMessageText(existing.chatId, existing.msgId, text, { parse_mode: "HTML" });
             } catch (err: any) {
                 const desc: string = err?.description ?? "";
-                const messageGone =
-                    err?.error_code === 400 &&
-                    (desc.includes("message to edit not found") ||
-                     desc.includes("MESSAGE_ID_INVALID") ||
-                     desc.includes("can't find"));
-                if (messageGone) {
-                    console.warn(`[MessageHandler.handleAgentHeartbeat] Message gone for "${agent.name}" - clearing`);
+                if (desc.includes("message is not modified")) {
+                    // Benign - content same, Telegram rejected edit
+                } else if (err?.error_code === 400 && (
+                    desc.includes("message to edit not found") ||
+                    desc.includes("MESSAGE_ID_INVALID"))) {
                     this.ctx.heartbeatMessages.delete(hbKey);
                 }
             }
         } else {
-            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" - creating new heartbeat`);
             try {
                 const { chatId, userId } = this.ctx.resolveAgentChat(agentId);
                 const msg = await bot.api.sendMessage(chatId, text, { parse_mode: "HTML" });
