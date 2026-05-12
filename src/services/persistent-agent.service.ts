@@ -71,6 +71,8 @@ export interface HeartbeatSummary {
     secondsSinceLastEvent?: number;
     /** Last known session status from session.status events */
     sessionStatus?: "busy" | "retry" | "idle";
+    /** Session ID this heartbeat belongs to */
+    sessionId: string;
 }
 
 /** Called by OpenCodeBot on each heartbeat tick (only while a prompt is in-flight) */
@@ -1546,6 +1548,7 @@ export class PersistentAgentService {
                 streamConnected,
                 secondsSinceLastEvent,
                 sessionStatus,
+                sessionId: pending.sessionId,
             });
         } catch (err) {
             console.error(`[PersistentAgent] heartbeat error for "${agent.name}":`, err);

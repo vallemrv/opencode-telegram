@@ -72,6 +72,30 @@ export class SessionHandler {
             return;
         }
 
+        // Cancel any pending operations on the current session before switching
+        const currentSessionId = this.ctx.persistentAgentService.getSessionId(agentId);
+        if (this.ctx.persistentAgentService.isBusy(agentId) && currentSessionId) {
+            await this.ctx.persistentAgentService.cancelPendingPrompt(agentId);
+            // Clear any heartbeat messages for this specific session
+            const hbKey = `${agentId}:${currentSessionId}`;
+            const hb = this.ctx.heartbeatMessages.get(hbKey) || this.ctx.heartbeatMessages.get(agentId);
+            if (hb) {
+                this.ctx.heartbeatMessages.delete(hbKey);
+                this.ctx.heartbeatMessages.delete(agentId);
+                // Try to update the old heartbeat message to indicate cancellation
+                try {
+                    if (this.ctx.bot) {
+                        await this.ctx.bot.api.editMessageText(
+                            hb.chatId, 
+                            hb.msgId,
+                            `⏹️ <b>${escapeHtml(agent.name)}</b> — sesión cambiada`,
+                            { parse_mode: "HTML" }
+                        );
+                    }
+                } catch { /* ignore edit errors */ }
+            }
+        }
+
         this.ctx.persistentAgentService.setSessionId(agentId, sessId);
         await ctx.answerCallbackQuery({ text: "✅ Sesión activada." });
 
@@ -95,6 +119,28 @@ export class SessionHandler {
         if (!agent) { await ctx.answerCallbackQuery(); await ctx.editMessageText("❌ Agente no encontrado.").catch(() => {}); return; }
 
         try {
+            // Cancel any pending operations before creating new session
+            const currentSessionId = this.ctx.persistentAgentService.getSessionId(agentId);
+            if (this.ctx.persistentAgentService.isBusy(agentId) && currentSessionId) {
+                await this.ctx.persistentAgentService.cancelPendingPrompt(agentId);
+                const hbKey = `${agentId}:${currentSessionId}`;
+                const hb = this.ctx.heartbeatMessages.get(hbKey) || this.ctx.heartbeatMessages.get(agentId);
+                if (hb) {
+                    this.ctx.heartbeatMessages.delete(hbKey);
+                    this.ctx.heartbeatMessages.delete(agentId);
+                    try {
+                        if (this.ctx.bot) {
+                            await this.ctx.bot.api.editMessageText(
+                                hb.chatId, 
+                                hb.msgId,
+                                `⏹️ <b>${escapeHtml(agent.name)}</b> — sesión anterior cancelada para crear nueva`,
+                                { parse_mode: "HTML" }
+                            );
+                        }
+                    } catch { /* ignore edit errors */ }
+                }
+            }
+
             const newSessId = await this.ctx.persistentAgentService.createNewSession(agent);
             this.ctx.persistentAgentService.setSessionId(agentId, newSessId);
             await ctx.answerCallbackQuery({ text: "✅ Nueva sesión creada." });
@@ -119,6 +165,19 @@ export class SessionHandler {
 
         const baseUrl = getAgentBaseUrl(agent);
         try {
+            // Cancel any pending operations on this session before deleting
+            const currentSessionId = this.ctx.persistentAgentService.getSessionId(agentId);
+            const isActiveSession = currentSessionId === sessId;
+            if (isActiveSession && this.ctx.persistentAgentService.isBusy(agentId)) {
+                await this.ctx.persistentAgentService.cancelPendingPrompt(agentId);
+                const hbKey = `${agentId}:${sessId}`;
+                const hb = this.ctx.heartbeatMessages.get(hbKey) || this.ctx.heartbeatMessages.get(agentId);
+                if (hb) {
+                    this.ctx.heartbeatMessages.delete(hbKey);
+                    this.ctx.heartbeatMessages.delete(agentId);
+                }
+            }
+
             await fetch(`${baseUrl}/session/${sessId}`, {
                 method: "DELETE",
                 signal: AbortSignal.timeout(8000),
@@ -151,6 +210,18 @@ export class SessionHandler {
 
         const baseUrl = getAgentBaseUrl(agent);
         try {
+            // Cancel any pending operations before deleting all sessions
+            const currentSessionId = this.ctx.persistentAgentService.getSessionId(agentId);
+            if (this.ctx.persistentAgentService.isBusy(agentId) && currentSessionId) {
+                await this.ctx.persistentAgentService.cancelPendingPrompt(agentId);
+                const hbKey = `${agentId}:${currentSessionId}`;
+                const hb = this.ctx.heartbeatMessages.get(hbKey) || this.ctx.heartbeatMessages.get(agentId);
+                if (hb) {
+                    this.ctx.heartbeatMessages.delete(hbKey);
+                    this.ctx.heartbeatMessages.delete(agentId);
+                }
+            }
+
             const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
             if (sessRes.ok) {
                 const allSessions: any[] = await sessRes.json();
@@ -185,6 +256,17 @@ export class SessionHandler {
 
         const baseUrl = getAgentBaseUrl(agent);
         try {
+            // Cancel any pending operations before deleting
+            if (this.ctx.persistentAgentService.isBusy(agent.id)) {
+                await this.ctx.persistentAgentService.cancelPendingPrompt(agent.id);
+                const hbKey = `${agent.id}:${sessionId}`;
+                const hb = this.ctx.heartbeatMessages.get(hbKey) || this.ctx.heartbeatMessages.get(agent.id);
+                if (hb) {
+                    this.ctx.heartbeatMessages.delete(hbKey);
+                    this.ctx.heartbeatMessages.delete(agent.id);
+                }
+            }
+
             await fetch(`${baseUrl}/session/${sessionId}`, {
                 method: "DELETE",
                 signal: AbortSignal.timeout(8000),
@@ -210,6 +292,18 @@ export class SessionHandler {
 
         const baseUrl = getAgentBaseUrl(agent);
         try {
+            // Cancel any pending operations before deleting all sessions
+            const currentSessionId = this.ctx.persistentAgentService.getSessionId(agent.id);
+            if (this.ctx.persistentAgentService.isBusy(agent.id) && currentSessionId) {
+                await this.ctx.persistentAgentService.cancelPendingPrompt(agent.id);
+                const hbKey = `${agent.id}:${currentSessionId}`;
+                const hb = this.ctx.heartbeatMessages.get(hbKey) || this.ctx.heartbeatMessages.get(agent.id);
+                if (hb) {
+                    this.ctx.heartbeatMessages.delete(hbKey);
+                    this.ctx.heartbeatMessages.delete(agent.id);
+                }
+            }
+
             const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
             if (sessRes.ok) {
                 const allSessions: any[] = await sessRes.json();

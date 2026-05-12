@@ -520,9 +520,11 @@ async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<
         const filesEdited = summary.filesModified;
         text += `\n\n📊 ${summary.messageCount} mensajes · ${filesEdited} edici${filesEdited !== 1 ? "ones" : "ón"}`;
 
-        const existing = this.ctx.heartbeatMessages.get(agentId);
+        // Use composite key for session-specific heartbeat tracking
+        const hbKey = `${agentId}:${summary.sessionId}`;
+        const existing = this.ctx.heartbeatMessages.get(hbKey);
         if (existing) {
-            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" - editing message ${existing.msgId}`);
+            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" session ${summary.sessionId} - editing message ${existing.msgId}`);
             try {
                 await bot.api.editMessageText(existing.chatId, existing.msgId, text, { parse_mode: "HTML" });
             } catch (err: any) {
@@ -535,20 +537,20 @@ async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<
                      desc.includes("MESSAGE_ID_INVALID") ||
                      desc.includes("can't find"));
                 if (messageGone) {
-                    console.warn(`[MessageHandler.handleAgentHeartbeat] Message ${existing.msgId} gone for "${agent.name}" - clearing reference`);
-                    this.ctx.heartbeatMessages.delete(agentId);
+                    console.warn(`[MessageHandler.handleAgentHeartbeat] Message ${existing.msgId} gone for "${agent.name}" session ${summary.sessionId} - clearing reference`);
+                    this.ctx.heartbeatMessages.delete(hbKey);
                 }
                 // For "message is not modified" we keep the reference so the next
                 // tick can still edit the same message when content changes.
             }
         } else {
-            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" - no existing heartbeat, creating new`);
+            console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" session ${summary.sessionId} - no existing heartbeat, creating new`);
             try {
                 const { chatId, userId } = this.ctx.resolveAgentChat(agentId);
                 const msg = await bot.api.sendMessage(chatId, text, { parse_mode: "HTML" });
                 if (msg) {
-                    this.ctx.heartbeatMessages.set(agentId, { chatId, msgId: msg.message_id, userId });
-                    console.log(`[MessageHandler.handleAgentHeartbeat] Created heartbeat message ${msg.message_id} for "${agent.name}"`);
+                    this.ctx.heartbeatMessages.set(hbKey, { chatId, msgId: msg.message_id, userId });
+                    console.log(`[MessageHandler.handleAgentHeartbeat] Created heartbeat message ${msg.message_id} for "${agent.name}" session ${summary.sessionId}`);
                 }
             } catch (err) {
                 console.error("[MessageHandler.handleAgentHeartbeat] Failed to send heartbeat message:", err);

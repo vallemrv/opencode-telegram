@@ -35,8 +35,6 @@ import { formatAsHtml, escapeHtml } from "./utils.js";
 import { TranscriptionService } from "../../services/transcription.service.js";
 import { SessionDbService } from "../../services/session-db.service.js";
 import { PersistentHeartbeatMap } from "../../services/persistent-map.js";
-import { SessionInstanceService, type HeartbeatSummary } from "../../services/session-instance.service.js";
-import { MultiSessionHandler } from "./handlers/multi-session.handler.js";
 
 // ─── Handler classes ──────────────────────────────────────────────────────────
 import { ProjectsHandler }  from "./handlers/projects.handler.js";
@@ -83,10 +81,6 @@ export class OpenCodeBot implements BotContext {
     private modelsHandler:    ModelsHandler;
     private sessionHandler:   SessionHandler;
     private messageHandler:   MessageHandler;
-    private multiSessionHandler: MultiSessionHandler;
-    
-    // ── Multi-session service (NEW) ─────────────────────────────────────────────
-    readonly sessionInstanceService: SessionInstanceService;
 
     constructor(configService: ConfigService) {
         this.configService         = configService;
@@ -95,18 +89,12 @@ export class OpenCodeBot implements BotContext {
         this.transcriptionService  = new TranscriptionService();
         this.sessionDb             = new SessionDbService();
         this.heartbeatMessages     = new PersistentHeartbeatMap(this.sessionDb);
-        this.sessionInstanceService  = new SessionInstanceService(this.agentDb);
 
         this.projectsHandler = new ProjectsHandler(this);
         this.serversHandler    = new ServersHandler(this);
         this.modelsHandler    = new ModelsHandler(this);
         this.sessionHandler   = new SessionHandler(this);
         this.messageHandler   = new MessageHandler(this);
-        this.multiSessionHandler = new MultiSessionHandler(
-            this.sessionInstanceService,
-            this.persistentAgentService,
-            this.agentDb
-        );
     }
 
     // ── Shared helper: make a short callback key ──────────────────────────────
@@ -145,6 +133,11 @@ export class OpenCodeBot implements BotContext {
         const agent = this.agentDb.getById(agentId);
         const fallbackUserId = agent?.userId ?? 0;
         return { chatId: fallbackUserId, userId: fallbackUserId };
+    }
+
+    // ── Shared helper: get heartbeat key for a session ──────────────────────────
+    private getHeartbeatKey(agentId: string, sessionId: string): string {
+        return `${agentId}:${sessionId}`;
     }
 
     // ── Shared helper: delete heartbeat then send new result message ───────────
@@ -278,8 +271,12 @@ export class OpenCodeBot implements BotContext {
                         `⏳ <b>${escapeHtml(agent.name)}</b> [${escapeHtml(agent.model)}] procesando…`,
                         { parse_mode: "HTML" }
                     ).catch(() => null);
-                    if (processingMsg) {
-                        this.heartbeatMessages.set(agent.id, { chatId, msgId: processingMsg.message_id });
+                    
+                    // Get current session ID for this agent to use as heartbeat key
+                    const sessionId = this.persistentAgentService.getSessionId(agent.id);
+                    if (processingMsg && sessionId) {
+                        const hbKey = this.getHeartbeatKey(agent.id, sessionId);
+                        this.heartbeatMessages.set(hbKey, { chatId, msgId: processingMsg.message_id });
                     }
 
                     const remaining = this.persistentAgentService.queueLength(agent.id);
@@ -297,13 +294,16 @@ export class OpenCodeBot implements BotContext {
                     await this.bot.api.sendChatAction(chatId, "typing").catch(() => {});
                 },
                 onResult: async (result) => {
-                    const hb = this.heartbeatMessages.get(agent.id);
-                    this.heartbeatMessages.delete(agent.id);
-                    console.log(`[OpenCodeBot.sendPromptToAgent.queue] Queued result for "${agent.name}" - heartbeat exists: ${!!hb}`);
+                    // Get the session ID that was active when this prompt was sent
+                    const sessionId = result.sessionId || this.persistentAgentService.getSessionId(agent.id);
+                    const hbKey = sessionId ? this.getHeartbeatKey(agent.id, sessionId) : agent.id;
+                    const hb = this.heartbeatMessages.get(hbKey);
+                    this.heartbeatMessages.delete(hbKey);
+                    console.log(`[OpenCodeBot.sendPromptToAgent.queue] Queued result for "${agent.name}" session ${sessionId} - heartbeat exists: ${!!hb}`);
                     if (hb) {
                         await this.editOrSendResult(hb.chatId, hb.msgId, agent, result);
                     } else {
-                        console.warn(`[OpenCodeBot.sendPromptToAgent.queue] No heartbeat for "${agent.name}", sending new message`);
+                        console.warn(`[OpenCodeBot.sendPromptToAgent.queue] No heartbeat for "${agent.name}" session ${sessionId}, sending new message`);
                         await this.sendAgentResult(chatId, agent, result);
                     }
                 },
@@ -326,18 +326,26 @@ export class OpenCodeBot implements BotContext {
         );
         await ctx.api.sendChatAction(ctx.chat!.id, "typing").catch(() => {});
 
-        this.heartbeatMessages.set(agent.id, { chatId: ctx.chat!.id, msgId: statusMsg.message_id });
+        // Store heartbeat with session-specific key
+        const currentSessionId = this.persistentAgentService.getSessionId(agent.id);
+        const hbKey = currentSessionId ? this.getHeartbeatKey(agent.id, currentSessionId) : agent.id;
+        this.heartbeatMessages.set(hbKey, { chatId: ctx.chat!.id, msgId: statusMsg.message_id });
         this.autoRenameSessionIfNeeded(agent, prompt).catch(() => {});
 
         const chatId           = ctx.chat!.id;
         const placeholderMsgId = statusMsg.message_id;
         this.persistentAgentService.sendPrompt(agent, prompt).then(async (result) => {
-            const hb = this.heartbeatMessages.get(agent.id);
-            this.heartbeatMessages.delete(agent.id);
-            console.log(`[OpenCodeBot.sendPromptToAgent] Result received for "${agent.name}" - heartbeat exists: ${!!hb}, using msgId: ${hb?.msgId ?? placeholderMsgId}`);
+            // Use the session ID from the result to find the correct heartbeat
+            const resultSessionId = result.sessionId || currentSessionId;
+            const resultHbKey = resultSessionId ? this.getHeartbeatKey(agent.id, resultSessionId) : agent.id;
+            const hb = this.heartbeatMessages.get(resultHbKey);
+            this.heartbeatMessages.delete(resultHbKey);
+            console.log(`[OpenCodeBot.sendPromptToAgent] Result received for "${agent.name}" session ${resultSessionId} - heartbeat exists: ${!!hb}, using msgId: ${hb?.msgId ?? placeholderMsgId}`);
             await this.editOrSendResult(chatId, hb?.msgId ?? placeholderMsgId, agent, result);
         }).catch(async (err) => {
-            this.heartbeatMessages.delete(agent.id);
+            const errSessionId = this.persistentAgentService.getSessionId(agent.id);
+            const errHbKey = errSessionId ? this.getHeartbeatKey(agent.id, errSessionId) : agent.id;
+            this.heartbeatMessages.delete(errHbKey);
             console.error(`[OpenCodeBot.sendPromptToAgent] Error for "${agent.name}":`, err);
             await this.bot!.api.deleteMessage(chatId, placeholderMsgId).catch(() => {});
             await this.bot!.api.sendMessage(
@@ -352,9 +360,6 @@ export class OpenCodeBot implements BotContext {
 
     registerHandlers(bot: Bot): void {
         this.bot = bot;
-
-        // Pass bot instance to MultiSessionHandler
-        this.multiSessionHandler.setBot(bot);
 
         // Wire persistent agent callbacks to MessageHandler methods
         this.persistentAgentService.setOnQuestionCallback(
@@ -432,6 +437,7 @@ export class OpenCodeBot implements BotContext {
                     { parse_mode: "HTML" }
                 );
                 // Register as heartbeat message so ticks update this placeholder
+                // For recovery, we use agentId only since we don't know the sessionId yet
                 this.heartbeatMessages.set(agentId, { chatId: targetChatId, msgId: msg.message_id, userId });
                 return { chatId: targetChatId, msgId: msg.message_id };
             } catch (err) {
@@ -447,8 +453,11 @@ export class OpenCodeBot implements BotContext {
                 console.warn(`[OpenCodeBot] adoptSessionResult: agent ${agentId} not found in DB`);
                 return;
             }
-            // Clear heartbeatMessages before editOrSendResult (same pattern as sendPromptToAgent)
+            // For recovery, try both agentId and composite key
             this.heartbeatMessages.delete(agentId);
+            if (result.sessionId) {
+                this.heartbeatMessages.delete(this.getHeartbeatKey(agentId, result.sessionId));
+            }
             await this.editOrSendResult(chatId, msgId, agent, result);
         };
         this.persistentAgentService.setOnAdoptSessionResultCallback(adoptSessionResultCallback);
@@ -517,30 +526,6 @@ export class OpenCodeBot implements BotContext {
         bot.command("deleteall", AccessControlMiddleware.requireAccess, this.sessionHandler.handleDeleteAll.bind(this.sessionHandler));
         bot.command("restart", AccessControlMiddleware.requireAccess, this.messageHandler.handleRestart.bind(this.messageHandler));
 
-        // ─── Multi-session commands (NEW) ─────────────────────────────────────────
-        bot.command("sessions", AccessControlMiddleware.requireAccess, (ctx) => this.multiSessionHandler.handleListSessions(ctx));
-        bot.command("newsession", AccessControlMiddleware.requireAccess, (ctx) => {
-            const args = ctx.message?.text?.split(" ").slice(1);
-            this.multiSessionHandler.handleNewSession(ctx, args?.[0]);
-        });
-        bot.command("switch", AccessControlMiddleware.requireAccess, (ctx) => {
-            const args = ctx.message?.text?.split(" ").slice(1);
-            const sessionIdOrName = args?.join(" ");
-            if (!sessionIdOrName) {
-                ctx.reply("❌ Usa: /switch <id_sesión> o /switch <nombre_servidor>");
-                return;
-            }
-            this.multiSessionHandler.handleSwitchSession(ctx, sessionIdOrName);
-        });
-        bot.command("closesession", AccessControlMiddleware.requireAccess, (ctx) => {
-            const args = ctx.message?.text?.split(" ").slice(1);
-            this.multiSessionHandler.handleCloseSession(ctx, args?.[0]);
-        });
-        bot.command("cancel", AccessControlMiddleware.requireAccess, (ctx) => {
-            const args = ctx.message?.text?.split(" ").slice(1);
-            this.multiSessionHandler.handleCancel(ctx, args?.[0]);
-        });
-
         // ─── Callbacks ───────────────────────────────────────────────────────
         // Projects explorer + wizard callbacks
         bot.callbackQuery(/^proj:nav:/,            AccessControlMiddleware.requireAccess, this.projectsHandler.handleProjectNav.bind(this.projectsHandler));
@@ -601,14 +586,6 @@ export class OpenCodeBot implements BotContext {
                 return;
             }
             
-            // Check if user has an active multi-session
-            const activeSession = this.multiSessionHandler.getActiveSession(userId);
-            if (activeSession) {
-                // Use multi-session handler for messages
-                await this.multiSessionHandler.handleMessage(ctx, ctx.message.text);
-                return;
-            }
-            
             await this.messageHandler.handleMessage(ctx);
         });
 
@@ -633,10 +610,6 @@ export class OpenCodeBot implements BotContext {
             `/proyectos — Explorar proyectos, crear folders, abrir/wizard de servers\n` +
             `/servers — Ver servidores OpenCode activos\n` +
             `/run — Prompt puntual a un servidor\n` +
-            `/sessions — Ver mis sesiones paralelas\n` +
-            `/newsession — Crear nueva sesión paralela\n` +
-            `/switch — Cambiar a otra sesión\n` +
-            `/closesession — Cerrar una sesión\n` +
             `/session — Ver sesiones del proyecto activo\n` +
             `/rename — Renombrar la sesión activa\n` +
             `/delete — Borrar sesión activa y crear nueva\n` +
@@ -646,12 +619,10 @@ export class OpenCodeBot implements BotContext {
             `/undo — Revertir último cambio\n` +
             `/redo — Restaurar cambio revertido\n` +
             `/restart — Reiniciar (git pull + build + restart)\n\n` +
-            `<b>Flujo Multi-Sesión:</b>\n` +
-            `1. <code>/sessions</code> → ver tus sesiones activas\n` +
-            `2. <code>/newsession</code> → crear nueva sesión paralela\n` +
-            `3. <code>/switch &lt;id&gt;</code> → cambiar entre sesiones\n` +
-            `4. Escribe mensajes → van a la sesión activa\n` +
-            `5. Cada sesión tiene su propio SSE y heartbeat independiente\n\n` +
+            `<b>Flujo:</b>\n` +
+            `1. <code>/proyectos</code> → explorar folders → abrir server o crear proyecto\n` +
+            `2. Escribe tus mensajes directamente\n` +
+            `3. <code>/esc</code> para desactivar el server activo\n\n` +
             `<b>Límite:</b> ${maxAgents} servidores OpenCode simultáneos (MAX_OPENCODE_SERVERS en .env).`,
             { parse_mode: "HTML" }
         );
