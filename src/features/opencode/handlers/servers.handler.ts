@@ -30,7 +30,7 @@ export class ServersHandler {
         const activeId = this.ctx.persistentAgentService.getActiveAgentId(userId);
         const keyboard = new InlineKeyboard();
 
-        for (const agent of agents) {
+for (const agent of agents) {
             const isActive = agent.id === activeId;
             const displayName = this.getAgentDisplayName(agent.name);
             const label = isActive ? `✅ ${displayName}` : `🤖 ${displayName}`;
@@ -42,6 +42,8 @@ export class ServersHandler {
             keyboard
                 .text(label, `server:activate:${agent.id}`)
                 .text("🗑️", `server:del:${agent.id}`)
+                .row()
+                .url(`🌐 ${displayName}`, webUrl)
                 .row();
         }
 
@@ -56,13 +58,7 @@ export class ServersHandler {
         const header = agents.length === 0
             ? `🤖 <b>Servidores OpenCode</b>\n\nNo hay ninguno arrancado.\nUsa /proyectos para abrir un proyecto.`
             : `🤖 <b>Servidores OpenCode (${agents.length}/${maxAgents})</b>\n\n` +
-              agents.map(a => {
-                  const h = a.host || "localhost";
-                  const sid = this.ctx.persistentAgentService.getSessionId(a.id);
-                  const url = sid ? `http://${h}:${a.port}/session/${sid}` : `http://${h}:${a.port}`;
-                  return `• <a href="${url}">${h}:${a.port}</a>`;
-              }).join("\n") +
-              `\n\nToca el nombre para activar (sticky), 🗑️ para parar y borrar.`;
+              `Toca el nombre para activar (sticky), 🗑️ para parar y borrar (irreversible).`;
 
         await ctx.reply(
             header + activeInfo,
