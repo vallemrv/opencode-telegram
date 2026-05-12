@@ -19,7 +19,7 @@
       "maxTokens": 8000
     },
     "title": {
-      "model": "openrouter/anthropic/claude-haiku-4",
+      "model": "alibaba-coding-plan/glm-5",
       "maxTokens": 100
     }
   },

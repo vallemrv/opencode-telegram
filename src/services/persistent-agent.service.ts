@@ -49,8 +49,8 @@ export type OnSessionErrorCallback = (agentId: string, errorMessage: string) => 
 
 /** Summary sent to the bot on each heartbeat tick */
 export interface HeartbeatSummary {
-    /** Minutes elapsed since the prompt was sent */
-    minutesRunning: number;
+    /** Seconds elapsed since the prompt was sent */
+    secondsRunning: number;
     /** Name of the last tool called (e.g. "edit", "bash", "read") — best-effort */
     lastToolName: string;
     /** Last snippet of assistant text (up to 300 chars) — best-effort */
