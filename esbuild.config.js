@@ -19,6 +19,7 @@ const commonOptions = {
   sourcemap: !isProd,
   minify: isProd,
   treeShaking: true,
+  packages: "external",  // Externaliza TODOS los node_modules — evita problemas con CJS dynamic require
   external: [
     // Node built-ins (both node: prefix and bare names)
     "node:*",
@@ -38,19 +39,6 @@ const commonOptions = {
     "net",
     "tls",
     "zlib",
-    // Dependencies that shouldn't be bundled (native modules)
-    "node-pty",
-    "puppeteer",
-    // Other dependencies that might have issues when bundled
-    "@google/genai",
-    "@ai-sdk/google",
-    "@ai-sdk/openai",
-    "grammy",
-    "dotenv",
-    "ai",
-    "archiver",
-    "zod",
-    "better-sqlite3",
   ],
   banner: {
     js: "#!/usr/bin/env node",

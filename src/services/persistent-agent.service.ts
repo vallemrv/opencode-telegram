@@ -695,239 +695,252 @@ export class PersistentAgentService {
     private async runSseLoop(agent: PersistentAgent, abort: AbortController): Promise<void> {
         const host = agent.host || 'localhost';
         const baseUrl = `http://${host}:${agent.port}`;
-        const client = createOpencodeClient({ baseUrl });
-        let retryDelay = 3000;
-        // Maximum time to keep a single SSE connection alive before forcing a reconnect.
-        // This prevents the stream from hanging silently when the TCP connection goes stale.
-        const SSE_RECONNECT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+        const workdir = resolveDir(agent.workdir);
 
         await this.recoverPendingQuestions(agent);
         await this.recoverPendingPrompt(agent);
 
+        // Use /global/event which keeps the connection open and streams all events.
+        // /event closes immediately after server.connected — unusable.
+        // Events have structure: { directory, project, payload: { id, type, properties } }
+        // We filter by directory to only handle events for this agent's workdir.
+        let reconnectDelay = 1000;
         while (!abort.signal.aborted) {
-            // Per-connection abort: forces reconnect every SSE_RECONNECT_INTERVAL_MS
-            const connAbort = new AbortController();
-            const connTimeout = setTimeout(() => {
-                if (!abort.signal.aborted) {
-                    console.log(`[PersistentAgent] SSE connection for agent "${agent.name}" exceeded ${SSE_RECONNECT_INTERVAL_MS / 1000}s — forcing reconnect`);
-                    connAbort.abort();
-                }
-            }, SSE_RECONNECT_INTERVAL_MS);
-            abort.signal.addEventListener("abort", () => connAbort.abort(), { once: true });
+        try {
+            const response = await fetch(`${baseUrl}/global/event`, {
+                signal: abort.signal,
+                headers: { Accept: 'text/event-stream' },
+            });
+            if (!response.ok || !response.body) {
+                throw new Error(`SSE connect failed: ${response.status}`);
+            }
+
+            const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+            let buffer = '';
+            const abortHandler = () => { try { reader.cancel(); } catch {} };
+            abort.signal.addEventListener('abort', abortHandler);
 
             try {
-                const events = await client.event.subscribe();
-                retryDelay = 3000;
+                while (!abort.signal.aborted) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += value;
+                    const chunks = buffer.split('\n\n');
+                    buffer = chunks.pop() ?? '';
+                    for (const chunk of chunks) {
+                        const dataLine = chunk.split('\n').find(l => l.startsWith('data:'));
+                        if (!dataLine) continue;
+                        let parsed: any;
+                        try { parsed = JSON.parse(dataLine.slice(5).trim()); } catch { continue; }
 
-                for await (const event of events.stream) {
-                    if (abort.signal.aborted || connAbort.signal.aborted) break;
+                        // Filter by directory — only handle events for this agent
+                        if (parsed.directory && parsed.directory !== workdir) continue;
 
-                    this.lastSseEventAt.set(agent.id, Date.now());
+                        // Unwrap: global events wrap payload inside .payload
+                        const event = parsed.payload ?? parsed;
+                        if (!event) continue;
 
-                    const type = (event as any).type;
-                    const props = (event as any).properties;
+                        if (abort.signal.aborted) break;
+                        this.lastSseEventAt.set(agent.id, Date.now());
 
-                    // Log all events for debugging
-                    console.log(`[PersistentAgent.SSE] Event received: type="${type}", agent="${agent.name}"`);
+                        const type = event.type as string;
+                        const props = event.properties;
 
-                    if (type === "server.connected" || type === "server.heartbeat") {
-                        console.log(`[PersistentAgent.SSE] Skipping ${type} event`);
-                        continue;
+                // Log all events for debugging
+                console.log(`[PersistentAgent.SSE] Event received: type="${type}", agent="${agent.name}"`);
+
+                if (type === "server.connected" || type === "server.heartbeat") {
+                    console.log(`[PersistentAgent.SSE] Skipping ${type} event`);
+                    // On reconnect, recover any missed state
+                    this.recoverPendingQuestions(agent).catch(() => {});
+                    this.recoverPendingPrompt(agent).catch(() => {});
+                    continue;
+                }
+
+                if (type === "session.status") {
+                    const statusType = props?.status?.type;
+                    const sessionStatus =
+                        statusType === "busy" || statusType === "retry" || statusType === "idle"
+                            ? (statusType as "busy" | "retry" | "idle")
+                            : undefined;
+                    console.log(`[PersistentAgent.SSE] session.status: statusType="${statusType}", sessionId="${props?.sessionID || 'N/A'}"`);
+                    if (sessionStatus) {
+                        this.lastSessionStatus.set(agent.id, sessionStatus);
+                    }
+                }
+
+                // ── question.asked → forward to bot ───────────────────
+                if (type === "question.asked" && this.onQuestion) {
+                    // SDK v2: question id is in props.id (QuestionRequest.id)
+                    const questionId: string = props?.id ?? "";
+                    console.log(`[PersistentAgent] question.asked for agent "${agent.name}": ${questionId}`);
+                    // Deduplicate: skip if already forwarded (can happen on SSE reconnect)
+                    if (!questionId || !this.forwardedQuestionIds.has(questionId)) {
+                        if (questionId) this.forwardedQuestionIds.add(questionId);
+                        this.onQuestion(agent.id, props).catch(err =>
+                            console.error(`[PersistentAgent] onQuestion callback error:`, err)
+                        );
+                    } else {
+                        console.log(`[PersistentAgent] question.asked for agent "${agent.name}" already forwarded, skipping duplicate`);
+                    }
+                }
+
+                // ── session.error → notify bot and resolve pending ─────
+                if (type === "session.error") {
+                    const errorSessionId: string = props?.sessionID ?? "";
+                    const mySessionId = this.sessionIds.get(agent.id);
+
+                    // Extract error message — SDK v2 error is a typed union (ApiError, UnknownError, etc.)
+                    let errorMessage: string = "Error desconocido del modelo";
+                    if (props?.error) {
+                        const err = props.error;
+                        // ApiError has data.message; other types have message directly
+                        errorMessage = err.data?.message ?? err.message ?? String(err);
                     }
 
-                    if (type === "session.status") {
-                        const statusType = props?.status?.type;
-                        const sessionStatus =
-                            statusType === "busy" || statusType === "retry" || statusType === "idle"
-                                ? (statusType as "busy" | "retry" | "idle")
-                                : undefined;
-                        console.log(`[PersistentAgent.SSE] session.status: statusType="${statusType}", sessionId="${props?.sessionID || props?.id || 'N/A'}"`);
-                        if (sessionStatus) {
-                            this.lastSessionStatus.set(agent.id, sessionStatus);
-                        }
-                    }
+                    // Log the full raw event so we can see what opencode is actually sending
+                    console.error(`[PersistentAgent] session.error for agent "${agent.name}": ${errorMessage} | raw: ${JSON.stringify(props)}`);
+                    console.error(`[PersistentAgent] session.error sessionId match: event="${errorSessionId}" mine="${mySessionId}"`);
 
-                    // ── question.asked → forward to bot ───────────────────
-                    if (type === "question.asked" && this.onQuestion) {
-                        const questionId: string = props.id ?? "";
-                        console.log(`[PersistentAgent] question.asked for agent "${agent.name}": ${questionId}`);
-                        // Deduplicate: skip if already forwarded (can happen on SSE reconnect)
-                        if (!questionId || !this.forwardedQuestionIds.has(questionId)) {
-                            if (questionId) this.forwardedQuestionIds.add(questionId);
-                            this.onQuestion(agent.id, props).catch(err =>
-                                console.error(`[PersistentAgent] onQuestion callback error:`, err)
+                    // Resolve pending prompt if the session matches — OR if there is no
+                    // session info in the error event (some opencode versions omit it)
+                    const sessionMatches =
+                        !errorSessionId ||                           // no session in event → assume ours
+                        !mySessionId ||
+                        errorSessionId === mySessionId;
+
+                    if (sessionMatches) {
+                        // Stop heartbeat and resolve in-flight prompt with the error
+                        const pending = this.pendingPrompts.get(agent.id);
+                        if (pending) {
+                            this.stopHeartbeat(agent.id);
+                            this.pendingPrompts.delete(agent.id);
+                            pending.resolve({
+                                output: `❌ Error del modelo: ${errorMessage}`,
+                                sessionId: errorSessionId || mySessionId || "",
+                            });
+                            // Drain queue after error so queued prompts are not lost
+                            this.drainQueue(agent).catch(err =>
+                                console.error(`[PersistentAgent] drainQueue error after session.error for "${agent.name}":`, err)
                             );
+                        }
+                    }
+
+                    // Always notify the bot so the user knows even if there was no pending prompt
+                    if (this.onSessionError) {
+                        this.onSessionError(agent.id, errorMessage).catch(err =>
+                            console.error(`[PersistentAgent] onSessionError callback error:`, err)
+                        );
+                    }
+                }
+
+                // ── session.created → track child sessions ────────────
+                if (type === "session.created") {
+                    // SDK v2: { sessionID, info: Session }
+                    const createdId: string = props?.sessionID ?? props?.info?.id ?? "";
+                    const parentId: string = props?.info?.parentID ?? "";
+                    const mySessionId = this.sessionIds.get(agent.id);
+
+                    if (createdId && parentId && mySessionId && parentId === mySessionId) {
+                        const children = this.activeChildSessions.get(agent.id) ?? new Set<string>();
+                        children.add(createdId);
+                        this.activeChildSessions.set(agent.id, children);
+                        console.log(`[PersistentAgent] session.created: child "${createdId}" tracked for agent "${agent.name}" (parent "${mySessionId}"), active children: ${children.size}`);
+                    }
+                }
+
+                // ── session.deleted → clear active session if matches ────────────
+                if (type === "session.deleted") {
+                    // SDK v2: { sessionID, info: Session }
+                    const deletedId: string = props?.sessionID ?? props?.info?.id ?? "";
+                    const mySessionId = this.sessionIds.get(agent.id);
+
+                    if (deletedId && mySessionId && deletedId === mySessionId) {
+                        console.log(`[PersistentAgent] session.deleted: active session "${deletedId}" was deleted for agent "${agent.name}" — clearing active session`);
+                        this.sessionIds.delete(agent.id);
+                        this.agentDb.setSessionId(agent.id, "");
+                    }
+                }
+
+                // ── session.idle → resolve in-flight prompt ───────────
+                if (type === "session.idle") {
+                    // SDK v2: { sessionID }
+                    const idleSessionId: string = props?.sessionID ?? "";
+                    const mySessionId = this.sessionIds.get(agent.id);
+                    const pendingPrompt = this.pendingPrompts.get(agent.id);
+
+                    console.log(`[PersistentAgent] session.idle event: agent="${agent.name}", idleSessionId="${idleSessionId}", mySessionId="${mySessionId || 'N/A'}", hasPendingPrompt=${!!pendingPrompt}`);
+
+                    // Case 1: event is for our parent session → resolve directly
+                    const isParentSession =
+                        !idleSessionId ||
+                        !mySessionId ||
+                        idleSessionId === mySessionId;
+
+                    if (isParentSession) {
+                        // Before resolving, clear all tracked children (parent is done)
+                        this.activeChildSessions.delete(agent.id);
+                        if (pendingPrompt) {
+                            const resolveId = idleSessionId || mySessionId || "";
+                            console.log(`[PersistentAgent] session.idle for PARENT session "${resolveId}" — resolving prompt for agent "${agent.name}"`);
+                            await this.resolvePromptFromIdle(agent, resolveId);
                         } else {
-                            console.log(`[PersistentAgent] question.asked for agent "${agent.name}" already forwarded, skipping duplicate`);
-                        }
-                    }
-
-                    // ── session.error → notify bot and resolve pending ─────
-                    if (type === "session.error") {
-                        const errorSessionId: string = props?.sessionID ?? props?.id ?? "";
-                        const mySessionId = this.sessionIds.get(agent.id);
-                        let errorMessage: string =
-                            props?.error?.message ?? props?.message ??
-                            (typeof props?.error === "string" ? props.error : null) ??
-                            "Error desconocido del modelo";
-                        
-                        // Extraer mensaje real de errores anidados (ej: APIError con data.message)
-                        if ((errorMessage === "Error desconocido del modelo" || errorMessage?.includes("Unauthorized")) && props?.error?.data) {
-                            const nestedMessage = props.error.data?.message || props.error.data?.error?.message;
-                            if (nestedMessage) {
-                                errorMessage = nestedMessage;
-                            }
-                        }
-
-                        // Log the full raw event so we can see what opencode is actually sending
-                        console.error(`[PersistentAgent] session.error for agent "${agent.name}": ${errorMessage} | raw: ${JSON.stringify(props)}`);
-                        console.error(`[PersistentAgent] session.error sessionId match: event="${errorSessionId}" mine="${mySessionId}"`);
-
-                        // Resolve pending prompt if the session matches — OR if there is no
-                        // session info in the error event (some opencode versions omit it)
-                        const sessionMatches =
-                            !errorSessionId ||                           // no session in event → assume ours
-                            !mySessionId ||
-                            errorSessionId === mySessionId;
-
-                        if (sessionMatches) {
-                            // Stop heartbeat and resolve in-flight prompt with the error
-                            const pending = this.pendingPrompts.get(agent.id);
-                            if (pending) {
-                                this.stopHeartbeat(agent.id);
-                                this.pendingPrompts.delete(agent.id);
-                                pending.resolve({
-                                    output: `❌ Error del modelo: ${errorMessage}`,
-                                    sessionId: errorSessionId || mySessionId || "",
-                                });
-                                // NOTE: Do NOT call onHeartbeatClear here — same race
-                                // condition as in resolvePromptFromIdle. OpenCodeBot's
-                                // .then() handler will clear heartbeatMessages after
-                                // sending/editing the result message.
-                                // Drain queue after error so queued prompts are not lost
-                                this.drainQueue(agent).catch(err =>
-                                    console.error(`[PersistentAgent] drainQueue error after session.error for "${agent.name}":`, err)
-                                );
-                            }
-                        }
-
-                        // Always notify the bot so the user knows even if there was no pending prompt
-                        if (this.onSessionError) {
-                            this.onSessionError(agent.id, errorMessage).catch(err =>
-                                console.error(`[PersistentAgent] onSessionError callback error:`, err)
-                            );
-                        }
-                    }
-
-                    // ── session.created → track child sessions ────────────
-                    if (type === "session.created") {
-                        const createdInfo: any = props?.info ?? props;
-                        const createdId: string = createdInfo?.id ?? "";
-                        const parentId: string = createdInfo?.parentID ?? "";
-                        const mySessionId = this.sessionIds.get(agent.id);
-
-                        if (createdId && parentId && mySessionId && parentId === mySessionId) {
-                            // This is a child session spawned by our parent session.
-                            // Track it so we know the parent is still working.
-                            const children = this.activeChildSessions.get(agent.id) ?? new Set<string>();
-                            children.add(createdId);
-                            this.activeChildSessions.set(agent.id, children);
-                            console.log(`[PersistentAgent] session.created: child "${createdId}" tracked for agent "${agent.name}" (parent "${mySessionId}"), active children: ${children.size}`);
-                        }
-                    }
-
-                    // ── session.deleted → clear active session if matches ────────────
-                    if (type === "session.deleted") {
-                        const deletedId: string = props?.sessionID ?? props?.id ?? "";
-                        const mySessionId = this.sessionIds.get(agent.id);
-                        
-                        if (deletedId && mySessionId && deletedId === mySessionId) {
-                            console.log(`[PersistentAgent] session.deleted: active session "${deletedId}" was deleted for agent "${agent.name}" — clearing active session`);
-                            this.sessionIds.delete(agent.id);
-                            this.agentDb.setSessionId(agent.id, "");
-                        }
-                    }
-
-                    // ── session.idle → resolve in-flight prompt ───────────
-                    if (type === "session.idle") {
-                        const idleSessionId: string = props?.sessionID ?? props?.id ?? "";
-                        const mySessionId = this.sessionIds.get(agent.id);
-                        const pendingPrompt = this.pendingPrompts.get(agent.id);
-
-                        console.log(`[PersistentAgent] session.idle event: agent="${agent.name}", idleSessionId="${idleSessionId}", mySessionId="${mySessionId || 'N/A'}", hasPendingPrompt=${!!pendingPrompt}`);
-
-                        // Case 1: event is for our parent session → resolve directly
-                        const isParentSession =
-                            !idleSessionId ||
-                            !mySessionId ||
-                            idleSessionId === mySessionId;
-
-                        if (isParentSession) {
-                            // Before resolving, clear all tracked children (parent is done)
-                            this.activeChildSessions.delete(agent.id);
-                            if (pendingPrompt) {
-                                const resolveId = idleSessionId || mySessionId || "";
-                                console.log(`[PersistentAgent] session.idle for PARENT session "${resolveId}" — resolving prompt for agent "${agent.name}"`);
-                                await this.resolvePromptFromIdle(agent, resolveId);
-                            } else {
-                                // No pending Telegram prompt — session was started from web/CLI.
-                                // Push the final assistant message as a notification.
-                                const resolveId = idleSessionId || mySessionId || "";
-                                console.log(`[PersistentAgent] session.idle: no pending prompt — firing external idle notification for agent "${agent.name}" session "${resolveId}"`);
-                                this.notifyExternalSessionIdle(agent, resolveId).catch(err =>
-                                    console.error(`[PersistentAgent] notifyExternalSessionIdle error:`, err)
-                                );
-                            }
-                        } else if (pendingPrompt) {
-                            // Case 2: event is for a different session AND we have a pending Telegram prompt.
-                            // Likely a child/sub-agent spawned by our parent.
-                            const children = this.activeChildSessions.get(agent.id);
-                            if (children?.has(idleSessionId)) {
-                                children.delete(idleSessionId);
-                                console.log(`[PersistentAgent] session.idle: child "${idleSessionId}" finished. Remaining active children: ${children.size}`);
-
-                                if (children.size === 0) {
-                                    console.log(`[PersistentAgent] All children idle — checking parent "${mySessionId}" status`);
-                                    await this.handleChildSessionIdle(agent, idleSessionId, mySessionId ?? "");
-                                }
-                            } else {
-                                console.log(`[PersistentAgent] session.idle for untracked session "${idleSessionId}" — checking parent "${mySessionId}" status`);
-                                await this.handleChildSessionIdle(agent, idleSessionId, mySessionId ?? "");
-                            }
-                        } else {
-                            // Case 3: event is for a different session AND no pending Telegram prompt.
-                            // This is a session created from web/CLI with a different sessionId.
-                            // Treat as external session and notify user.
-                            console.log(`[PersistentAgent] session.idle for UNREGISTERED session "${idleSessionId}" (different from "${mySessionId || 'N/A'}') — treating as external web/CLI session for agent "${agent.name}"`);
-                            this.notifyExternalSessionIdle(agent, idleSessionId).catch(err =>
+                            // No pending Telegram prompt — session was started from web/CLI.
+                            const resolveId = idleSessionId || mySessionId || "";
+                            console.log(`[PersistentAgent] session.idle: no pending prompt — firing external idle notification for agent "${agent.name}" session "${resolveId}"`);
+                            this.notifyExternalSessionIdle(agent, resolveId).catch(err =>
                                 console.error(`[PersistentAgent] notifyExternalSessionIdle error:`, err)
                             );
                         }
-                    } else if (type === "message.updated") {
-                        // Log message.updated events for debugging
-                        const msgSessionId = props?.sessionID ?? props?.id ?? "";
-                        console.log(`[PersistentAgent] message.updated event: session="${msgSessionId}"`);
+                    } else if (pendingPrompt) {
+                        // Case 2: event is for a different (child) session
+                        const children = this.activeChildSessions.get(agent.id);
+                        if (children?.has(idleSessionId)) {
+                            children.delete(idleSessionId);
+                            console.log(`[PersistentAgent] session.idle: child "${idleSessionId}" finished. Remaining active children: ${children.size}`);
+                            if (children.size === 0) {
+                                console.log(`[PersistentAgent] All children idle — checking parent "${mySessionId}" status`);
+                                await this.handleChildSessionIdle(agent, idleSessionId, mySessionId ?? "");
+                            }
+                        } else {
+                            console.log(`[PersistentAgent] session.idle for untracked session "${idleSessionId}" — checking parent "${mySessionId}" status`);
+                            await this.handleChildSessionIdle(agent, idleSessionId, mySessionId ?? "");
+                        }
+                    } else {
+                        // Case 3: different session, no pending prompt → external web/CLI session
+                        console.log(`[PersistentAgent] session.idle for UNREGISTERED session "${idleSessionId}" (different from "${mySessionId || 'N/A'}') — treating as external web/CLI session for agent "${agent.name}"`);
+                        this.notifyExternalSessionIdle(agent, idleSessionId).catch(err =>
+                            console.error(`[PersistentAgent] notifyExternalSessionIdle error:`, err)
+                        );
                     }
                 }
-            } catch (err) {
-                clearTimeout(connTimeout);
-                if (abort.signal.aborted) break;
-                // If it was a forced reconnect (connAbort), retry immediately without backoff
-                if (connAbort.signal.aborted && !abort.signal.aborted) {
-                    console.log(`[PersistentAgent] SSE reconnect triggered for agent "${agent.name}" — reconnecting immediately`);
-                    await this.recoverPendingQuestions(agent);
-                    await this.recoverPendingPrompt(agent);
-                    continue;
+
+                if (type === "message.updated") {
+                    const msgSessionId = props?.sessionID ?? "";
+                    console.log(`[PersistentAgent] message.updated event: session="${msgSessionId}"`);
                 }
-                console.warn(`[PersistentAgent] SSE stream for agent "${agent.name}" disconnected, retrying in ${retryDelay}ms`);
-                await new Promise(r => setTimeout(r, retryDelay));
-                retryDelay = Math.min(retryDelay * 2, 15000);
-                await this.recoverPendingQuestions(agent);
-                await this.recoverPendingPrompt(agent);
+                    } // end for chunk
+                } // end while reader
             } finally {
-                clearTimeout(connTimeout);
+                abort.signal.removeEventListener('abort', abortHandler);
+                reader.releaseLock();
             }
+
+            // Stream ended normally — reconnect after short delay
+            if (!abort.signal.aborted) {
+                console.log(`[PersistentAgent] SSE stream closed normally for agent "${agent.name}" — reconnecting in ${reconnectDelay}ms`);
+                await new Promise(r => setTimeout(r, reconnectDelay));
+                reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+            }
+        } catch (err) {
+            if (abort.signal.aborted) break;
+            console.error(`[PersistentAgent] SSE loop error for agent "${agent.name}":`, err);
+            await new Promise(r => setTimeout(r, reconnectDelay));
+            reconnectDelay = Math.min(reconnectDelay * 2, 10000);
         }
+        } // end while
+
+        console.log(`[PersistentAgent] SSE loop ended for agent "${agent.name}" (aborted=${abort.signal.aborted})`);
     }
 
     /**
