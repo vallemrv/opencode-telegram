@@ -24,6 +24,7 @@ export class ConfigService {
 
     // Agent Configuration
     private readonly maxAgents: number;
+    private readonly opencodeRemoteHost: string;
 
     // System Environment
     private readonly homeDirectory: string;
@@ -74,6 +75,7 @@ export class ConfigService {
             process.env.MAX_OPENCODE_SERVERS || process.env.MAX_AGENTS || '5',
             10,
         );
+        this.opencodeRemoteHost = process.env.OPENCODE_REMOTE_HOST || 'localhost';
 
         // Load system environment
         this.homeDirectory = process.env.HOME || '/tmp';
@@ -127,6 +129,10 @@ export class ConfigService {
     // Agent Configuration Getters
     getMaxAgents(): number {
         return this.maxAgents;
+    }
+
+    getOpencodeRemoteHost(): string {
+        return this.opencodeRemoteHost;
     }
 
     // System Environment Getters

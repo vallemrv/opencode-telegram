@@ -867,6 +867,7 @@ export class ProjectsHandler {
                 status: "running",
                 createdAt: new Date().toISOString(),
                 lastUsedAt: new Date().toISOString(),
+                host: this.ctx.configService.getOpencodeRemoteHost(),
             };
             this.ctx.agentDb.save(agent);
 

@@ -21,6 +21,10 @@ function getAgentBaseUrl(agent: { host?: string; port: number }): string {
 export class MessageHandler {
     constructor(private readonly ctx: BotContext) {}
 
+    // Track last heartbeat time per session to prevent Telegram rate limiting (min 5s between updates)
+    private lastHeartbeatTime: Map<string, number> = new Map();
+    private readonly MIN_HEARTBEAT_INTERVAL_MS = 5000;
+
     // ── Regular text message routing ──────────────────────────────────────────
 
     async handleMessage(ctx: Context): Promise<void> {
@@ -476,6 +480,17 @@ async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<
         const agent = this.ctx.agentDb.getById(agentId);
         if (!agent) return;
 
+        // Rate limiting: ensure minimum interval between heartbeats to avoid Telegram limits
+        const hbKey = `${agentId}:${summary.sessionId}`;
+        const now = Date.now();
+        const lastTime = this.lastHeartbeatTime.get(hbKey) ?? 0;
+        const timeSinceLast = now - lastTime;
+        
+        if (timeSinceLast < this.MIN_HEARTBEAT_INTERVAL_MS) {
+            console.log(`[MessageHandler.handleAgentHeartbeat] Skipping update for "${agent.name}" - too soon (${timeSinceLast}ms < ${this.MIN_HEARTBEAT_INTERVAL_MS}ms)`);
+            return;
+        }
+
         const elapsed = summary.minutesRunning === 0
             ? "< 1 min"
             : `${summary.minutesRunning} min`;
@@ -520,28 +535,35 @@ async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<
         const filesEdited = summary.filesModified;
         text += `\n\n📊 ${summary.messageCount} mensajes · ${filesEdited} edici${filesEdited !== 1 ? "ones" : "ón"}`;
 
-        // Use composite key for session-specific heartbeat tracking
-        const hbKey = `${agentId}:${summary.sessionId}`;
+        // Use composite key for session-specific heartbeat tracking (hbKey already defined above)
         const existing = this.ctx.heartbeatMessages.get(hbKey);
+        let success = false;
         if (existing) {
             console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" session ${summary.sessionId} - editing message ${existing.msgId}`);
             try {
                 await bot.api.editMessageText(existing.chatId, existing.msgId, text, { parse_mode: "HTML" });
+                success = true;
             } catch (err: any) {
                 // "message is not modified" (400) is benign — the text didn't change this tick.
                 // Only clear the reference if the message truly no longer exists (deleted/too old).
                 const desc: string = err?.description ?? "";
+                const messageNotModified = desc.includes("message is not modified");
                 const messageGone =
                     err?.error_code === 400 &&
                     (desc.includes("message to edit not found") ||
                      desc.includes("MESSAGE_ID_INVALID") ||
                      desc.includes("can't find"));
-                if (messageGone) {
+                
+                if (messageNotModified) {
+                    // Message content hasn't changed - still count as successful update
+                    // to maintain the rate limiting schedule
+                    success = true;
+                    console.log(`[MessageHandler.handleAgentHeartbeat] Message ${existing.msgId} not modified for "${agent.name}" - content unchanged`);
+                } else if (messageGone) {
                     console.warn(`[MessageHandler.handleAgentHeartbeat] Message ${existing.msgId} gone for "${agent.name}" session ${summary.sessionId} - clearing reference`);
                     this.ctx.heartbeatMessages.delete(hbKey);
                 }
-                // For "message is not modified" we keep the reference so the next
-                // tick can still edit the same message when content changes.
+                // For other errors, we don't update lastHeartbeatTime so it can retry sooner
             }
         } else {
             console.log(`[MessageHandler.handleAgentHeartbeat] Agent "${agent.name}" session ${summary.sessionId} - no existing heartbeat, creating new`);
@@ -551,10 +573,16 @@ async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<
                 if (msg) {
                     this.ctx.heartbeatMessages.set(hbKey, { chatId, msgId: msg.message_id, userId });
                     console.log(`[MessageHandler.handleAgentHeartbeat] Created heartbeat message ${msg.message_id} for "${agent.name}" session ${summary.sessionId}`);
+                    success = true;
                 }
             } catch (err) {
                 console.error("[MessageHandler.handleAgentHeartbeat] Failed to send heartbeat message:", err);
             }
+        }
+        
+        // Update last heartbeat time on successful update
+        if (success) {
+            this.lastHeartbeatTime.set(hbKey, Date.now());
         }
     }
 

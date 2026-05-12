@@ -34,8 +34,14 @@ export class ServersHandler {
             const isActive = agent.id === activeId;
             const displayName = this.getAgentDisplayName(agent.name);
             const label = isActive ? `✅ ${displayName}` : `🤖 ${displayName}`;
+            const host = agent.host || "localhost";
+            const sessionId = this.ctx.persistentAgentService.getSessionId(agent.id);
+            const webUrl = sessionId
+                ? `http://${host}:${agent.port}/session/${sessionId}`
+                : `http://${host}:${agent.port}`;
             keyboard
                 .text(label, `server:activate:${agent.id}`)
+                .url("🌐", webUrl)
                 .text("🗑️", `server:del:${agent.id}`)
                 .row();
         }

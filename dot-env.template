@@ -28,6 +28,10 @@ OPENCODE_DEFAULT_MODEL=github-copilot/claude-sonnet-4.6
 # Use 127.0.0.1 if you don't want the servers reachable outside localhost
 OPENCODE_BIND_HOST=0.0.0.0
 
+# Remote host for connecting to external opencode servers (default: localhost)
+# Example: OPENCODE_REMOTE_HOST=10.0.0.8
+OPENCODE_REMOTE_HOST=localhost
+
 # ─── Workspace ───────────────────────────────────────────────────────────────
 # Root directory shown in the /proyectos browser.
 # Supports ~ expansion.

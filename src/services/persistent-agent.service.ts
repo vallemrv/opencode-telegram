@@ -250,6 +250,9 @@ export class PersistentAgentService {
     /** Map of agentId → heartbeat timer handle (only active while prompt is in-flight) */
     private heartbeatTimers: Map<string, NodeJS.Timeout> = new Map();
 
+    /** Map of agentId → timestamp (ms) of last heartbeat sent to track minimum interval */
+    private lastHeartbeatSentAt: Map<string, number> = new Map();
+
     /** Map of agentId → safety timeout handle (prevents indefinite hanging) */
     private safetyTimers: Map<string, NodeJS.Timeout> = new Map();
 
@@ -1401,19 +1404,34 @@ export class PersistentAgentService {
     private startHeartbeat(agent: PersistentAgent): void {
         if (this.heartbeatTimers.has(agent.id)) return;
 
-        const timer = setInterval(async () => {
-            await this.fireHeartbeat(agent);
-        }, HEARTBEAT_INTERVAL_MS);
+        // Use recursive setTimeout instead of setInterval to prevent overlapping executions
+        // and ensure we wait the full interval between heartbeats
+        const scheduleNext = () => {
+            const timer = setTimeout(async () => {
+                const startTime = Date.now();
+                await this.fireHeartbeat(agent);
+                
+                // Check if heartbeat should continue (only if still pending)
+                if (this.pendingPrompts.has(agent.id)) {
+                    scheduleNext();
+                } else {
+                    this.heartbeatTimers.delete(agent.id);
+                }
+            }, HEARTBEAT_INTERVAL_MS);
+            
+            if (timer.unref) timer.unref();
+            this.heartbeatTimers.set(agent.id, timer);
+        };
 
-        if (timer.unref) timer.unref();
-        this.heartbeatTimers.set(agent.id, timer);
+        scheduleNext();
     }
 
     private stopHeartbeat(agentId: string): void {
         const timer = this.heartbeatTimers.get(agentId);
         if (timer) {
-            clearInterval(timer);
+            clearTimeout(timer);
             this.heartbeatTimers.delete(agentId);
+            this.lastHeartbeatSentAt.delete(agentId);
         }
     }
 
