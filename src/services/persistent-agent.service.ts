@@ -198,7 +198,7 @@ export async function findOpencodeCmd(): Promise<string> {
 }
 
 /** Heartbeat interval while a prompt is in-flight */
-const HEARTBEAT_INTERVAL_MS = 20 * 1000;
+const HEARTBEAT_INTERVAL_MS = 30 * 1000;
 
 /** File-modifying tool names recognised for the filesModified counter */
 const FILE_WRITE_TOOLS = new Set(["edit", "write", "patch", "multiedit"]);
