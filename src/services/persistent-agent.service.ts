@@ -1427,6 +1427,12 @@ export class PersistentAgentService {
             if (statusRes.ok) {
                 const session: any = await statusRes.json();
                 const status = session?.status ?? session?.info?.status;
+                
+                // Update lastSessionStatus from HTTP response for heartbeat display
+                if (status && (status === "busy" || status === "retry" || status === "idle")) {
+                    this.lastSessionStatus.set(agent.id, status);
+                }
+                
                 if (status === "idle") {
                     const children = this.activeChildSessions.get(agent.id);
                     const hasActiveChildren = children && children.size > 0;
@@ -1437,11 +1443,15 @@ export class PersistentAgentService {
                     } else {
                         console.log(`[PersistentAgent] fireHeartbeat watchdog: parent session "${pending.sessionId}" is idle but ${children!.size} child session(s) still active — waiting`);
                     }
+                } else if (status) {
+                    console.log(`[PersistentAgent] fireHeartbeat watchdog: session status="${status}" (waiting for idle)`);
                 }
-                // If status is missing or not 'idle', do NOT resolve — trust the SSE loop.
+                // If status is missing, do NOT resolve — trust the SSE loop.
+            } else {
+                console.log(`[PersistentAgent] fireHeartbeat watchdog: HTTP ${statusRes.status} checking session status`);
             }
-        } catch {
-            // best-effort watchdog only
+        } catch (err) {
+            console.log(`[PersistentAgent] fireHeartbeat watchdog: error checking session status: ${err}`);
         }
 
         const minutesRunning = (Date.now() - pending.startedAt) / 60000;
