@@ -2,9 +2,13 @@
 
 # Script de inicio para OpenCode Telegram Bot
 # Previene múltiples instancias
+#
+# **NOTA: Este script eslegacy. Usar systemd para gestionar el bot:**
+#   sudo systemctl start/stop/restart/status opencode-telegram
+# **NUNCA usar PM2 - causa conflictos de token (error 409)**
 
 PIDFILE="/var/run/opencode-telegram.pid"
-WORKDIR="/home/valle/Documentos/proyectos/opencode-telegram"
+WORKDIR="/home/valle/proyectos/opencode-telegram"
 USER="valle"
 
 # Función para limpiar procesos existentes

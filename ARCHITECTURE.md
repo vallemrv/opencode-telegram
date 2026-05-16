@@ -129,7 +129,7 @@ Tablas gestionadas por `SessionDbService`:
 ```ini
 # /etc/systemd/system/opencode-telegram.service
 ExecStart=/usr/bin/node dist/cli.js
-WorkingDirectory=/home/valle/Documentos/proyectos/opencode-telegram
+WorkingDirectory=/home/valle/proyectos/opencode-telegram
 EnvironmentFile=.../.env
 StandardOutput=append:.../bot.log
 StandardError=append:.../bot.log

@@ -406,7 +406,7 @@ export class PersistentAgentService {
         console.log(`[PersistentAgent.startAgent] Spawning opencode serve on ${hostname}:${agent.port}`);
         const shellCmd = `cd ${workdir} && ${cmd} serve --port ${agent.port} --hostname ${hostname}`;
         console.log(`[PersistentAgent.startAgent] Shell command: ${shellCmd}`);
-        const child = spawn("sh", ["-c", shellCmd], {
+        const child = spawn("/usr/bin/sh", ["-c", shellCmd], {
             cwd: workdir,
             detached: false,
             stdio: "ignore",

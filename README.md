@@ -105,6 +105,19 @@ npm install -g opencode-ai
 For more details, see [OpenCode Integration Documentation](docs/opencode-integration.md).
 
 
+## Deployment (Systemd)
+
+**IMPORTANT: Use systemd to manage the bot, NOT PM2.**
+
+PM2 causes conflicts (error 409: Conflict: terminated by other getUpdates request) by creating duplicate instances that conflict with systemd.
+
+```bash
+sudo systemctl start opencode-telegram
+sudo systemctl stop opencode-telegram
+sudo systemctl restart opencode-telegram
+sudo systemctl status opencode-telegram
+```
+
 ## Quick Installation
 
 Choose the installation method that works best for you:
