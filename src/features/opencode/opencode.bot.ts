@@ -3,9 +3,8 @@
  *
  * Comandos:
  *   /proyectos — Navega proyectos del workspace, abre servidor
- *   /new       — Wizard: navega carpeta padre → nombre → git opcional → crea agente
- *   /agents    — Lista agentes, activa sticky, borra
- *   /run       — One-shot: prompt puntual a un agente
+ *   /servers    — Lista servidores, activa sticky, borra
+ *   /run       — One-shot: prompt puntual a un servidor
  *   /models    — Cambia el modelo del agente activo
  *   /esc       — Cancela wizard, desactiva sticky, o aborta operación en curso
  *   /undo      — Revertir último mensaje (solo agentes OpenCode)
@@ -16,7 +15,7 @@
  * Flujo de mensajes:
  *   1. Si hay agente sticky → va a él
  *   2. Si no → va al último agente usado (persistido en DB)
- *   3. Si no hay ninguno → pide crear uno con /new
+ *   3. Si no hay ninguno → pide crear uno con /proyectos
  *
  * Architecture:
  *   All handler logic lives in src/features/opencode/handlers/*.handler.ts
@@ -552,6 +551,9 @@ export class OpenCodeBot implements BotContext {
 
         // ─── Server callbacks ────────────────────────────────────────────────
         bot.callbackQuery(/^server:activate:/,  AccessControlMiddleware.requireAccess, this.serversHandler.handleServerActivate.bind(this.serversHandler));
+        bot.callbackQuery(/^server:restart:/,   AccessControlMiddleware.requireAccess, this.serversHandler.handleServerRestart.bind(this.serversHandler));
+        bot.callbackQuery(/^server:restartconfirm:/, AccessControlMiddleware.requireAccess, this.serversHandler.handleServerRestartConfirm.bind(this.serversHandler));
+        bot.callbackQuery(/^server:restartcancel$/, AccessControlMiddleware.requireAccess, this.serversHandler.handleServerRestartCancel.bind(this.serversHandler));
         bot.callbackQuery(/^server:del:/,       AccessControlMiddleware.requireAccess, this.serversHandler.handleServerDelete.bind(this.serversHandler));
         bot.callbackQuery(/^server:delconfirm:/, AccessControlMiddleware.requireAccess, this.serversHandler.handleServerDeleteConfirm.bind(this.serversHandler));
         bot.callbackQuery(/^server:delcancel$/, AccessControlMiddleware.requireAccess, this.serversHandler.handleServerDeleteCancel.bind(this.serversHandler));

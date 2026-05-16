@@ -9,6 +9,12 @@ import { escapeHtml } from "../utils.js";
 
 export class ServersHandler {
     constructor(private readonly ctx: BotContext) {}
+    
+    private getPublicUrl(agent: { port: number; workdir: string }): string {
+        const host = this.ctx.configService.getOpencodeRemoteHost();
+        const pathBase64 = Buffer.from(agent.workdir).toString('base64url');
+        return `http://${host}:${agent.port}/${pathBase64}`;
+    }
 
     async handleServers(ctx: Context): Promise<void> {
         const userId = ctx.from?.id;
@@ -34,13 +40,10 @@ for (const agent of agents) {
             const isActive = agent.id === activeId;
             const displayName = this.getAgentDisplayName(agent.name);
             const label = isActive ? `✅ ${displayName}` : `🤖 ${displayName}`;
-            const host = agent.host || "localhost";
-            const sessionId = this.ctx.persistentAgentService.getSessionId(agent.id);
-            const webUrl = sessionId
-                ? `http://${host}:${agent.port}/session/${sessionId}`
-                : `http://${host}:${agent.port}`;
+            const webUrl = this.getPublicUrl(agent);
             keyboard
                 .text(label, `server:activate:${agent.id}`)
+                .text("🔄", `server:restart:${agent.id}`)
                 .text("🗑️", `server:del:${agent.id}`)
                 .row()
                 .url(`🌐 ${displayName}`, webUrl)
@@ -124,8 +127,7 @@ for (const agent of agents) {
         const agent = this.ctx.agentDb.getById(agentId);
         if (!agent) { await ctx.editMessageText("❌ Servidor no encontrado."); return; }
 
-        const host = agent.host || "localhost";
-        const baseUrl = `http://${host}:${agent.port}`;
+        const baseUrl = this.getPublicUrl(agent);
 
         try {
             const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
@@ -161,6 +163,64 @@ for (const agent of agents) {
     }
 
     async handleServerDeleteCancel(ctx: Context): Promise<void> {
+        await ctx.answerCallbackQuery();
+        await ctx.deleteMessage().catch(() => {});
+        await this.handleServers(ctx);
+    }
+
+    async handleServerRestart(ctx: Context): Promise<void> {
+        await ctx.answerCallbackQuery();
+        const callbackData = ctx.callbackQuery?.data;
+        if (!callbackData?.startsWith("server:restart:")) return;
+        const agentId = callbackData.replace("server:restart:", "");
+        const agent = this.ctx.agentDb.getById(agentId);
+        if (!agent) { await ctx.editMessageText("❌ Servidor no encontrado."); return; }
+
+        const keyboard = new InlineKeyboard()
+            .text("✅ Sí, reiniciar", `server:restartconfirm:${agentId}`)
+            .text("❌ Cancelar", "server:restartcancel");
+
+        await ctx.editMessageText(
+            `🔄 ¿Reiniciar servidor <b>${escapeHtml(agent.name)}</b>?\n\nSe detendrá y volverá a arrancar. La sesión activa se perderá.`,
+            { parse_mode: "HTML", reply_markup: keyboard }
+        );
+    }
+
+    async handleServerRestartConfirm(ctx: Context): Promise<void> {
+        await ctx.answerCallbackQuery();
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        const callbackData = ctx.callbackQuery?.data;
+        if (!callbackData?.startsWith("server:restartconfirm:")) return;
+        const agentId = callbackData.replace("server:restartconfirm:", "");
+        const agent = this.ctx.agentDb.getById(agentId);
+        if (!agent) { await ctx.editMessageText("❌ Servidor no encontrado."); return; }
+
+        await ctx.editMessageText(
+            `🔄 Reiniciando <b>${escapeHtml(agent.name)}</b>...`,
+            { parse_mode: "HTML" }
+        );
+
+        this.ctx.persistentAgentService.stopAgent(agentId);
+        this.ctx.agentDb.clearSessionId(agentId);
+
+        const result = await this.ctx.persistentAgentService.startAgent(agent);
+        
+        if (result.success) {
+            await ctx.editMessageText(
+                `✅ Servidor <b>${escapeHtml(agent.name)}</b> reiniciado en puerto ${agent.port}.`,
+                { parse_mode: "HTML" }
+            );
+        } else {
+            await ctx.editMessageText(
+                `❌ Error reiniciando <b>${escapeHtml(agent.name)}</b>: ${escapeHtml(result.message)}`,
+                { parse_mode: "HTML" }
+            );
+        }
+    }
+
+    async handleServerRestartCancel(ctx: Context): Promise<void> {
         await ctx.answerCallbackQuery();
         await ctx.deleteMessage().catch(() => {});
         await this.handleServers(ctx);

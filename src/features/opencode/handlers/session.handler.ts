@@ -43,7 +43,7 @@ export class SessionHandler {
 
         const agent = this.ctx.getActiveOrLastAgent(userId);
         if (!agent) {
-            await ctx.reply("ℹ️ No hay agente activo. Activa uno con /agents.");
+            await ctx.reply("ℹ️ No hay servidor activo. Activa uno con /servers.");
             return;
         }
 
@@ -249,7 +249,7 @@ export class SessionHandler {
         if (!userId) return;
 
         const agent = this.ctx.getActiveOrLastAgent(userId);
-        if (!agent) { await ctx.reply("ℹ️ No hay agente activo. Activa uno con /agents."); return; }
+        if (!agent) { await ctx.reply("ℹ️ No hay servidor activo. Activa uno con /servers."); return; }
 
         const sessionId = this.ctx.persistentAgentService.getSessionId(agent.id);
         if (!sessionId) { await ctx.reply("ℹ️ No hay sesión activa que borrar."); return; }
@@ -288,7 +288,7 @@ export class SessionHandler {
         if (!userId) return;
 
         const agent = this.ctx.getActiveOrLastAgent(userId);
-        if (!agent) { await ctx.reply("ℹ️ No hay agente activo. Activa uno con /agents."); return; }
+        if (!agent) { await ctx.reply("ℹ️ No hay servidor activo. Activa uno con /servers."); return; }
 
         const baseUrl = getAgentBaseUrl(agent);
         try {
@@ -330,7 +330,7 @@ export class SessionHandler {
         if (!userId) return;
 
         const agent = this.ctx.getActiveOrLastAgent(userId);
-        if (!agent) { await ctx.reply("ℹ️ No hay agente activo. Activa uno con /agents."); return; }
+        if (!agent) { await ctx.reply("ℹ️ No hay servidor activo. Activa uno con /servers."); return; }
 
         const sessionId = this.ctx.persistentAgentService.getSessionId(agent.id);
         if (!sessionId) { await ctx.reply("ℹ️ No hay sesión activa para renombrar."); return; }

@@ -142,7 +142,7 @@ export class ModelsHandler {
 
         const agents = this.ctx.agentDb.getByUser(userId);
         if (agents.length === 0) {
-            await ctx.reply("ℹ️ No tienes agentes. Crea uno con /new.");
+            await ctx.reply("ℹ️ No tienes servidores. Crea uno con /proyectos.");
             return;
         }
 

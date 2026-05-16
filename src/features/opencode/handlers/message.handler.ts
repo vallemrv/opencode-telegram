@@ -71,7 +71,7 @@ export class MessageHandler {
         if (!activeId) {
             await ctx.reply(
                 `ℹ️ No hay ningún agente activo.\n\n` +
-                `Crea uno con /new o activa uno existente con /agents.`
+                `Crea uno con /proyectos o activa uno existente con /servers.`
             );
             return;
         }
@@ -80,14 +80,14 @@ export class MessageHandler {
         if (!agent) {
             this.ctx.persistentAgentService.clearActiveAgent(userId);
             this.ctx.agentDb.clearLastUsed(userId);
-            await ctx.reply("❌ El agente activo ya no existe. Usa /new o /agents.");
+            await ctx.reply("❌ El agente activo ya no existe. Usa /proyectos o /servers.");
             return;
         }
 
         if (agent.status === "stopped") {
             await ctx.reply(
                 `⏸️ El agente <b>${escapeHtml(agent.name)}</b> está aparcado.\n\n` +
-                `Reanúdalo con ▶️ en /agents antes de enviarle mensajes.`,
+                `Reanúdalo con ▶️ en /servers antes de enviarle mensajes.`,
                 { parse_mode: "HTML" }
             );
             return;
@@ -105,7 +105,7 @@ export class MessageHandler {
         const allAgents = this.ctx.agentDb.getByUser(userId);
         const agents = allAgents.filter(a => a.status !== "stopped");
         if (agents.length === 0) {
-            await ctx.reply("ℹ️ No tienes agentes activos. Crea uno con /new o reanuda un agente aparcado con /agents.");
+            await ctx.reply("ℹ️ No tienes servidores activos. Crea uno con /proyectos o reanuda un servidor con /servers.");
             return;
         }
 
@@ -485,7 +485,9 @@ async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<
         const now = new Date();
         const timeStr = now.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
-        let text = `⏳ <b>${escapeHtml(agent.name)}</b> — ${elapsed} · ${timeStr}`;
+        const statusIcon = summary.sessionStatus === "busy" ? "🔄" : summary.sessionStatus === "retry" ? "🔁" : "⏳";
+        const statusText = summary.sessionStatus ? ` · ${summary.sessionStatus}` : "";
+        let text = `${statusIcon} <b>${escapeHtml(agent.name)}</b> — ${elapsed}${statusText} · ${timeStr}`;
 
         if (summary.lastToolName) {
             text += `\n🔧 <code>${escapeHtml(summary.lastToolName)}</code>`;
@@ -648,7 +650,7 @@ async handleAgentHeartbeat(agentId: string, summary: HeartbeatSummary): Promise<
                     }
                 }
 
-                await ctx.reply("ℹ️ Transcripción lista. Usa /agents para activar un agente.");
+                await ctx.reply("ℹ️ Transcripción lista. Usa /servers para activar un servidor.");
                 return;
             }
 

@@ -90,7 +90,7 @@ Al reconectar, `recoverPendingPrompt()` comprueba si la sesión ya está `idle` 
 `/esc` ahora tiene tres niveles, en orden de prioridad:
 
 1. **Prompt en vuelo**: si el agente activo/último está `isBusy()` → `cancelPendingPrompt()` → edita el mensaje de heartbeat con `❌ cancelado`.
-2. **Wizard activo** (`/new`, `/run`, `/rename`): cancela el wizard.
+2. **Wizard activo** (`/proyectos`, `/run`, `/rename`): cancela el wizard.
 3. **Agente sticky**: desactiva el agente fijo del usuario.
 
 ---
@@ -145,8 +145,8 @@ Logs: `tail -f bot.log` o `journalctl -u opencode-telegram -f`.
 
 | Comando | Descripción |
 |---------|-------------|
-| `/new` | Wizard para crear un agente nuevo (workdir local) |
-| `/agents` | Lista agentes, activa sticky, borra |
+| `/proyectos` | Explora proyectos, crea folders, abre/wizard de servidores |
+| `/servers` | Lista servidores, activa sticky, borra |
 | `/session` | Lista y gestiona sesiones del agente activo |
 | `/rename` | Renombra la sesión activa |
 | `/delete` | Borra sesión activa y crea una nueva |
