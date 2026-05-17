@@ -130,11 +130,10 @@ for (const agent of agents) {
         const baseUrl = this.getPublicUrl(agent);
 
         try {
-            const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
+            const agentDir = resolveDir(agent.workdir);
+            const sessRes = await fetch(`${baseUrl}/session?directory=${encodeURIComponent(agentDir)}`, { signal: AbortSignal.timeout(5000) });
             if (sessRes.ok) {
-                const allSessions: any[] = await sessRes.json();
-                const agentDir = resolveDir(agent.workdir);
-                const sessions = allSessions.filter((s: any) => !s.directory || s.directory === agentDir);
+                const sessions: any[] = await sessRes.json();
                 await Promise.all(sessions.map(s =>
                     fetch(`${baseUrl}/session/${s.id}`, {
                         method: "DELETE",

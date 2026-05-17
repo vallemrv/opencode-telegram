@@ -563,11 +563,16 @@ export class OpenCodeBot implements BotContext {
 
         // ─── Regular text messages ───────────────────────────────────────────
         bot.on("message:text", AccessControlMiddleware.requireAccess, async (ctx, next) => {
+            console.log(`[OpenCodeBot.message:text] ENTER: text="${ctx.message?.text?.slice(0, 50)}..."`);
             if (ctx.message?.text?.startsWith("/")) return next();
             if (ctx.message?.text === "⏹️ ESC") return next();
             const userId = ctx.from?.id;
             if (!userId) return;
 
+            // Check if agent is busy and should queue
+            const activeId = this.persistentAgentService.getActiveAgentId(userId);
+            console.log(`[OpenCodeBot.message:text] userId=${userId}, activeId="${activeId || 'N/A'}", isBusy=${activeId ? this.persistentAgentService.isBusy(activeId) : false}`);
+            
             // Projects wizard states
             if (this.projectsHandler.isWizardModel(userId)) {
                 // No text input in wizard — model step uses inline picker only

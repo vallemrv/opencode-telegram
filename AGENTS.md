@@ -1,21 +1,12 @@
-# AGENTS.md
+# opencode-telegram
 
-## OpenCode Telegram Bot - Deployment
+Project created via TelegramCoder.
 
-**El bot solamente se arranca y gestiona a través de systemd:**
+## Notas importantes
 
-```bash
-sudo systemctl start opencode-telegram
-sudo systemctl stop opencode-telegram
-sudo systemctl restart opencode-telegram
-sudo systemctl status opencode-telegram
-```
-
-**NUNCA usar PM2** para gestionar el bot. PM2 causa conflictos de token (error 409: Conflict: terminated by other getUpdates request) al crear instancias duplicadas que pelean con systemd.
-
-Siempre verificar que no haya procesos huérfanos de PM2 antes de reiniciar:
-
-```bash
-pm2 list
-# Si aparece telegramCoder: pm2 stop telegramCoder && pm2 delete telegramCoder
-```
+- **sudo sin password**: El usuario `valle` tiene sudo sin contraseña para gestionar el servicio `opencode-telegram.service`.
+- **Comandos de servicio**:
+  - `sudo systemctl stop opencode-telegram` - Detener el bot
+  - `sudo systemctl start opencode-telegram` - Iniciar el bot
+  - `sudo systemctl status opencode-telegram` - Ver estado
+  - `sudo journalctl -u opencode-telegram -f` - Ver logs en tiempo real

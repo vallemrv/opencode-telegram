@@ -48,6 +48,12 @@ bot.catch((err) => {
     console.error(`[TelegramCoder] Error while handling update ${ctx.update.update_id}:`, err.error);
 });
 
+// Debug: log every update received
+bot.use(async (ctx, next) => {
+    console.log(`[TelegramCoder] Update received: update_id=${ctx.update.update_id}, type=${Object.keys(ctx.update).filter(k => k !== 'update_id').join(',')}`);
+    await next();
+});
+
 // Set config service for access control
 AccessControlMiddleware.setConfigService(configService);
 
@@ -107,12 +113,12 @@ async function startBot() {
         }
 
         // Restore active agents state from DB
-        // NOTE: opencodeBot has its own PersistentAgentService instance — we must
-        // use THAT instance, not the standalone one created above (which is unused).
-        // restoreActiveAgentsState() was already called inside registerHandlers(),
-        // so we just read the map again to build the restart notification.
+        // NOTE: restoreActiveAgentsState() was already called inside registerHandlers()
+        // (before restoreAll/startAgent runs), so we must NOT call it again here —
+        // calling it a second time would overwrite the in-memory sessionIds with stale
+        // values from the DB, undoing any new sessions created during startAgent.
         try {
-            const restoredAgents = opencodeBot.persistentAgentService.restoreActiveAgentsState();
+            const restoredAgents = opencodeBot.persistentAgentService.getActiveAgents();
             
             // Helper: fetch session title with retry until server is ready (max 30s)
             async function fetchSessionTitle(baseUrl: string, sessionId: string): Promise<string> {

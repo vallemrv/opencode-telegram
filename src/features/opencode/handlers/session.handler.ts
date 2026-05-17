@@ -222,10 +222,10 @@ export class SessionHandler {
                 }
             }
 
-            const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
+            const workdir = resolveDir(agent.workdir);
+            const sessRes = await fetch(`${baseUrl}/session?directory=${encodeURIComponent(workdir)}`, { signal: AbortSignal.timeout(5000) });
             if (sessRes.ok) {
-                const allSessions: any[] = await sessRes.json();
-                const sessions = filterSessionsByWorkdir(allSessions, agent.workdir);
+                const sessions: any[] = await sessRes.json();
                 await Promise.all(sessions.map(s =>
                     fetch(`${baseUrl}/session/${s.id}`, { method: "DELETE", signal: AbortSignal.timeout(8000) }).catch(() => {})
                 ));
@@ -304,10 +304,10 @@ export class SessionHandler {
                 }
             }
 
-            const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
+            const workdir = resolveDir(agent.workdir);
+            const sessRes = await fetch(`${baseUrl}/session?directory=${encodeURIComponent(workdir)}`, { signal: AbortSignal.timeout(5000) });
             if (sessRes.ok) {
-                const allSessions: any[] = await sessRes.json();
-                const sessions = filterSessionsByWorkdir(allSessions, agent.workdir);
+                const sessions: any[] = await sessRes.json();
                 await Promise.all(sessions.map(s =>
                     fetch(`${baseUrl}/session/${s.id}`, { method: "DELETE", signal: AbortSignal.timeout(8000) }).catch(() => {})
                 ));
@@ -376,11 +376,11 @@ export class SessionHandler {
         if (!agent) { await ctx.reply("ℹ️ No hay agente activo."); return; }
 
         const baseUrl = getAgentBaseUrl(agent);
+        const workdir = resolveDir(agent.workdir);
         try {
-            const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
+            const sessRes = await fetch(`${baseUrl}/session?directory=${encodeURIComponent(workdir)}`, { signal: AbortSignal.timeout(5000) });
             if (!sessRes.ok) { await ctx.reply("❌ No se pudo conectar al servidor del agente."); return; }
-            const allSessions: any[] = await sessRes.json();
-            const sessions = filterSessionsByWorkdir(allSessions, agent.workdir);
+            const sessions: any[] = await sessRes.json();
             if (sessions.length === 0) { await ctx.reply("ℹ️ No hay sesiones."); return; }
             const session = sessions.sort((a, b) => b.time.updated - a.time.updated)[0];
 
@@ -407,11 +407,11 @@ export class SessionHandler {
         if (!agent) { await ctx.reply("ℹ️ No hay agente activo."); return; }
 
         const baseUrl = getAgentBaseUrl(agent);
+        const workdir = resolveDir(agent.workdir);
         try {
-            const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
+            const sessRes = await fetch(`${baseUrl}/session?directory=${encodeURIComponent(workdir)}`, { signal: AbortSignal.timeout(5000) });
             if (!sessRes.ok) { await ctx.reply("❌ No se pudo conectar al servidor del agente."); return; }
-            const allSessions: any[] = await sessRes.json();
-            const sessions = filterSessionsByWorkdir(allSessions, agent.workdir);
+            const sessions: any[] = await sessRes.json();
             if (sessions.length === 0) { await ctx.reply("ℹ️ No hay sesiones."); return; }
             const session = sessions.sort((a, b) => b.time.updated - a.time.updated)[0];
 
@@ -432,7 +432,8 @@ export class SessionHandler {
 
     async sendSessionList(ctx: Context, agent: PersistentAgent, edit = false): Promise<void> {
         const baseUrl = getAgentBaseUrl(agent);
-        const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(5000) });
+        const workdir = resolveDir(agent.workdir);
+        const sessRes = await fetch(`${baseUrl}/session?directory=${encodeURIComponent(workdir)}`, { signal: AbortSignal.timeout(5000) });
         if (!sessRes.ok) {
             const txt = `❌ No se pudo conectar al servidor del agente <b>${escapeHtml(agent.name)}</b>.`;
             if (edit) await ctx.editMessageText(txt, { parse_mode: "HTML" }).catch(() => ctx.reply(txt, { parse_mode: "HTML" }));

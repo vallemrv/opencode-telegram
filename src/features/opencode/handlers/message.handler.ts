@@ -24,6 +24,7 @@ export class MessageHandler {
     // ── Regular text message routing ──────────────────────────────────────────
 
     async handleMessage(ctx: Context): Promise<void> {
+        console.log(`[MessageHandler.handleMessage] ENTER: text="${ctx.message?.text?.slice(0, 50)}..."`);
         const userId = ctx.from?.id;
         if (!userId) return;
 

@@ -557,13 +557,16 @@ export class PersistentAgentService {
             }
         }
 
+        // Extract project name from workdir path (last segment)
+        const projectName = workdir.split('/').filter(Boolean).pop() || 'project';
+        const defaultTitle = `tg-${projectName}`;
+
         // Create session with directory in query parameter (per SDK spec)
-        // Don't set initial title - let OpenCode/opencode auto-generate based on conversation
         const createRes = await fetch(`${baseUrl}/session?directory=${encodeURIComponent(workdir)}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                title: "", // Empty title - OpenCode will auto-generate from conversation content
+                title: defaultTitle, // Default title: tg-{project-name}
                 system: agent.role || undefined,
                 model: modelConfig,
                 permission: [
@@ -732,9 +735,6 @@ export class PersistentAgentService {
                         if (!dataLine) continue;
                         let parsed: any;
                         try { parsed = JSON.parse(dataLine.slice(5).trim()); } catch { continue; }
-
-                        // Filter by directory — only handle events for this agent
-                        if (parsed.directory && parsed.directory !== workdir) continue;
 
                         // Unwrap: global events wrap payload inside .payload
                         const event = parsed.payload ?? parsed;
@@ -1828,6 +1828,11 @@ export class PersistentAgentService {
         return this.activeAgentByUser.get(userId) ?? null;
     }
 
+    /** Returns a snapshot of all userId → agentId active agent assignments */
+    getActiveAgents(): Map<number, string> {
+        return new Map(this.activeAgentByUser);
+    }
+
     clearActiveAgent(userId: number): void {
         this.activeAgentByUser.delete(userId);
     }
@@ -2012,11 +2017,10 @@ export class PersistentAgentService {
         // Best-effort: delete OpenCode sessions that belong to this workdir.
         try {
             const baseUrl = `http://${agent.host || "localhost"}:${agent.port}`;
-            const sessRes = await fetch(`${baseUrl}/session`, { signal: AbortSignal.timeout(3000) });
+            const agentDir = resolveDir(agent.workdir);
+            const sessRes = await fetch(`${baseUrl}/session?directory=${encodeURIComponent(agentDir)}`, { signal: AbortSignal.timeout(3000) });
             if (sessRes.ok) {
-                const allSessions: any[] = await sessRes.json();
-                const agentDir = resolveDir(agent.workdir);
-                const sessions = allSessions.filter((s: any) => !s.directory || s.directory === agentDir);
+                const sessions: any[] = await sessRes.json();
                 await Promise.all(sessions.map(s =>
                     fetch(`${baseUrl}/session/${s.id}`, {
                         method: "DELETE",

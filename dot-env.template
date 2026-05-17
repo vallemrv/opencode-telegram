@@ -63,3 +63,23 @@ MEDIA_TMP_LOCATION=/tmp/telegramcoder_media
 
 # Set to true to clean up the media directory on startup
 CLEAN_UP_MEDIADIR=false
+
+# ─── Audio Transcription (Gemini) ─────────────────────────────────────────────
+# Gemini API key for audio transcription of voice messages
+# Optional - if not set, voice messages will not be transcribed
+GEMINI_API_KEY=
+
+# Gemini models to use for transcription (comma-separated)
+# Default: gemini-flash-latest
+GEMINI_MODELS=gemini-flash-latest
+
+# ─── Database ────────────────────────────────────────────────────────────────
+# Path where SQLite databases are stored (sessions, agents, projects, etc.)
+# Default: current working directory
+SESSIONS_PERSIST_PATH=
+
+# ─── Legacy/Alias Variables ───────────────────────────────────────────────────
+# ROOT_PATH_INIT is an alias for WORKSPACE_DIR (deprecated, use WORKSPACE_DIR)
+# MAX_AGENTS is an alias for MAX_OPENCODE_SERVERS (deprecated)
+ROOT_PATH_INIT=
+MAX_AGENTS=

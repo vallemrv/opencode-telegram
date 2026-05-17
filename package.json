@@ -20,14 +20,7 @@
     "start": "node ./dist/cli.js",
     "watch": "tsc --watch",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "doPublish": "npm run build:prod && npm version patch && npm publish --access public",
-    "pm2:start": "npm run build:prod && pm2 start ecosystem.config.cjs",
-    "pm2:stop": "pm2 stop telegramCoder",
-    "pm2:restart": "npm run build:prod && pm2 startOrRestart ecosystem.config.cjs",
-    "pm2:delete": "pm2 delete telegramCoder",
-    "pm2:logs": "pm2 logs telegramCoder",
-    "pm2:monit": "pm2 monit",
-    "pm2:status": "pm2 status"
+    "doPublish": "npm run build:prod && npm version patch && npm publish --access public"
   },
   "keywords": [
     "telegram",
@@ -73,7 +66,7 @@
     "@opencode-ai/sdk": "^1.14.48",
     "archiver": "^7.0.1",
     "axios": "^1.13.6",
-    "better-sqlite3": "^12.6.2",
+    "better-sqlite3": "^12.10.0",
     "cors": "^2.8.6",
     "dotenv": "^17.2.2",
     "express": "^5.2.1",
